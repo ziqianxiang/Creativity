@@ -1,6 +1,6 @@
-##文献收集
+## 文献收集
 
-###creative writing
+### creative writing
 * Xiaojin Zhu, Zhiting Xu, and Tushar Khot. 2009. **How creative is your writing? A linguistic creativity measure from computer science and cognitive psychology perspectives**. In Proceedings of the Workshop on Computational Approaches to Linguistic Creativity (CALC '09). Association for Computational Linguistics, USA, 87–93.
 * **Abstract**：We demonstrate that subjective creativity in sentence-writing can in part be predicted using computable quantities studied in Computer Science and Cognitive Psychology. We introduce a task in which a writer is asked to compose a sentence given a keyword. The sentence is then assigned a subjective creativity score by human judges. We build a linear regression model which, given the keyword and the sentence, predicts the creativity score. The model employs features on statistical language models from a large corpus, psychological word norms, and WordNet.
 * **摘要**：我们证明了句子写作中的主观创造力可以部分地使用计算机科学和认知心理学中研究的可计算量来预测。我们设计了一项任务，要求作者在给定关键字的情况下撰写句子。然后由人类评委为该句子分配一个主观创造力分数。我们建立了一个线性回归模型，给定关键字和句子，预测创造力得分。该模型采用来自大型语料库、心理词规范和 WordNet 的统计语言模型的特征。
