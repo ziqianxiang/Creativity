@@ -13,7 +13,7 @@
    * 远距离联想测验（Compound remote associates (CRA) problems）
    * 创造力自我报告（Creative Behavior Inventory (CBI) short form）
  * 创造力写作的评估方法目前主要是人为评估，基于打分者的经验对于文章的创造力进行评估，是比较主观的。
- *  ** An analytical rubric for assessing creativity in creative writing**这篇文章介绍了创造力写作的一些客观评分标准（具体可见7月11日的周报），即：
+ *  **An analytical rubric for assessing creativity in creative writing**这篇文章介绍了创造力写作的一些客观评分标准（具体可见7月11日的周报），即：
    * **Image**：想象是创造性写作的核心，这样的描写包括声音、气味、感受、情绪等等，优秀的作者能够以很好的诱导读者，用文字将读者导入到故事之中。**充满想象的文章避免概括、抽象、平面写作等元素，而是使用丰富而具体的事件描述来替代**。
    * **Voice**：评估作者自己**写作风格的独特程度**，可以通过多种方式，包括独特和特殊的选择词（例如，罕见的、老式的或俚语词，在故事的特定背景下不典型，或自创词语或表达)，使用有趣或复杂的句子结构和标点符号、隐喻的使用和其他比喻，或通过叙述者的独特视角或态度。
    * **Originality**：评估故事的**原创性**程度。
@@ -54,15 +54,15 @@
      * **基于Originality**
         * 原创性分数反映了一个故事的想法或情节是否原创。 因此，与 Image 和Voice相比，原创性在很大程度上是根据上下文定义的（即，原创相对于其他故事），因此很难关联文本中固有的特定语言特征。
 * **实验结果**
- * 在study1中，Image和Voice与几乎所有其他创造力测量相关（唯一的例外是Image和 AUT之间的不显著相关性），而原创性Originality未能与其他创造力测量一致地相关。 在更广泛的学生样本 (Study2) 中，Image、Voice和Originality与创造力任务的表现表现出一致的相关性。
- * 在**Coh-Metric**计算结果中，**Referential cohesion**成为两项研究最一致的的预测因子，显著预测两者Image和Voice。
- * 在**LIWC**计算结果中，Image被类别Insight一致且负面地预测，Feel类别中的词对它进行了积极预测，并且在研究 1 中也显示出与Body相关词的显着关联。与预测相反，与Hear和See相关的词并不能预测Image分数。
- * 在**LIWC**计算结果中，Vioce始终被归类为真实Authenticity的语言积极预测，而 LIWC 词典中的单词数量为负面预测（即，更少的词典单词对应于更高的Vioce分数）。还发现标点符号和Voice分数之间的关联在研究 1 中显著。非正式单词Informal language仅在研究 1 中预测Voice分数，而逗号仅在研究 2 中预测。每个句子的单词数不能预测Voice分数。
+  * 在study1中，Image和Voice与几乎所有其他创造力测量相关（唯一的例外是Image和 AUT之间的不显著相关性），而原创性Originality未能与其他创造力测量一致地相关。 在更广泛的学生样本 (Study2) 中，Image、Voice和Originality与创造力任务的表现表现出一致的相关性。
+  * 在**Coh-Metric**计算结果中，**Referential cohesion**成为两项研究最一致的的预测因子，显著预测两者Image和Voice。
+  * 在**LIWC**计算结果中，Image被类别Insight一致且负面地预测，Feel类别中的词对它进行了积极预测，并且在研究 1 中也显示出与Body相关词的显着关联。与预测相反，与Hear和See相关的词并不能预测Image分数。
+  * 在**LIWC**计算结果中，Vioce始终被归类为真实Authenticity的语言积极预测，而 LIWC 词典中的单词数量为负面预测（即，更少的词典单词对应于更高的Vioce分数）。还发现标点符号和Voice分数之间的关联在研究 1 中显著。非正式单词Informal language仅在研究 1 中预测Voice分数，而逗号仅在研究 2 中预测。每个句子的单词数不能预测Voice分数。
 * **总结与思考**
- * 本篇论文的目标是探索是否可以通过**计算机语言分析预测人类对创造力的评分**。
- * 指标Image、Vioce、Originality具有可靠的信度和效度。
- * 本文的创新点是**建立指标Image、Vioce、Originality和文本的语言特征的联系**，并使用文本分析工具 Coh-Metrix 和 LIWC 对文本进行分析。
- * 本研究结果表明，借助量规（Image、Vioce、Originality）对创造力进行的人类评分可以在某种程度上从客观测量的文本语言特征中预测出来。 这些结果将评估标准确立为评估创意写作的有用工具，并说明，**创意写作的某些方面可以通过计算机化测量来捕捉**——这些证据值得在后续研究中应给予更多关注。
+  * 本篇论文的目标是探索是否可以通过**计算机语言分析预测人类对创造力的评分**。
+  * 指标Image、Vioce、Originality具有可靠的信度和效度。
+  * 本文的创新点是**建立指标Image、Vioce、Originality和文本的语言特征的联系**，并使用文本分析工具 Coh-Metrix 和 LIWC 对文本进行分析。
+  * 本研究结果表明，借助量规（Image、Vioce、Originality）对创造力进行的人类评分可以在某种程度上从客观测量的文本语言特征中预测出来。 这些结果将评估标准确立为评估创意写作的有用工具，并说明，**创意写作的某些方面可以通过计算机化测量来捕捉**——这些证据值得在后续研究中应给予更多关注。
 
 ## **文献调研（关注作者历史发表内容）**
 
