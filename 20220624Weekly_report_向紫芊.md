@@ -1,9 +1,9 @@
-#20220624_Weekly report
+# 20220624_Weekly report
 + [1.上周反馈](上周反馈)
 + [2.收集资料](收集资料)
 + [3.下周计划](下周计划)
 
-###上周反馈
+### 上周反馈
 * Proceedings of the Workshop on Computational Approaches to Linguistic Creativity（计算方法和语言创造性）整理里面的文章。
 * Proceedings of the AISB01 Symposium on artificial intelligence and creativity in arts and science整理里面的文章
 * 以后要读的文章：
@@ -17,7 +17,7 @@
 * * *
 
 
-###收集资料
+### 收集资料
 * **Proceedings of the Workshop on Computational Approaches to Linguistic Creativity（计算方法和语言创造性）**
 ![](微信图片_20220623010122.png)
 
@@ -56,5 +56,5 @@
 
 * * *
 
-###下周计划
+### 下周计划
 * 整理找到的论文，阅读摘要，总结
