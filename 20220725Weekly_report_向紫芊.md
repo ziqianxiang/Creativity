@@ -1,4 +1,4 @@
-#20220725_Weekly report
+# 20220725_Weekly report
 
 + [1.论文阅读笔记](论文阅读笔记)
 + [2.文献调研](文献调研)
@@ -6,7 +6,7 @@
 
 ## 论文阅读笔记
 
-###**Beyond subjective judgments: Predicting evaluations of creative writing from computational linguistic features**
+### **Beyond subjective judgments: Predicting evaluations of creative writing from computational linguistic features**
 * **研究背景**
  * 传统的创造力评估方法：
    * 发散思维测验（Alternate uses task (AUT)）
@@ -64,7 +64,7 @@
  * 本文的创新点是**建立指标Image、Vioce、Originality和文本的语言特征的联系**，并使用文本分析工具 Coh-Metrix 和 LIWC 对文本进行分析。
  * 本研究结果表明，借助量规（Image、Vioce、Originality）对创造力进行的人类评分可以在某种程度上从客观测量的文本语言特征中预测出来。 这些结果将评估标准确立为评估创意写作的有用工具，并说明，**创意写作的某些方面可以通过计算机化测量来捕捉**——这些证据值得在后续研究中应给予更多关注。
 
-##**文献调研（关注作者历史发表内容）**
+## **文献调研（关注作者历史发表内容）**
 
 * **Amabile T. M.**
  * Amabile T M, Barsade S G, Mueller J S, et al. **Affect and creativity at work**[J]. Administrative science quarterly, 2005, 50(3): 367-403.
@@ -81,7 +81,7 @@
  * Crossley S A, Greenfield J, McNamara D S. **Assessing text readability using cognitively based indices**[J]. Tesol Quarterly, 2008, 42(3): 475-493.
  * Crossley S A, Allen D B, McNamara D S.** Text readability and intuitive simplification: A comparison of readability formulas**[J]. Reading in a foreign language, 2011, 23(1): 84-101.
 
-##**工具调研**
+## **工具调研**
 *  **Coh-Metric**
   * Coh-Metrix 通过分析文本的多个层次级别来自动测量**连贯性**和**可读性**。超越了文本的表面特征，进入了因果、时间和意图的凝聚力。衔接反映了构建情境模型（即整体心理表征）的文本特征。这些特征的范围从单词到短语再到构建连贯文本表示的句子。 Coh-Metrix 产生的指标是通过潜在语义分析 (LSA)、句法解析器和传统难度指数（如单词和句子长度）的组合得出的。
 * **LIWC**
