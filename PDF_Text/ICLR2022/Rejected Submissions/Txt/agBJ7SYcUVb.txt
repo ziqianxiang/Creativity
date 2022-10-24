@@ -1,0 +1,1374 @@
+﻿Under review as a conference paper at ICLR 2022
+DfssAtten: Dynamic Fine-grained Structured
+Sparse Attention Mechanism
+Anonymous authors
+Paper under double-blind review
+Ab stract
+Transformers are becoming mainstream solutions for various tasks like NLP and
+computer vision. Despite their success, the quadratic complexity of their attention
+mechanism hinders them from applying to latency-sensitive tasks. Tremendous
+efforts have been made to alleviate this problem, and many of them successfully
+reduce the asymptotic complexity to linear. Nevertheless, few of them achieve
+practical speedup over the original full attention, especially under the moderate
+sequence length. in this paper, we present DfssAtten, an attention mechanism
+that dynamically prunes the full attention weight matrix to the 50% fine-grained
+structured sparse pattern used by the sparse tensor core on NVIDIA A100 GPU.
+We provide both theoretical and empirical evidence that demonstrate DfssAtten
+is a good approximation of the full attention mechanism and can achieve speedups
+in wall-clock time under arbitrary sequence length. We evaluate our method on
+tasks from various domains under different sequence lengths from 256 to 4096.
+DfssAtten achieves 1.27 〜1.89× speedups over the full-attention mechanism
+with no accuracy loss on A100 GPU.
+1	Introduction
+Transformers (Vaswani et al., 2017) have achieved competitive performance across various domains
+like NLP (Ott et al., 2018) and computer Vision (Dosovitskiy et al., 2021). The key feature that sets
+them apart from traditional neural network architectures is the attention mechanism (Vaswani et al.,
+2017), which allows the transformers to gather information from the embeddings of elements in the
+input sequence in an adaptive and learnable manner.
+Nevertheless, the high computation cost and memory footprint brought by the attention mechanism
+make it difficult to apply transformers to latency-sensitive tasks. Many efficient attention mecha-
+nisms(Tay et al., 2020b; Zaheer et al., 2020; Beltagy et al., 2020; Tay et al., 2020a; Roy et al., 2021;
+Kitaev et al., 2020) have been proposed to address this issue. However, most of them drastically
+modify the original full attention mechanism and introduce a handful of hyper-parameters to tune.
+Therefore, they require tremendous engineering effort to deploy and optimize. Besides, they usually
+need to be trained from scratch instead of exploiting pretrained models like BERT (Devlin et al.,
+2019). some of them rely on fixed sparse patterns or extremely high sparsity to achieve wall-clock
+time speedup. Therefore, these methods usually require thousands of pretraining or fine-tuning steps
+on specific tasks and toilsome tuning of several hyper-parameters to reach good accuracy. Last but
+not least, previous methods usually introduce additional operators like top-k, sort that cause large
+overheads and offset their benefits at moderate sequence length.
+in this paper, we present DfssAtten, a simple and effective sparse attention mechanism that ad-
+dress the limitations mentioned above. DfssAtten dynamically prunes the full attention score
+matrix using 50% fine-grained structured sparse patterns (NVIDIA, 2020). This pattern is GPU
+friendly and can leverage the new sparse tensor core on NViDiA A100 GPU (Mishra et al., 2021).
+Our DfssAtten offers several advantages over existing studies:
+•	it requires minimal changes to the original full-attention with no hyper-parameters to tune. This
+makes it a drop-in replacement of the full attention that only requires to change a few lines of
+code. Moreover, it can directly exploit existing pretrained models like BERT (Devlin et al., 2019)
+and RoBERTa (Liu et al., 2020).
+1
+Under review as a conference paper at ICLR 2022
+•	We dynamically prune the attention scores based on their magnitude under only 50% sparsity.
+This allows the pruned attention matrix to reserve the important entries, achieving on par model
+accuracy with full attention even without fine-tuning.
+•	Our method introduces zero overhead on existing GPU hardware. As a result, we are able to
+achieve wall-clock time speedup and memory footprint reduction over the full attention in arbitrary
+sequence length.
+To conclude, our main contributions are summarized below:
+•	We propose DfssAtten, a dynamic sparse attention mechanism that is a drop-in proxy of the
+full attention mechanism. Its effectiveness is justified by both empirical and theoretical evidence.
+•	We present a dedicated CUDA kernel design to completely remove the pruning overhead. The
+pruning is implemented as an epilogue of the dense matrix multiplication which produces the
+attention score matrix.
+•	We evaluate DFSSATTEN on tasks cross various domains and sequence lengths. It achieves 1.27 〜
+1.89× speedup over the full attention with no accuracy loss.
+2	Background and Motivation
+We first introduce the preliminaries, notations, and background of our paper.
+2.1	Full Attention Mechanism
+Given an input sequence X= (x1,..,xn) ∈ Rn×d, the full attention mechanism can be defined as
+O = Softmax(QK T/√d)V,	(1)
+where Q = XWq, K = XWk , and V = XWv are query, key, and value matrices. QKT
+forms a full-quadratic adjacency matrix, whose edge weights are the dot-product similarity between
+all the elements in the sequence. This adjacency matrix is standardized with 1∕√d to keep the
+unit second moment and then normalized with softmax. At last, the row feature vectors in V are
+aggregated according to the normalized adjacency matrix by multiplying them together. In the rest
+of this paper, We denote A = Softmax(QKT/√d) for simplicity. We refer QKT as the attention
+score matrix and A as the attention weight matrix.
+2.2	Efficient Attention Mechanism
+The high computation cost and memory footprint in the full attention mechanism come from A,
+whose size grows quadratically with the sequence length n. To address this issue, various efficient
+attention mechanisms have been proposed (Tay et al., 2020b).
+Fixed Sparse Patterns. Zaheer et al. (2020); Beltagy et al. (2020) apply a set of fixed sparse
+attention patterns on A, like global attention and sliding window attention. These patterns are
+constructed from empirical observations and designed GPU-friendly to achieve wall-time speedup.
+However, as these patterns are designed empirically and fixed during inference, there is no guarantee
+that they can always capture the important entries in A or transfer easily across different tasks.
+Dynamic Sparse Patterns. Ham et al. (2021) dynamically generate fine-grained sparse attention
+patterns on A with low-cost binary hashing. However, this technique requires specialized hardware
+to achieve speedup, so it is not available on general-purpose hardware like GPU. Tay et al. (2020a);
+Roy et al. (2021); Kitaev et al. (2020) apply various clustering methods and only compute the at-
+tention within each cluster. Although computing full attention in each cluster is more friendly to
+GPU compared with fine-grained sparsity, the clustering methods contain several GPU-unfriendly
+operators like top-k and sorting that offsets their benefits under moderate sequence length.
+Low Rank / Kernel. Wang et al. (2020) project A from n × n to n × k with linear projection.
+Choromanski et al. (2021) introduce the FAVOR+ which approximates the softmax with kernel
+method. This allows them to change the computation order and reduce the asymptotic complexity
+2
+Under review as a conference paper at ICLR 2022
+Figure 1: A100 GPU Fine-Grained Structured Sparsity Pruning. (NVIDIA, 2020)
+to linear. However, the low-rank projection and kernel construction also introduce considerable
+overhead. This makes these methods only effective under long sequence length.
+Besides, the previous studies drastically change the attention mechanisms, tens of thousands pre-
+training or finetuning steps are required to reach a comparable performance with the origin full
+attention mechanism. So they require tremendous engineering effort to deploy.
+2.3	Fine-grained Structured Sparsity in NVIDIA A100 GPU
+NVIDIA introduces the fine-grained structured sparsity in the A100 GPU. As shown in Figure 1,
+the dense input matrix is pruned with fine-grained structured pruning. If the data type is float, 1:2
+sparsity is used which selects the larger one in two consecutive entries. If the data type is bfloat16
+or float16, the 2:4 sparsity is used which selects two larger ones among four consecutive elements.
+After the pruning, the result is compressed to nonzeros and metadata. The nonzeros contain the
+value of reserved data that is 50% smaller than the original one. The metadata records the index of
+the nonzeros in the origins matrix. It takes 4 bit metadata to record the decision of each 1:2 or 2:4
+selection. Therefore, the metadata is only 1/16 of the original dense matrix in terms of bits. This
+compressed sparse matrix can be multiplied with a dense matrix under the support of the sparse
+tensor core to achieve significant speedup.
+This fine-grained structured sparsity has been applied to the static weight matrices in various neural
+network models including transformer (Mishra et al., 2021). It can effectively accelerate the feed-
+forward part of the transformer up to 1.9×. However, to the best of our knowledge, no previous
+studies use it in the attention mechanism where the attention weight matrix is dynamically generated
+for each sequence. One plausible explanation is that during pruning, GPU must read the whole
+dense matrix to be pruned from the memory. Then, after selecting the elements to be reserved under
+the 1:2 and 2:4 pattern, it must also generate the metadata encoded in a special format such that
+the metadata can be used efficiently later. All these overheads will offset the benefit brought by the
+pruning if we do it on the fly.
+3	Dynamic Fine-grained S tructured Sparse Attention Mechanism
+In this section, we first give an overview of our DfssAtten method. Then, we discuss the design
+considerations of exploring sparsity in attention and the choice of sparse granularity in our method
+for GPU-friendly implementation and effectiveness. Finally, we briefly introduce our GPU kernel
+design to remove pruning overhead.
+Our proposed DfssAtten mechanism is simple and effective, as illustrated in Figure 2. Com-
+pared with the full-quadratic attention mechanism, our method dynamically prunes attention scores
+without incurring storage or computation overhead, while maintaining the effectiveness of atten-
+tion. More importantly, our method can achieve practical speedups of attention on existing GPU
+hardware with customized CUDA kernels. Listing 1 shows all the modifications to be made to use
+DfssAtten.
+3
+Under review as a conference paper at ICLR 2022
+Figure 2: Overview of our Dynamic Fine-grained Structured Sparse Attention Mechanism. σ repre-
+Sents Softmax,e is omitted for simplicity.
+#	Full attention mechanism
+def full_attention(q,k,v):
+attn_weight = torch.bmm(q, k.transpose(1, 2))
+attn_weight = torch.nn.functional.softmax(attn_weight, -1)
+return torch.bmm(attn_weight, v)
+#	DFSS attention mechanism
+import dspattn
+def dfss_attention(q,k,v):
+attn_weight, metadata = dspattn.bmm(q, k)
+attn_weight = torch.nn.functional.softmax(attn_weight, -1)
+return dspattn.spmm(attn_weight, metadata, v)
+Listing 1: Example of using DfssAtten. The “dspattn” is the package we developed.
+3.1	Design Considerations for Exploiting Attention Sparsity
+As illustrated in Figure 3, the attention mechanism can be considered @
+as three stages: QKT, Softmax, and AV. To design a sparse atten-
+tion mechanism, the first decision to make is where should we induce
+pruning to sparsify the attention.
+)l——a--------ΘlI
+IQKTF Softmax ι=>∣ΛK ∣
+Figure 3: Attention Stages.
+If We start from。，all the three stages will be benefited from the sparsity given effective imple-
+mentation on GPU: the dense matrix multiplication between Q and K will be replaced with the
+sampled dense-dense matrix multiplication (SDDMM) which only computes the entries identified
+by the sparse pattern. The Softmax only operates on the nonzero values in each row. The original
+dense matrix multiplication between A and V will be replaced with a sparse matrix-matrix multipli-
+cation (SpMM) which multiplies a sparse matrix with a dense matrix. However, as it is not possible
+to exactly know which entry in QKT has higher magnitude before computing QKT, starting from
+⑨ usually requires some additional components to predict the location of important entries.
+Starting from @ requires us to compute a dense matrix multiplication between Q and K. The
+benefit is that we can explicitly select important entries from QKT without prediction. As the
+softmax is a monotonically increasing function, starting from Q does not offer any benefits over (T
+but throws away the opportunity to accelerate S of tmax.
+In this paper, we choose to start from O based on two considerations. First, replacing the dense
+matrix multiplication with SDDMM at QKT offers limited speedup even at high sparsity. Chen
+et al. (2021b) show that it is difficult for SDDMM to achieve speedup over its dense counterpart
+under 80% sparsity even with some structured design. Second, starting from O allows us to keep
+our design simple such that it does not introduce additional overhead or hyper-parameters to tune.
+3.2	On the Granularity of Sparse Attention Patterns
+The second decision to make is what sparse pattern to use as it will tremendously affect the latency of
+SpMM as well as the overhead to encode the sparse QKT . Existing studies exploit various sparse
+encoding schemes. For instance, the compressed sparse row (CSR) is popular for encoding fine-
+grained sparsity. However, CSR-based SpMM requires over 95% sparsity to be on par with its dense
+counterpart (Chen et al., 2021b). Block sparsity is also widely used as it can bring considerable
+wall-time speedup at moderate sparsity given large block size. However, it cannot capture some
+4
+Under review as a conference paper at ICLR 2022
+fine-grained attention patterns. Moreover, these patterns require data comparisons within the entire
+row, which is difficult to execute in parallel and unfriendly to GPUs.
+We find the fine-grained structured sparsity mentioned in Section 2.3 is a good choice as long as we
+address the pruning overhead. On one hand, the 1:2 and 2:4 selections are performed locally and
+are easy to execute in parallel. On the other hand, the size of compressed nonzeros is half of the
+original dense attention matrix, so the softmax only needs half of the computations. Powered by the
+NVIDIA Sparse Tensor Core, the SpMM between the compressed A and V can also achieve 1.7×
+speedup.
+3.3	Empirical Results of DfssAtten Mechanism
+Empirically, We find this pattern can well ap- TabIe 上 FI Score w/o FinetUne On SQUAD v1.1
+proximate the full attention mechanism. We	Full	I 1:2 I 2:4__________________
+first finetune a BERT-Iarge model on SQUAD 93.17 ± 0.27 ∣ 92.86 ± 0.22 ∣ 93.00 ± 0.16
+v1.1 under full attention. Then, we directly replace the full attention with the 1:2 and 2:4 attention
+without additional finetuning. The F1-scores are summarized in Table 1 under Cl = 95%. It is
+obvious that the accuracy loss is only around one sigma even without finetuning.
+3.4	Removing Pruning Overhead
+As mentioned in Section 2.3, the major challenge that hinders us from using the fine-grained struc-
+tured sparse attention is the pruning overhead. We observe that when computing QKT , the results
+are first accumulated in GPU registers and written to memory when all the computations are done.
+Therefore, we can implement the pruning as an epilogue of the matrix multiplication: after the accu-
+mulation is finished, we compare the data stored in the registers, select the larger ones and generate
+the metadata. Then, we only write the reserved non-zeros and metadata to memory. This design
+brings two benefits. First, it completely removes the overhead caused by reading the matrix to be
+pruned from memory, so it has zero overhead. Second, the memory footprint caused by the attention
+weight matrix is reduced from n2 × 32-bit to n22 X 32-bit + n2 X 32-bit as the originaln×nfull
+attention weight matrix is not written to memory. The more detailed description of the CUDA kernel
+design including how to encode the metadata on the fly is summarized in Appendix A.1.
+4 Theoretical Results
+In this section, we provide more theoretical and empirical evidence that justify our DfssAttn as a
+good proxy of the full attention mechanism. The strategy is to first derive the theoretical value of 1)
+quality of the approximation with different sparse patterns 2) speedup can be achieved under certain
+sparsity. Then, we compare the quality of different methods under the same speedup.
+4.1	Attention Lottery Ticket
+We borrow the lottery ticket hypothesis (Frankle & Carbin, 2019) and extend it to the attention
+mechanism. The last step AV in the attention mechanism can be viewed as the aggregation in the
+graph neural network. Following the Generalized Attention Mechanism (Zaheer et al., 2020), we
+describe it with a weighted directed graph G = (A, X). A is the adjacent matrix and Au,v > 0
+indicates that element xu attends to xv. Inspired by the Graph Lottery Tickets (Chen et al., 2021a),
+we propose the Attention Lottery Ticket as follows.
+Attention Lottery Ticket (ALT). Given a fully connected d graph G = {A, X} constructed from
+the full quadratic attention mechanism (Vaswani et al., 2017), the associated sub-graph can be de-
+fined as Gs = {m A, X}, where m is a binary mask. If a Gs has the performance matching
+or surpassing the original full quadratic attention mechanism, then we define the sparse attention
+mechanism with Gs as an attention lottery ticket.
+Zaheer et al. (2020) have proved the existence of lottery tickets by showing 1) sparse attention
+mechanisms are universal approximators of sequence to sequence functions when being used as
+encoder 2) sparse encoder-decoder transformers are Turing Complete. So the remaining problem is
+how to identify the winning tickets Gs at runtime.
+5
+Under review as a conference paper at ICLR 2022
+4.2	Quality of the Lottery Ticket
+A popular strategy that empirically works well is selecting the top-k neighborhood in G based on
+the magnitude of edge weight. We refer it as Top-k Sparsity. Intuitively, this strategy is based on the
+hypothesis that the edges with larger edge weight are more important. It has been widely adapted in
+existing studies (Frankle & Carbin, 2019; Chen et al., 2021a; Ham et al., 2021; Wang et al., 2021)
+and demonstrated its ability to preserve model accuracy at a high sparsity ratio. Following this trend
+of work, we define the Quality of Attention Lottery Ticket as follows:
+Definition 4.1. (Lp-Quality of Attention Lottery Ticket) The quality of attention lottery ticket Gs
+{m Θ A, X} under density S = n12 En=I En=I mj,i is defined as
+Qp =1 X Pi=ι(m Θ A)P,i
+=n 幺	Pi=ι j
+(2)
+The above definition computes the expectation of normalized Lp norm in each row of the attention
+score matrix. The p is a task-dependent factor that indicates how the accuracy depends on the edges
+with higher magnitude. In this paper, we compare the Lp -Quality of tickets yield by three types of
+sparse patterns: Top-K, fixed, and our dynamic 1:2 and 2:4 sparse pattern. Particularly, we have the
+proposition below:
+Proposition 4.1. Under the assumption that the entries in QKT/√d follow i.i.d. N(μ, σ), we have
+1 + erf (√σ2 - erfinv(I - 2s))	1 + erf (pσ)⑶
+QpopkIs ≈--------ky½-------------------L, QfixIs = S,	Qp:4 ≥ QP：2 = + f "⑶
+(Proof: Appendix A.2)
+It is obvious that the Qtpopk achieves the upper bound of Qp under s. Besides, the pσ is always
+positive. Therefore, we also have Q2p:4 ≥ Q1p:2 > QfpixIs=0.5 = 1/2.
+4.3	Efficiency of the Lottery Ticket
+A lottery ticket with high quality does not necessarily mean that it is also efficient to execute for
+wall-clock time speedup. In this section, we analyze the efficiency of the three sparse patterns.
+Top-K Sparsity. Zhao et al. (2019) explicitly select k neighbors in each row of A based on their
+magnitude. However, as shown in their Table 4, the explicit sparse transformer has lower inference
+throughput despite k	n. On one hand, the top-k operator is difficult to parallel and introduces
+high overhead. On the other hand, even if an oracle top-k sparsity mask m were provided with
+zero overhead, it would still be difficult for the explicit Top-K sparse attention to beat its dense
+counterpart. We provide a theoretical upper bound for density s in Proposition 4.2.
+Proposition 4.2. Given embedding size d and the maximum tiling size supported by GPU T, the
+upper bound of the speedup achieved by Top-K Sparsity under density s is (Proof: Appendix A.3)
+Speedup <
+4d +3T
+2d + T + (d +2T + dT )s
+(4)
+As typical values for the dimension d and tiling size T are d = 64, T = 128, s < 4.5% is a
+necessary and insufficient condition to have Speedup > 1. Notably, this is not a strict upper bound
+as we did not take the overhead of identifying top-k entries into consideration. Therefore, the strict
+upper bounder should be even smaller.
+Fixed Sparsity. As the fixed sparse pattern are designed or learned before inference, they can be
+designed to be GPU-friendly and have the same tiling size with the dense matrix multiplication.
+Therefore, we can derive the upper bound of the speedup under density s with the same strategy in
+Proposition 4.2:
+S peedup
+n2 (竿 + 1) + 2n2 + nd (争 + 1)
+sn2 (2d + 1) + 2n2s + nd ((1+s)n + 1)
+4d + 3T
+(1 + 3s)d + 3sT
+(5)
+6
+Under review as a conference paper at ICLR 2022
+Dynamic 1:2 / 2:4 Sparsity. Similarly, we can derive the theoretical speedup with 1:2 and 2:4
+sparsity as follows
+S peedup
+n (2Td + 1)+ 2n2 + nd (竽 + 1)
+n2 (2Td + 1 + ⅛) + n2 + nd (T + 2nT + ιnτ + 1)
+n=d 64d + 48T
+=57d + 25T
+(6)
+4.4	Quality of the Lottery Tickets under the same Efficiency
+With the theoretical conclusions above, we compare the quality of the lottery ticket under our dy-
+namic 1:2 and 2:4 sparsity with the other two methods under the same efficiency.
+Comparison with Top-K Sparsity. The Top-K sparsity achieves the same efficiency with ours at
+(4d +3T )(57d + 25T)	2d + T
+s < (64d + 48T)(d +2T + dT) - (d + 2T + dT).	⑺
+With typical values T = 128, d = 64, we have s < 0.02. We can substitute it to Proposition 4.1
+and get Qtpopk < Q1p:2 when pσ < 7. On the other hand, when pσ > 7, although the Top-K sparsity
+produces tickets with higher quality, Qp：2 ∣pσ=7 ≈ 0.9999996 is already very close to 1.
+Comparison with Fixed Sparsity. The fixed sparsity achieves the same efficiency with ours when
+(4d+3T)(64d+48T)
+S = (57d + 25T)(3d + 3T) - 3d + 3T'
+(8)
+d
+With typical values T = 128, d = 64, we have s ≈ 0.63. On the other hand, we have theoretical
+value of σ ≈ 1 and p ≥ 1 . The p ≥ 1 is based on the observation that the edges with higher
+magnitude are more influential. Therefore, we have pσ ≥ 1 and Qp1:2 ≥ 0.76 > 0.63 = Qfpix|s=0.63.
+To conclude, compared with both top-k sparsity and fixed sparsity, our method can always yield
+lottery tickets with higher quality under the same efficiency. To support this conclusion, we further
+provide some empirical studies in Appendix A.4. Besides, we found both theoretically and em-
+pirically that our method is a good complementary to the kernel-based transformers like Performer
+(Choromanski et al., 2021). We add more discussions about it in Appendix A.5.
+5	Evaluation
+In this section, we first evaluate the accuracy of our dynamic fine-grained structured sparse attention
+mechanism on tasks across different domains. Then, we profile our methods on NVIDIA A100 GPU
+under different sequence lengths from 256 to 4096 to show that we can achieve practical speedup in
+arbitrary sequence length.
+5.1	Model Accuracy
+To show that our method is effective in comprehensive scenarios, we first evaluate the model accu-
+racy on tasks in different domains and sequence length. For models under “bfloat16” data type, we
+first finetune them from the pretrained model under “float” data type as “float” provides more pre-
+cise gradient that helps convergence. After the finetuning, we directly cast all the parameters in the
+model to “bfloat16” and test it on the test dataset. For Question Answering and Masked Language
+Modeling tasks, we report the results averaged over 8 runs under different random seeds.
+Question Answering. We evaluate the BERT-large on SQuAD v1.1 under sequence length 384.
+We use the “bert-large-uncased-whole-word-masking” in Huggingface (Wolf et al., 2020) as the
+pretrained model and finetune it with the default configuration in Huggingface 1. The F1-scores of
+“1:2(float)” and “2:4(bfloat16)” without finetuning are obtained by directly using the checkpoints
+from “Transformer(float)”. The F1-scores of “Transformer (float)” and “Transformer (bfloat16)”
+without finetuning are obtained by directly using the checkpoints from “DFSSATTEN 1:2 (float)”
+7
+Under review as a conference paper at ICLR 2022
+Table 2: F1 Score on BERT-Iarge SQUAD v1.1 (Cl=95%)
+Model	w/o finetune	w/ finetune
+Transformer (float)	93.22 ± 0.l5zz	93.17 ± 0.2十
+Transformer (bfloat16)	93.34 ± 0.31	93.18 ± 0.27
+DfssAtten 1:2 (float)	92.86 ± 0.22	93.07 ± 0.17
+DfssAtten 2:4 (bfloat16)	93.00 ± 0.16	93.28 ± 0.29
+and “DFSSATTEN 2:4 (bfloat16)”, respectively, and running inference with dense attention mecha-
+nism.
+As shown in Table 2, with finetUning, oUr 1:2 sparsity has only 0.1 F1 score loss that is smaller
+than the standard deviation. OUr 2:4 sparsity even achieves a little bit of performance improvement
+over the dense baseline. One plaUsible explanation is that while the 2:4 sparsity can keep most of
+the important edges, it also occasionally drops a small fraction of important edges which acts like
+the attention dropoUt techniqUe (ZehUi et al., 2019). Besides, directly applying oUr methods to the
+dense transformer withoUt finetUning also achieves comparable resUlts, it jUstifies that oUr method
+can well approximate the dense attention mechanism.
+Masked Language Modeling. We also evalUate oUr models on the masked modeling tasks on
+Wikitext-2 and Wikitext-103 Under seqUence length 512. Similar to the qUestion-answering tasks,
+we choose the “roberta-large” as the pretrained model and finetUne it Under the defaUlt configUration
+in HUggingface 1 2. The resUlts are sUmmarized in Table 3. Similarly, the perplexities achieved by oUr
+methods are on par with the dense transformer.
+Table 3: Perplexity on roBERTa-large (Cl=95%)
+Model	Wikitext-2		Wikitext-103	
+	w/o finetune	w/ finetune	w/o finetune	w/ finetune
+Transformer (float)	2.85 ± 0.09	2.83 ± 0.09zz	2.63 ± 0.03=	2.62 ± 0.0十
+Transformer (bfloat16)	2.85 ± 0.05	2.85 ± 0.07	2.62 ± 0.08	2.63 ± 0.05
+-DFSSATTEN 1:2 (float)-	2.88 ± 0.06	2.88 ± 0.07	2.64 ± 0.06	2.64 ± 0.06
+DFSSATTEN 2:4 (bfloat16)	2.88 ± 0.07	2.84 ± 0.04	2.63 ± 0.03	2.61 ± 0.04
+Long Range Arena. For seqUence length longer than 512, we incorporate foUr tasks from the Long
+Range Arena (Tay et al., 2021), inclUding ListOps, Text Classification, DocUment Retrieval, and
+Image Classification Under seqUence lengths 2048, 2048, 4096, and 1024, respectively. We omit the
+Pathfinder (1K) task as we cannot replicate the resUlts, which was also reported in LU et al. (2021).
+For a fair comparison with other efficient transformers, the model is trained from scratch Under the
+defaUlt configUrations. The resUlts are sUmmarized in Table 4. OUr method achieves comparable
+accUracy on all the three benchmarks for long seqUence.
+Table 4: AccUracy of different transformer models on LRA benchmark. We follow the training
+instructions from Tay et al. (2021) to reuse the results from this paper.
+Model	ListOps (n=2048)	Text (n=2048)	Retrieval (n=4000)	Image (n=1024)	Avg
+Transformer (float)	35.91	65.05 =	61.72	42.15	51.21
+Transformer (bfloat16)	35.92	65.03	61.73	42.17	51.21
+Local Attention	15:82	52:98	53:39	4146	40.91
+Sparse Trans.	17.07	63.58	59.59	44.24	46.12
+Longformer	35.63	62.85	56.89	42.22	49.40
+Linformer	35.70	53.94	52.27	38.56	45.12
+Reformer	37.27	56.10	53.40	38.07	46.21
+Sinkhorn Trans.	33.67	61.20	53.83	41.23	47.48
+Synthesizer	36.99	61.68	54.67	41.61	48.74
+BigBird	36.05	64.02	59.29	40.83	50.05
+Linear Trans.	16.13	65.90	53.09	42.34	44.37
+Performer	18.01	65.40	53.82	42.77	45.00
+DfssAtten 1:2 (float)	36:85	64:95	6183	4202	51.41
+DfssAtten 2:4 (bfloat16)	37.19	64.91	62.26	42.31	51.67
+5.2 Speedup
+In this section, we demonstrate the speedup achieved by our method across different sequence
+lengths. For a fair comparison, we only show the speedup achieved on the attention mechanism
+1https://github.com/huggingface/transformers/tree/master/examples/pytorch/question-answering
+2https://github.com/huggingface/transformers/tree/master/examples/pytorch/language-modeling
+8
+Under review as a conference paper at ICLR 2022
+■ SeneSI ■ Series2 ■ SeneS3 ■ Series4
+1.8
+1.6
+1.4
+1.2
+1
+0.8
+0.6
+0.4
+0.2
+0
+bfloat16
+EOJSU Elol P ①∙--BE∙JOU&Uwl
+」8E」OJsue.Jl
+∞⅛0
+」8E」-8H
+」8E」OJsue.Jl
+∞⅛0
+」8E」-8H
+」8E」OJsue.Jl
+∞⅛0
+」8E」OJsue.Jl
+」OE」OJsue.Jl
+E2AN
+U.JOU-S
+uno
+,JOE-JOH
+」OE」OJ」od
+s」no
+E2sAN
+U.JOU-S
+uno
+」8E」8H
+」8E-O七8d
+s」no
+2
+1.5
+1
+0.5
+0
+2048
+4096
+」8E」OJsue.Jl
+∞⅛0
+」8E」-8H
+」8E」OJsue.Jl
+∞⅛0
+」8E」-8H
+」8E」OJsue.Jl
+∞⅛0
+」8E」OJsue.Jl
+」8E」-8H
+」8E-O七8d
+s」no
+EO-JlSAN
+U.JOU-S
+uno
+」8E」OJsue.Jl
+EO-JlSAN
+U.JOU-S
+uno
+」8E」8H
+」8E-O七8d
+s」no
+
+
+
+
+2048
+4096
+Sequence Length
+Figure 4:	Latency breakdown of different attention mechanism. For each configuration, we normal-
+ize the latency to Transformer with full attention mechanism and cut off the axis at 2 for clarity.
+declared in equation 1. This is because the end-to-end speedup can be affected by various other
+factors including the quantization and pruning strategies applied to the other parts of the transformer
+models, the embedding sizes, and the efficiency of the code implementation (e.g. some operators
+could be fused for lower latency). We present the end-to-end speedup and memory footprint reduc-
+tion under different sequence length, number of heads, and hidden dimension in Appendix A.6. For
+models in previous studies, We also apply the PyTorch JIT script when possible in case that their
+implementations are not efficient. The configuration we use is as follows: Each layer contains 4
+heads, the feature dimension per head is 64. The batch size is set to be large enough to keep the
+GPU busy. We summarize the profiling results in Figure 4. We normalize the latency to the Trans-
+former with full attention mechanism under each configuration. We also cut the y axis off at 2 for
+clarity, because some methods designed for long sequence could be more than 20× slower than the
+dense transformer at moderate sequence length.
+First of all, our method achieves 1.27〜1.89x speedup over the transformer with full attention. It
+is the only method that brings consistent speedup across different sequence lengths, while other
+methods from previous papers suffer from high overhead at moderate and short sequence lengths.
+Second, under the float data type, our method achieves speedup in all the three stages with zero
+overhead. This accords with our arguments in Section 3. Under the data type bfloat16, the QKT in
+our method is a little bit slower than the dense baseline. The reason is that selecting 2 larger ones
+from 4 elements requires more comparisons, which results in more warp divergence.
+6 Conclusion and Discussion
+In this paper, we present DfssAtten, a dynamic fine-grained structured sparse attention mecha-
+nism that dynamically prunes the QKT on the fly to 1:2 and 2:4 structured sparsity. As it only
+requires 50% sparsity, it can achieve no accuracy loss compared with the full attention mechanism
+across tasks in various domains and sequence lengths. Besides, it only requires modifying a few
+lines of code, which makes it a drop-in replacement of the full-attention mechanism. Moreover,
+powered by our customized CUDA kernels and the new sparse tensor core on Ampere GPU, we
+achieve 1.27〜1.89 × speedup over the full attention in arbitrary sequence length. All of these pieces
+of evidence demonstrate that our method can be a good replacement for the full attention mechanism.
+Our method is also orthogonal to many existing efficient attention mechanisms and can potentially
+be applied jointly for further speedup. We present two examples in Appendix A.7.
+9
+Under review as a conference paper at ICLR 2022
+References
+Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer.
+arXiv preprint arXiv:2004.05150, 2020.
+Tianlong Chen, Yongduo Sui, Xuxi Chen, Aston Zhang, and Zhangyang Wang. A unified lottery
+ticket hypothesis for graph neural networks. In International Conference on Machine Learning,
+pp.1695-1706. PMLR, 2021a.
+Zhaodong Chen, Zheng Qu, Liu Liu, Yufei Ding, and Yuan Xie. Efficient tensor core-based gpu
+kernels for structured sparsity under reduced precision. 2021b.
+Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea
+Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser,
+David Benjamin Belanger, Lucy J Colwell, and Adrian Weller. Rethinking attention with per-
+formers. In International Conference on Learning Representations, 2021. URL https:
+//openreview.net/forum?id=Ua6zuk0WRH.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+bidirectional transformers for language understanding. In NAACL-HLT (1), pp. 4171-4186, 2019.
+URL https://aclweb.org/anthology/papers/N/N19/N19-1423/.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszko-
+reit, and Neil Houlsby. An image is worth 16x16 words: Transformers for image recogni-
+tion at scale. In International Conference on Learning Representations, 2021. URL https:
+//openreview.net/forum?id=YicbFdNTTy.
+Andrew Kerr et al. Cutlass. https://github.com/NVIDIA/cutlass, 2021.
+Jonathan Frankle and Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable neural
+networks. In International Conference on Learning Representations, 2019. URL https://
+openreview.net/forum?id=rJl-b3RcF7.
+Tae Jun Ham, Yejin Lee, Seong Hoon Seo, Soosung Kim, Hyunji Choi, Sung Jun Jung, and Jae W
+Lee. Elsa: Hardware-software co-design for efficient, lightweight self-attention mechanism in
+neural networks. In 2021 ACM/IEEE 48th Annual International Symposium on Computer Archi-
+tecture (ISCA), pp. 692-705. IEEE, 2021.
+Andrew Kerr. Gtc 2020: Developing cuda kernels to push tensor cores to the absolute limit on nvidia
+a100. https://developer.nvidia.com/gtc/2020/video/s21745, 2020.
+Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In
+International Conference on Learning Representations, 2020. URL https://openreview.
+net/forum?id=rkgNKkHtvB.
+Francois Lagunas, Ella Charlaix, Victor Sanh, and Alexander M Rush. Block pruning for faster
+transformers. arXiv preprint arXiv:2109.04838, 2021.
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike
+Lewis, Luke Zettlemoyer, and Veselin Stoyanov. Ro{bert}a: A robustly optimized {bert} pre-
+training approach, 2020. URL https://openreview.net/forum?id=SyxS0T4tvS.
+Jiachen Lu, Jinghan Yao, Junge Zhang, Xiatian Zhu, Hang Xu, Weiguo Gao, Chunjing Xu, Tao
+Xiang, and Li Zhang. Soft: Softmax-free transformer with linear complexity. arXiv preprint
+arXiv:2110.11945, 2021.
+Asit Mishra, Jorge Albericio Latorre, Jeff Pool, Darko Stosic, Dusan Stosic, Ganesh Venkatesh,
+Chong Yu, and Paulius Micikevicius. Accelerating sparse deep neural networks. arXiv preprint
+arXiv:2104.08378, 2021.
+NVIDIA.	Nvidia a100 tensor core gpu architecture.	https://
+images.nvidia.com/aem- dam/en- zz/Solutions/data- center/
+nvidia-ampere-architecture-whitepaper.pdf, 2020.
+10
+Under review as a conference paper at ICLR 2022
+Myle Ott, Sergey Edunov, David Grangier, and Michael Auli. Scaling neural machine translation. In
+Proceedings ofthe Third Conference on Machine Translation: Research Papers, pp. 1-9, 2018.
+Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efficient content-based sparse
+attention with routing transformers. Transactions of the Association for Computational Linguis-
+tics, 9:53-68, 2021.
+Zhiqing Sun, Hongkun Yu, Xiaodan Song, Renjie Liu, Yiming Yang, and Denny Zhou. Mobile-
+bert: a compact task-agnostic bert for resource-limited devices. arXiv preprint arXiv:2004.02984,
+2020.
+Yi Tay, Dara Bahri, Liu Yang, Donald Metzler, and Da-Cheng Juan. Sparse sinkhorn attention. In
+International Conference on Machine Learning, pp. 9438-9447. PMLR, 2020a.
+Yi Tay, Mostafa Dehghani, Dara Bahri, and Donald Metzler. Efficient transformers: A survey. arXiv
+preprint arXiv:2009.06732, 2020b.
+Yi Tay, Mostafa Dehghani, Samira Abnar, Yikang Shen, Dara Bahri, Philip Pham, Jinfeng Rao,
+Liu Yang, Sebastian Ruder, and Donald Metzler. Long range arena : A benchmark for efficient
+transformers. In International Conference on Learning Representations, 2021. URL https:
+//openreview.net/forum?id=qVyeW-grC2k.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+Eukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in neural information
+processing systems, pp. 5998-6008, 2017.
+Hanrui Wang, Zhekai Zhang, and Song Han. Spatten: Efficient sparse attention architecture with
+cascade token and head pruning. In 2021 IEEE International Symposium on High-Performance
+Computer Architecture (HPCA), pp. 97-110. IEEE, 2021.
+Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention
+with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+Pierric Cistac, Tim Rault, Remi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick
+von Platen, Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain Gug-
+ger, Mariama Drame, Quentin Lhoest, and Alexander M. Rush. Transformers: State-of-the-art
+natural language processing. In Proceedings of the 2020 Conference on Empirical Methods in
+Natural Language Processing: System Demonstrations, pp. 38-45, Online, October 2020. As-
+sociation for Computational Linguistics. URL https://www.aclweb.org/anthology/
+2020.emnlp- demos.6.
+Yunyang Xiong, Zhanpeng Zeng, Rudrasis Chakraborty, Mingxing Tan, Glenn Fung, Yin Li, and
+Vikas Singh. Nystromformer: A nystrom-based algorithm for approximating self-attention. In
+Proceedings of the AAAI Conference on Artificial Intelligence, volume 35, pp. 14138-14148,
+2021.
+Ofir Zafrir, Guy Boudoukh, Peter Izsak, and Moshe Wasserblat. Q8bert: Quantized 8bit bert. arXiv
+preprint arXiv:1910.06188, 2019.
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago
+Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for
+longer sequences. In NeurIPS, 2020.
+Lin Zehui, Pengfei Liu, Luyao Huang, Junkun Chen, Xipeng Qiu, and Xuanjing Huang. Dropat-
+tention: A regularization method for fully-connected self-attention networks. arXiv preprint
+arXiv:1907.11065, 2019.
+Guangxiang Zhao, Junyang Lin, Zhiyuan Zhang, Xuancheng Ren, Qi Su, and Xu Sun. Ex-
+plicit sparse transformer: Concentrated attention through explicit selection. arXiv preprint
+arXiv:1912.11637, 2019.
+Aojun Zhou, Yukun Ma, Junnan Zhu, Jianbo Liu, Zhijie Zhang, Kun Yuan, Wenxiu Sun, and Hong-
+sheng Li. Learning n: M fine-grained structured sparse neural networks from scratch. In Interna-
+tional Conference on Learning Representations, 2020.
+11
+Under review as a conference paper at ICLR 2022
+Illl ∣EΞ0x4^JI I I ^∏
+LLLLIIΞ0χ8ΞΞII Illl
+0xd
+0xe
+0x9
+IllIl
+IllIl
+Figure 5:	Prune dense data and generate nonzeros, metadata.
+A Appendix
+A.1 Kernel Design Details
+In this section, we first demonstrate how a dense matrix is pruned and compressed under the 50%
+structured sparsity on Ampere GPU in Section A.1.1. Then, we detail the design and implementation
+of the SDDMM, Softmax, and SpMM kernels in Section A.1.2 and A.1.3.
+A.1.1 Structured Pruning of Dense Matrix
+We first illustrate how to dynamically prune a dense matrix with 50% structured sparsity. Under data
+type float, we select the larger one in every two consecutive elements. If the data type is bfloat16,
+we select two larger ones in every four consecutive elements. We compress the pruned dense matrix
+to nonzeros and metadata following CUTLASS et al (2021) as there are two benefits. First, it can
+be directly used by high-performance SpMM kernels in CUTLASS. Second, as we will show in
+Section A.1.2, it can be dynamically generated from the SDDMM kernel with neglectable overhead.
+As shown in Figure 5, the basic tile size to prune is 32 X 64-byte, this corresponds to a 32 X 32
+block under bfloat16 or 32 X 16 block under float. There are four major steps: ‹0 Prune 50% of
+each consecutive 8B data, generate nonzeros and metadata; @ Interleave the metadata rows by 8;
+② Switch the metadata along sub-diagonal. @ Write metadata and nonzeros to global memory.
+In detail, 2 out of 4 2-byte data are select based on their magnitude and a unique 4-bit metadata is
+assigned to each combination in O. The correspondence between selection pattern and metadata is
+enumerated in Figure 5 (b). Notably, with float32 data type, each 32-bit data occupies two consec-
+utive 2-byte slots. Therefore, it only supports the patterns under 0x4 and 0xe. After generating the
+4-bit metadata, consecutive four of them are concatenated to a 2B metadata block. Then, the rows
+of metadata are interleaved by8 in φ following
+dst_row = ∖row∕32C X 32 + (row%8) X 4 + b(row%32)∕81.	(9)
+In (2, the metadata blocks at upper right and lower left of each 2 X 2 grid are switched. At last, in
+③,the metadata produced by @ is written into global memory following the interleaved column-
+12
+Under review as a conference paper at ICLR 2022
+Figure 6: Dense Matrix Multiplication (GEMM) Tiling Design.
+major format under stride 4-byte. This can be realized by interpreting two consecutive metadata as
+an int object and then write it to DRAM in column-major. The nonzeros are simply writen to global
+memory under row-major.
+A.1.2 SDDMM KERNEL DESIGN
+Our strategy for dynamically pruning the attention score matrix has two steps. First, perform a
+conventional dense GEMM. Second, prune the GEMM output with procedures described in Section
+A.1.1. However, if the second step is implemented as a separate GPU kernel, we need to write the
+dense attention score matrix to DRAM and read it back. This not only introduces high overhead,
+but also prevents us from reducing global memory footprint. To address this issue, we implement
+the pruning step as an epilogue attached to the conventional GEMM kernel: the results of the dense
+GEMM are stored in the registers, the epilogue processes the results and then writes nonzeros and
+metadata to global memory.
+Dense GEMM. The GEMM step is no different from conventional GEMM kernels, and all the
+existing optimizations can be used. The tiling is shown in Figure 6: each thread block processes
+a M tile × N tiles output tile, which is further partitioned to several warp tiles. Each warp tile is
+composed of a grid of 16 × 16 blocks that matches the tensor core output size. In each thread block,
+all the threads jointly load M tile × K tile and K tile × N tile input tiles from matrix A andB into the
+shared memory. We use the new synchronize copy feature on Ampere architecture to fully utilize the
+memory bandwidth and reduce register usage. To fully annihilate shared memory bank conflict, we
+use the XOR layout. Once the load is completed, the warps fetch their source operands from shared
+memory with Idmatrix and perform a (16 X 32B) ∙ (32B X 16) warp matrix multiply accumulate
+(wmma) with tensor core. Notably, float data will be converted to tensorfloat-32 before wmma. To
+reduce accumulation error, we accumulate the partial sum as float regardless of the source operand
+data type. Besides, software 2-stage pipeline is used to overlap memory access and computation
+with double buffering (et al, 2021). Although deeper software pipeline can be built on Ampere, we
+find 2 stages is enough as the inner-product dimension K is usually very small (e.g. 64). More
+detailed explanation of the above techniques can be found in this GTC 2020 talk (Kerr, 2020).
+Pruning the GEMM result. In the pruning step, the warp tile is partitioned to a grid of 32 X 64B
+blocks that are processed by the warp one at a time.
+Under data type float, the register layout of the 32 X 16 block is illustrated in Figure 7 (a). It consists
+of two 16 X 16 wmma blocks, so each thread has sixteen 32-bit registers to hold the results. The
+registers are annotated with “T thread-id {registered}”. As the adjacent two data are held by the
+same thread, we can simply compare them and the larger one is retained.
+Under data type bfloat16, we need to select 2 larger ones from adjacent 4 entries. However, under
+the naive mapping shown in Figure 8 (a), these 4 entries are held by 2 thread. Therefore, we need
+additional warp shuffle to first pass these 4 entries to the same thread, then compare them and obtain
+the 2 larger ones. This will introduce additional overhead. To solve this problem, we propose
+to interleave the columns when loading matrix B to shared memory by simply manipulating the
+pointer to the global memory at the beginning. The resulted mapping to the registers is shown in
+Figure 8 (b) which is equivalent with Figure 7 (a) bfloat16. After the interleaving, consecutive four
+13
+Under review as a conference paper at ICLR 2022
+(a)	float32
+bfloat16
+R\C	0 1	2 3	4 5	6 7	8 9	10 11	12 13	14 15
+0	T0{0,1}	T1{0,1}	T2{0,1}	T3{0,1}	T0{4,5}	T1{4,5}	T2{4,5}	T3{4,5}
+1 2 .. 7	T4{0,1}	T5{0,1}	T6{0,1}	T7{0,1}	T4{4,5}	T5{4,5}	T6{4,5}	T7{4,5}
+	■4 T28{0,1}	r-	 T29{0,1}	-——— T30{0,1}	T31{0,1}	-4- T28{4,5}	——■— T29{4,5}			 T30{4,5}	T31{4,5}
+8	T0{2,3}	T1{2,3}	T2{2,3}	T3{2,3}	T0{6,7}	T1{6,7}	T2{6,7}	T3{6,7}
+9	T4{2,3}	T5{2,3}	T6{2,3}	T7{2,3}	T4{6,7}	T5{6,7}	T6{6,7}	T7{6,7}
+10	*	--*	∙---"		4	-		-		
+.. 15	T28{2,3}	T29{2,3}	T30{2,3}	T31 {2,3}	T28{6,7}	T29{6,7}	T30{6,7}	T31{6,7}
+16	T0{0,1}	T1{0,1}	T2{0,1}	T3{0,1}	T0{4,5}	T1{4,5}	T2{4,5}	T3{4,5}
+17	T4{0,1}	T5{0,1}	T6{0,1}	T7{0,1}	T4{4,5}	T5{4,5}	T6{4,5}	T7{4,5}
+18		-							+	——―-			——	
+.. 23	T28{0,1}	T29{0,1}	T30{0,1}	T31{0,1}	T28{4,5}	T29{4,5}	T30{4,5}	T31{4,5}
+24	T0{2,3}	T1{2,3}	T2{2,3}	T3{2,3}	T0{6,7}	T1{6,7}	T2{6,7}	T3{6,7}
+25 26	T4{2,3}	T5{2,3}	T6{2,3}	T7{2,3}	T4{6,7}	T5{6,7}	T6{6,7}	T7{6,7}
+		—-~-——	——■		W	——■	-			
+.. 31	T28{2,3}	T29{2,3}	T30{2,3}	T31 {2,3}	T28{6,7}	T29{6,7}	T30{6,7}	T31{6,7}
+R\C	0-3	4-7	8-11	12-15	16-19 20-23	24-27	28-31
+0	T0{0,14,5} T1{0,1,4,5} T2{0,1,4,5} T3{0,1,4,5} T0{0,1,4,5} T1{0,1,4,5} T2{0,1,4,5} T3{0,1,4,5}
+1	T4{0,14,5} T5{0,1,4,5} T6{0,1,4,5} T7{0,1,4,5} T4{0,14,5} T5{0,1,4,5} T6{0,1,4,5} T7{0,1,4,5}
+7 T28{0,14,5} T29{0,1,4,5} T30{0,1,4,5} T31{0,1,4,5} T28{0,14,5} T29{0,1,4,5} T30{0,1,4,5} T31{0,1,4,5}
+8	T0{2,3,6,7} T1{2,3,6,7} T2{2,3,6,7} T3{2,3,6,7} T0{2,3,6,7} T1{2,3,6,7} T2{2,3,6,7} T3{2,3,6,7}
+15	T28{2,3,6,7} T29{2,3,6,7} T30{2,3,6,7} T31{2,3,6,7}T28{2,3,6,7} T29{2,3,6,7} T30{2,3,6,7} T31{2,3,6,7}
+16	T0{0,1,4,5} T1{0,1,4,5} T2{0,1,4,5} T3{0,1,4,5}
+17	T4{0,14,5} T5{0,14,5} T6{0,14,5} T7{0,1,4,5}
+T0{0,1,4,5} T1{0,1,4,5} T2{0,1,4,5} T3{0,1,4,5}
+T4{0,1,4,5} T5{0,1,4,5} T6{0,1,4,5} T7{0,1,4,5}
+23	T28{0,1,4,5} T29{0,1,4,5} T30{0,1,4,5} T31{0,1,4,5} T28{0,1,4,5} T29{0,1,4,5} T30{0,1,4,5} T31{0,1,4,5}
+24	T0{2,3,6,7} T1{2,3,6,7} T2{2,3,6,7} T3{2,3,6,7} T0{2,3,6,7} T1{2,3,6,7} T2{2,3,6,7} T3{2,3,6,7}
+25	T4{2,3,6,7} T5{2,3,6,7} T6{2,3,6,7} T7{2,3,6,7} T4{2,3,6,7} T5{2,3,6,7} T6{2,3,6,7} T7{2,3,6,7}
+31	T28{2,3,6,7} T29{2,3,6,7} T30{2,3,6,7} T31{2,3,6,7}T28{2,3,6,7} T29{2,3,6,7} T30{2,3,6,7} T31{2,3,6,7}
+(b)
+(c)
+(e)
+(f)
+R\C___________________________________________________________________________
+0	T0{0}[0]	T1{0}[1]	T2{0}[2]	T3{0}[3] T0{2}[0]	T1{2}[1] T2{2}[2]	T3{2}[3]
+1	T4{0}[0]	T5{0}[1]	T6{0}[2]	T7{0}[3] T4{2}[0]	T5{2}[1] T6{2}[2]	T7{2}[3]
+7
+~
+9
+10
+T28{0}[0] T29{0}[1]	T30{0}[2]	T31{0}[3]	T28{2}[0]	T29{2}[1 ]	T30{2}[2]	T31{2}[3]
+T0{1}[0] T1{1}[1]	T2{1}[2]	T3{1}[3]	T0{3}[0]	T1{3}[1]	T2{3}[2]	T3{3}[3]
+T4{1}[0] T5{1}[1]	T6{1}[2]	T7{1}[3]	T4{3}[0]	T5{3}[1]	T6{3}[2]	T7{3}[3]
+15
+16
+17
+T28{1}[0] T29{1}[1]	T30{1}[2] T31{1}[3]	T28{3}[0]	T29{3}[1]	T30{3}[2] T31{3}[3
+T0{4}[0] T1{4}[1]	T2{4}[2]	T3{4}[3]	T0{6}[0]	T1{6}[1]	T2{6}[2] T3{6}[3]
+T4{4}[0] T5{4}[1]	T6{4}[2]	T7{4}[3]	T4{6}[0]	T5{6}[1]	T6{6}[2] T7{6}[3]
+23	T28{4}[0] T29{4}[1] T30{4}[2] T31{4}[3] T28{6}[0] T29{6}[1] T30{6}[2] T31{6}[3
+24	T0{5}[0]	T1{5}[1] T2{5}[2]	T3{5}[3] T0{7}[0]	T1{7}[1]	T2{7}[2]	T3{7}[3]
+25	T4{5}[0]	T5{5}[1] T6{5}[2]	T7{5}[3] T4{7}[0]	T5{7}[1]	T6{7}[2]	T7{7}[3]
+31	T28{5}[0] T29{5}[1] T30{5}[2] T31{5}[3] T28{7}[0] T29{7}[1] T30{7}[2] T31{7}[3
+R\C		
+0	T0{0}	T1{2}
+1	T4{0}	T5{2}
+2	T8{0}	T9{2}
+		
+7	T28{0}	T29{2}
+9	T0{1} T4{1}	T1{3} T5{3}
+10	T8{1}	T9{3}
+..	⅛	⅛
+15	T28{1}	T29{3}
+16	T2{4}	T3{6}
+17	T6{4}	T7{6}
+18 ..	T10{4} ⅛	T11{6}
+23	T30{4}	T31{6}
+24	T2{5}	T3{7}
+25	T6{5}	T7{7}
+26 ..	T10{5} ⅛	T11{7} ⅛
+31	T30{5}	T31{7}
+R\C______________
+0	T0{0,1}
+1	T1{2,3}
+2	T2{4,5}
+3	T3{6,7}
+4	T4{0,1}
+5	T5{2,3}
+6	T6{4,5}
+7	T7{6,7}
+8	T8{0,1}
+9	T9{2,3}
+10	T10{4,5}
+11	T11{6,7}
+R\C
+0	T0{0,1}
+1	Ti{o,i}
+2	T2{0,1}
+3	T3{0,1}
+4	T4{0,1}
+5	T5{0,1}
+6	T6{0,1}
+7	T7{0,1}
+8	T8{0,1}
+9	T9{0,1}
+10	T10{0,1}
+11	T11{0,1}
+28	T28{0,1}
+29	T29{2,3}
+28
+29
+T28{0,1}
+T29{0,1}
+30	T30{4.5}
+31	T31{6,7}
+30
+31
+T30{0,1}
+T31{0,1}
+Figure 7: Mapping between the registers and data, metadata.
+data are naturally held by the same thread, and we select 2 larger ones from them. To reduce branch
+divergence, the selection is done by comparing the sum of any two data.
+Generate Metadata and Nonzeros. For both float and bfloat16 data type, each comparison pro-
+duces a 4-bit metadata. Next, following the procedures described in Section A.1.1, we need to
+concatenate consecutive four metadata to a 16-bit metadata block. This is done in two steps. First,
+put the 4-bit metadata to the correct position of a int16 register with bit shift. Second, share these
+int16 registers cross threads with warp shuffle, and concatenate them with bitwise OR. As con-
+secutive four metadata are held by thread 4t to 4t+3, we put the 4-bit metadata of thread 4t+k to
+[k×4:k×4 + 3] bits in the int16 object in the first step. The detailed layout is shown in Figure 8 (b),
+where We denote each 4-bit metadata as “Tthread-id{registered}[bit-id]”. The result of the second
+step is shown in Figure 7 (c). Figure 7 (d) and (e) illustrate the result after @ and @ in Figure 5.
+Notably, these two step only change the logic mapping of the metadata and the register allocation is
+not affected. So no code is required for these two steps. At last, we need to write the metadata and
+nonzeros to global memory following @ in Figure 5. As shown in Figure 7 (e), each row is held
+by consecutive two int16 registers of the same thread, so we can simply reinterpret it as an =int32
+object and write the metadata to global memory in column major. For the nonzeros, we simply
+coalesce them in the shared memory and then write to global memory in row-major.
+Batched Kernel. The self-attention layer in transformer usually has multiple independent attention
+heads. Instead of launching one CUDA kernel for each attention head, using a batched kernel that
+14
+Under review as a conference paper at ICLR 2022
+(a)
+col	col	col∖
+dst_col = ( —— mod 2)x2 + col mod 2+ ∏-^- mod 2 1 ×2 + ɪ^-
+Figure 8: Interleave the columns for matrix B to reduce cross-lane data sharing during pruning for
+bfloat16.
+×16
+processes all the heads can better utilize the GPU resources and reduce kernel launching overhead.
+We support the batched computation by using the blockIdx.z to index the heads in the batch and
+update the pointers to the input and output based on the index.
+Blocked-ELL Sparsity. Under long sequence length, higher sparsity is desired to reduce compu-
+tation cost and memory footprint. Our kernel support hybrid blocked-ELL sparsity Zaheer et al.
+(2020) and 50% structured sparsity. To support this feature, we set the block size in blocked-ELL to
+the thread block tile size of the GEMM. Therefore, we can simply skip those pruned blocks during
+the execution.
+A.1.3 Softmax and SpMM Kernel
+In this section, we detail the implementation of the softmax and SpMM kernels.
+Softmax Kernel. To improve numerical stability, the softmax on GPU is computed with
+exi -max(x)
+Softmax(Xb= P eχj-maχ(χ) .	(IO)
+Therefore, each element in x has to be loaded for three times. 1) compute c = max(x); 2) compute
+s = Pj exj -c; 3) compute exi -c/s. Instead of loading xi from global memory in each time, we
+cache it in the register when the whole row fits in the register file capacity. Besides, the ordinary
+softmax kernel in libraries like PyTorch can also be used.
+SpMM Kernel. As we encode the nonzeros and metadata following the CUTLASSet al (2021), we
+directly construct the SpMM kernels from the CUTLASS APIs. To support the hybrid blocked-ELL
+and structured 50% sparsity, we modify the PredictedTileAccessIterator class in CUTLASS to skip
+the tiles masked out by the blocked-ELL sparsity.
+A.2 Proof of Proposition 4.1
+Proof. Under the assumption that the entries in QKT/√d follow i.i.d. N(μ, σ), We denote xi,j =
+eμ+σzi,j, where Z 〜i.i.d. N(0,1). Then we can substitute it into the definition of the softmax and
+15
+Under review as a conference paper at ICLR 2022
+get
+xu,v
+u,v = ∖∙^n	.
+i=1 xu,i
+We substitute the above equation into the definition of Lp -Quality and get
+OP = 1X pn=ι (m。A)j,i = 1X 1 pn=ι mj,ixj,i
+Q =n j=ι	pn=ι Ap,i	=n j=ι Fnɪ
+With n → ∞, the denominator can be approximated with
+(11)
+(12)
+1 匚 P ∞ epμ+pσz
+n ⅛ xj,i ≈ JL -√2rexp
+dz = exp (pμ + T
+(13)
+Top-K Sparsity. When the sequence is long enough such that we have n → ∞, the numerator can
+be approximated with
+1 S P ∞	epμ+pσz
+m〉 mj ixPi ≈	---,__ exp
+n i=ι	，	√√2erfinv(1-2s) √2∏
+dz
+p2σ2
+exp I pμ +——2~
+1 + erf (√pσ — erfinv(1 — 2s))
+(14)
+Therefore, the Lp -Quality of Top-K sparsity is
+2
+1 + erf (√pσ — erfinv(1 — 2s))
+2
+(15)
+Fixed Sparsity. Without any assumption on the distribution of important edges in A, applying a
+fixed pattern is equivalent with uniformly sampling with probability s and we have
+1X mj,ixρp,i ≈ exp (pμ + p ； ) s.
+n i=1	2
+Therefore, the Lp-Quality of the fixed sparsity is
+Qfpix ≈ s.
+(16)
+(17)
+2-to-1 Sparsity: This sparsity pattern select the larger one in every two elements. We denote adja-
+cent two elements with
+X = eμ+σZ1, Y = eμ+σZ2; Z1,Z2 〜N(0,1),
+Z1 and Z2 are independent. Then we have
+1n	1
+n Emj,ixρp,i ≈ 2 Emax(X p, Yp)] =
+n i=1
+(18)
+1
+2
+epμ+pσz1 ɪexp (—z2+z2) dz1dz2 +
+z2	2π	2
+epμ+pσz2 ɪexp bz2+z2
+dz1 dz2
+(19)
+We denote
+then we have
+z1 — z2	z1 + z2
+X —	, y —
+√2 , g √2
+(20)
+epμ+pσz1 ɪ exp
+z2	2π
+Z∞
+∞0
+Z∞
+∞0
+∞
+∞
+22
+epμ+ ⅛-
+dz1 dz2
+—
+(21)
+16
+Under review as a conference paper at ICLR 2022
+With the conclusion above, we have
+1 X mj,ixp,i = exp (pμ + p2p
+i=1
+1 + erf(pσ)
+2
+(22)
+The LP -Quality of 1:2 sparsity can be computed with
+1 + erf (号)
+2
+(23)
+2:4 Sparsity: This sparsity pattern select the largest two elements in consecutive four elements.
+While it is more challenging to find an explicit expression for Q4p-to-2, a trivial lower bound can be
+found with
+1n	1
+-E mj,ixp,i ≈ -E [max(XP + Yp, XP + Up, XP + Vp, YP + Up, YP + Vp, UP + Vp)]
+≥ 1 (Emax(Xp, Yp)] + E[max(Up, Vp)]) = 1 Emax(XP, YP)],
+(24)
+where we have
+X = eμ+σZ1, Y = eμ+σZ2, U = eμ+σZ3,V = eμ+σZ4; Z1,Z2,Z3,Z4 〜N(0,1),	(25)
+Z1 , ..., Z4 are independent. Therefore, the lower-bound of Q2P:4 is
+Q2:4 ≥ 1 + T 号).	(26)
+□
+A.3 Proof of Proposition 4.2
+Proof. First of all, thanks to the Tensor Core in latest GPUs, the latency of matrix multiplication op-
+erations, both sparse and dense, are bounded by the memory access. Therefore, instead of counting
+the number of MACs (multiply-accumulate operations), the amount of memory access is a better
+metric to estimate the latency.
+Figure 9: Tiling Matrix-Matrix Multiply
+Tiling is a basic optimization applied to optimize matrix matrix multiply on GPU. As shown in
+Figure 9 (A), the original n × n output is partitioned to independent blocks with size T × T . When
+computing each block, operands with size T × r and r × T are loaded from A and V T to the fast
+memory, respectively. Then, these two operand are multiplied and accumulated to the partial sum
+stored in the registers. After applying the top-k, as shown in Figure 9 (B), the k elements in each row
+of A correspond to different rows in A. Therefore, we can only partition the output to independent
+17
+Under review as a conference paper at ICLR 2022
+	
+I ∣'∖∣	
+	
+一	CXL r					Z⅛	_	I	Top-K 	ToP-K Theory
+-'	I	I	I	V	ʌ. '、 、 、 、	Fixed -- Fixed Theory
+∖ 、 、 、 、	→- 1:2 —©- 1:2 Theory
+［二:	 *~	■ ■ ■ ■ ■ 、 j--∙~∙	»	
+18
+Under review as a conference paper at ICLR 2022
+Figure 11: Qp under different density s and sparsity strategies. Box plot: Empirical results from
+BERT-large on SQuAD v1.1; Solid line: Theoretical results from Proposition 4.1.
+First of all, the Top-K sparsity is well bounded by the theoretical value, and our method achieves
+better speedup than the Top-K sparsity when the density s > 0.02. This is because gathering top-k
+elements in each row of the attention weight matrix and sorting them to compressed row format
+introduce huge overhead.
+Second, the speedup achieved by the fixed sparsity is well predicted by our theoretical value. The
+speedup it achieved is lower than ours when density s ≥ 0.63, which accords with our theoretical
+conclusion. Notably, the speedup of fixed sparsity we used here is simply truncate the number of
+columns of the attention weight matrix based on the density. The actual speedup will be even lower
+when more fine-grained pattern is involved.
+Our method delivers speedup a little bit higher than the theoretical value. This is because the softmax
+kernel has different implementations under different sequence length. When the sequence length is
+moderate, as mentioned in Appendix A.3, the data loaded from the attention score matrix can be
+explicitly cached in fast memory like registers or shared memory for reuse. When sequence length
+too long for the fast memory to cache, it has to be implicitly reused through lower-level cache or
+even global memory. The second implementation is slower than the first one as lower-level cache
+has longer access latency and lower throughput. As our method reduces the sequence length by half,
+it can use the implementation for moderate sequence length while the full attention is handled by
+the long sequence version.
+In Figure 11, we compute the theoretical value (solid line) and empirical value (box plot) of Qp over
+attention matrix A in BERT-Large on SQuAD v1.1. As p is a task-dependent value that is hard to
+obtain, we instead sweep through several typical values.
+Compared with the top-k sparsity, when p < 7, our 1:2 and 2:4 sparsity always achieve better
+performance than the top-k sparsity when s < 0.05. Besides, when p = 7, the Qp1:2 and Qp2:4 are
+19
+Under review as a conference paper at ICLR 2022
+Figure 12: Qp under different density s and sparsity strategies. Box plot: Empirical results from
+BERT-large on SQuAD v1.1; Solid line: Theoretical results from Proposition 4.1.
+very close to 1. These observations accord with our conclusion that our 1:2 and 2:4 sparsity can
+obtain tickets with better quality than Top-K sparsity at the same efficiency.
+Compared with the fixed sparsity, our Q1p:2 and Q2p:4 are also similar or better than Qpfix across
+different ps. This supports our conclusion that our method achieves better performance than the
+fixed sparsity patterns under the same efficiency.
+To show that our Qp is a good metric to compare the performance of different sparse patterns, we
+plot the Qp and F1 score on BERT-large SQuAD v1.1 in Figure 12. As we mentioned before,
+p is a task-specific value used to model tasks with different degree of dependency on the largest
+few elements. In order to identify the p for our target task, we tune the value of p until the data
+points from Top-K sparsity and Fixed sparsity form a monotonically increasing line. We found that
+p = 6.5 is a good choice. This large p accords our observation that the Top-K sparsity works well
+even under 5.4% density. After anchored the p, we put the data points from 1:2 and 2:4 sparsity
+into the plot and verify if the line is still monotonically increasing. Figure 12 shows that the data
+points from our 1:2/2:4 sparsity perfectly fills in the monotonically increasing line. Oppositely, The
+traditional F-norm based metric cannot explain why the 1:2 sparsity has better F1-score than some
+Fixed Sparsity even though it has lower score. This demonstrates that our Qp is a better metric than
+existing metrices.
+A.5 Comparison with Performer
+In this section, we add more discussions on how our method compared with kernel based trans-
+former, i.e. Performer (Choromanski et al., 2021). As our Definition 4.1 is designed to characterize
+how well the sparse pattern could reserve the important edges in A, so it is not suitable for kernel-
+based attention mechanisms that do not involve sparsity. For example, an approximation of A with
+high positive approximation error can have QP ≥ 1 under Definition 4.1. Therefore, we instead
+compare the mean squared error (MSE) following Choromanski et al. (2021). Given the query
+and two adjacent key vectors q, k, and k0 ∈ N(0, Id), we denote the softmax kernel between
+them as SM(q, k) = exp(qTk/√d). And the Softmax approximated by our dynamic 1:2 sparsity
+S\M1:2(q, k) is defined as
+S∖2(q, k) = { exp (q√k)
+if qTk > qTk0
+else
+(28)
+Then, we can compute its MSE as follows
+M SE(S\M1:2(q, k)) =	exp
+q k<q k0
+2π-d∕2exp
+∣∣k0∣∣2) dk.
+(29)
+—
+20
+Under review as a conference paper at ICLR 2022
+Because qTk0 = Pid=1 qiki0 is the weighted sum of i.i.d variables following N(0, 1), we have
+X = qτ k0 〜N (0, ||q||2). Wecan substitute it into equation 29 and get
+exp
+1 - erf 1
+2
+,-----,
+M SE(S\M1:2(q, k)) = exp
+一，	C exp
+>qTk，2而11
+SM2(q,k)
+2⅛) dx
+1-erf(∣⅛ln (SM@ k))
+(30)
+1
+—
+2
+With Lemma 2 and Theorem 2 in Choromanski et al. (2021), the MSE of their positive softmax
+kernel with orthogonal random features has an upper bound as follows
+MSE (sM∖+(q, k))) ≤ — exp
+m
+exjg + k11
+—SM2(q, k)
+m
+||q||22 + ||k||22
+exp ----
+.k √d
+SM2(q, k)-1 -
+2
+d+2
+d+2
+(31)
+First of all, when SM(q, k) → 0, both M SE(S\M1:2(q, k)) and MSE S\Mmort+(q, k))) con-
+verge to 0. However, for large SM (q, k)s that are potentially be critical for the model accuracy,
+the exp (UqUw|kU2) SM2(q, k) term in the positive Softmax kernel in Performer could greatly
+increases the MSE. Oppositely, the 1 一 erf (∣∣q∣√√In (SM(q, k))) term in our method reduces
+the MSE. To conclude, while both the positive softmax kernel and ours has low MSE error when ap-
+proximating small edge weights, our method can better approximate the edges with high magnitude.
+From the empirical perspective, as shown in Table 2 and 3, our method can achieve good accuracy
+even without finetuning. Whereas the Performer still requires tens of thousands steps of finetuning
+(e.g. Figure 5 in Choromanski et al. (2021)). Table 4 also reveals that Performer has poor accuracy
+on certain tasks like byte-level document retrieval, while ours consistently achieve accuracy on par
+with the dense transformer. All this observations suggest that our method can better approximate
+the full attention mechanism than Performer.
+In terms of wall-clock time speedup, Figure 4 illustrates that the Performer can only achieve good
+speedup at long sequence length. The similar phenomenon is also observed in multiple online fo-
+rums 3. Certainly, the PyTorch JIT script does not yield the optimal implementation of the compu-
+tation graph, but it reveals that tremendous engineering efforts are required for Performer to achieve
+good speedup under moderate sequence length.
+Following Section 4.3, we also compare the theoretical speedup achieved by ours and the Performer.
+TnlIm= √√×ddpPd×m∙, "Tn×1 = 2√d X [Qn×d Θ Qn×d]：,i
+φ(Qn×m) = -^=pxp
+T(2) T(3) +
+一 Tn×1 一 Tn×1 +
+Tn×1 = maxi [Tn×m ]:i ,
+7 (4)	— Kn ×d P
+Tn×m = -√d Pd×m,
+Tn×1 = maxi [Tn×m ]:i ,
+1d
+Tn'' = 2√d 工 [Kn×d ® Knxd]：,i
+φ(Kn×m) = -ɪ exp
+T (5) T (6) +
+一 Tn×1 一 Tn×1 +
+(32)
+T(7)
+Tm×1
+T(9)
+Tm×d
+n
+X[φ(K)n×m ]i,:, Tn×1
+i=1
+φ(K)τn×m × Vn×d, Tn(×10d)
+n×m × Tm(7×)1
+φ(Q)n×m × Tm×d	Tn×1.
+The computation steps of Performer are listed in equation 32 where each equation denotes a sub
+computation graph that can potentially be fused. Notably, this is more complex than the original
+3https://github.com/huggingface/transformers/issues/7675
+21
+Under review as a conference paper at ICLR 2022
+—∙- Ours -∙- Perfomer -∙- Reformer -∙- Routing -∙- Slnkhom -∙- Nystrom
+dtype=float, #head=4, hldden=256	dtype=float, #head=4, hldden=512	dtype=float, #head=4, hldden=1024
+」9UUOJSUe4L υωcυα ⅛>0
+512	1024	2048	4096
+dtype=bfloatl6, #head=4, h∣dden=256
+PU 川，o4rpu 川
+512	1024	2048	4096
+dtype=bfloatl6, #head=4, hldden=256
+2.0
+1.5
+1.0
+0.5
+2.5
+2.0
+1.5
+1.0
+0.5
+2.5
+2.0
+1.5
+1.0
+0.5
+dtype=bfioatl6, #head=4, hldden=1024
+Figure 13: End-to-end inference speedup of different efficient transformers over dense transformer.
+mathematical expression to handle the numerical instability of exp. The total memory access can be
+computed with
+Speedup = {2
+nm (W + l) +n(d+1)+n(m + 1)+n(m + 3)
+m
++m(n + 1)+n( T + m + 1)
++ md (2n +1) + nd 2Tm+ +1) + n}/ n2 (2d +1) + 2n2+ nd (2n +1)].
+(33)
+We have m = dln(d) following Theorem 4 in Choromanski et al. (2021). We can substitute m =
+266, d = 64, and T = 128 into equation 33 and get Speedup > 1 when n > 672. On the other
+hand, the performer achieves the same speedup with ours with n > 1002.
+To conclude, our method is a good complementary to performer. With delicately optimized com-
+putation graph, performer can achieve good speedup and relatively good accuracy under long se-
+quence scenario. In contrary, our method has better speedup and accuracy under moderate and short
+sequence length. Besides, our method delivers lower approximation error on important edges so it
+is more friendly to finetuning.
+A.6 End-to-End Speedup and Memory Footprint Reduction
+In this section, we present the end-to-end speedup achieved by our method under different config-
+urations. We use the 4-layer dense transformer model of Text Classification task in Long Range
+Arena Tay et al. (2021). The dimension of each head is 64. We explore different combination of
+number of heads (4, 8), sequence length (512, 1024, 2048, 4096), and hidden dimension of the feed
+forward layer (256, 512, 1024). The end-to-end speedup over the dense transformer under different
+configurations are plotted in Figure 13.
+Our method achieves 1.11 〜1.52× and 1.08 〜1.47× end-to-end speedup over the dense trans-
+former, it is the only method that deliver end-to-end speedup under all configurations. Under se-
+quence length ≤ 2048, our method achieves higher speedup than most of the baselines. Although
+22
+Under review as a conference paper at ICLR 2022
+Sinkhorn transformer (Tay et al., 2020a) has higher speedup than ours at sequence length 2048, as
+shown in Table 4, its accuracy is less satisfying. This result justifies that our method delivers good
+speedup under short and moderate sequence length. Notably, this speedup is almost a free lunch.
+On one hand, Section 5 demonstrates that our method achieves comparable accuracy across differ-
+ent tasks and sequence length, so the model accuracy is not sacrificed. On the other hand, unlike
+previous efficient transformers, our method has no hyper-parameters and only requires lightweight
+finetuning process.
+■ Attention ■ Others « Speedup
+ωsuωα o÷jpωz=euuoN Aouω÷je-j
+1.6
+1.4
+1.2
+1
+0.8
+0.6
+0.4
+0.2
+0
+Seq
+1.6
+1.4
+1.2
+0.8
+0.6
+0.4
+0.2
+0
+1.10 x 1.09 x
+∞⅛0
+512
+512
+# Head = 8
+1.10 x
+1.09 x
+1.10 X 1.09 X
+1.41 x 1.38 x 1.37 X	1∙44 X	1.43 X 1.41 X
+∞⅛0
+∞⅛0
+∞⅛0
+∞⅛0
+∞⅛0
+512
+2048
+—1.44 X
+∞⅛0
+∞⅛0
+512
+4096
+—1.46 x
+①SUoa
+s」no
+①SUoa
+1024	256	512	1024
+1024
+1.15 X 1.15 X
+s」no
+①SUoa
+s」no
+①SUoa
+s」no
+①Suo Cl
+256
+-1.45 x
+1.41 x
+1.47 x
+1024
+s」no
+Φ∞CΦQ
+s」no
+Φ∞CΦQ
+s」no
+Φ∞CΦQ
+s」no
+Φ∞CΦQ
+s」no
+Φ∞CΦQ
+s」no
+Φ∞CΦQ
+6
+5
+2
+1
+S
+n
+O
+S
+n
+O
+6
+5
+2
+5
+2
+6
+5
+2
+5
+2
+Seq
+2048
+1024
+4096
+Figure 14: End-to-end inference latency break down under bfloat16.
+To study how our method contributes to the end-to-end speedup, we further break down the end-to-
+end inference time to the attention mechanism and other components under bfloat16. The results are
+illustrated in Figure 14. Under moderate and short sequence length like 1024 and 512, the “Others”
+contributes over 70% of the total latency. This is because the size of the matrix multiplications in the
+feed-forward network and query/key/value projection are comparable with the attention mechanism.
+However, unlike the attention mechanism that has limited time budget for compression, the feed-
+forward network and query/key/value projection use a static weight matrix during inference, so they
+can be compressed offline. Tons of methods have been proposed in the literature to do that even
+before the transformers are proposed. For instance, Mishra et al. (2021); Zhou et al. (2020) show
+that pruning the weights to 2:4 sparsity can deliver 1.3 〜1.6× speedup and 2× fewer parameters in
+the feed-forward and projection layers 4 without accuracy loss on BERT-large. Lagunas et al. (2021)
+apply structured pruning and achieve 2.4× speedup on SQuAD v1.1 with 1% drop of F1. The
+MobileBERT (Sun et al., 2020), on the other hand, redesign the network architecture that reduce the
+hidden dimension of feed-forward network in BERT from 4096 to 512. In terms of quantization,
+previous work (Zafrir et al., 2019) have shown that the linear layers can be quantized to 8 bit integer.
+Besides the linear layers, there are also techniques to accelerate other components in transform-
+ers. For instance, the MobileBERT (Sun et al., 2020) replaces the layer normalization to a simple
+element-wise linear transformation. The input embedding table is also compressed with smaller
+embedding dimension along with an 1D convolution.
+4https://developer.nvidia.com/blog/exploiting-ampere-structured-sparsity-with-cusparselt/
+23
+Under review as a conference paper at ICLR 2022
+⅛io⅛CPF υωcυα Oa p9z=euuoN UOReU-3∂0EυΞ Xead
+Perfomer -∙- Reformer —Routing -∙- Slnkhom -∙- Nystrom
+dtype=float, #head=4, hldden=512	dtype=float, #head=4, hldden=1024
+-∙- Ours
+dtype=float, ⅛head=4, hldden=256
+512	1024	2048	4096
+dtype=bfloatl6, #head=4, h∣dden=256
+Figure 15: Peak memory allocation normalized to dense transformer under different configurations.
+With all these techniques in the literature, it should not be hard to achieve 2× speedup in the non-
+attention part of transformer models. Then our method could deliver 1.13 〜1.41× speedup under
+sequence length ≤ 1024.
+We also measure the peak memory allocation of different models and configurations, the results
+are summarized in Figure 15. Our method achieves 1.41 〜1.82× memory reduction, which is
+comparable with or better than most existing efficient transformers when sequence length ≤ 1024.
+A.7 Combination with the Existing Efficient Transformers
+Existing efficient transformers usually sparsify the full attention mechanism to densely connected
+clusters (Tay et al., 2020a; Roy et al., 2021; Kitaev et al., 2020; Zaheer et al., 2020) or approximate
+it with low-rank projection (Wang et al., 2020). As our method is a good approximation of the full
+attention mechanism and brings wall time speedup at arbtrary sequence length, it can potentially be
+combined with the existing efficient transformers.
+We first demonstrate the combination of our method with Xiong et al. (2021). Xiong et al. (2021)
+propose a Nystrom-based self-attention mechanism that approximate standard self-attention with
+O(n) complexity. The Nystromformer is illustrated in Figure 16. We observe that the computation
+circled in Figure 16 is identical to the standard attention mechanism, so it can be further accelerated
+with our method. More importantly, the two matrix multipliation involved are the two of the three
+largest m × n matrices. It will be very beneficial to reduce their complexity.
+We report the accuracy on Image (1K) on LRA (Tay et al., 2021) in Table 6. We first pretrain a
+standard Nystromformer from the scratch for 35,000 iterations following Xiong et al. (2021). Then,
+we finetune it for 3,500 iterations (1/10 of the training process) under standard Nystromformer,
+Nystromformer + DFSSATTEN 1:2, and Nystromformer + DFSSATTEN 2:4. It is obvious that
+by combining DFSSATTEN and Nystromformer, we can achieve higher accuracy on LRA with
+lightweight finetuning.
+24
+Under review as a conference paper at ICLR 2022
+Figure 16: Combination of our method with Nystromformer (Xiong et al., 2021). The two red
+matrices are stored under 1:2/2:4 structured sparsity.
+Table 6: Accuracy on Image (1K) on LRA (Tay et al., 2021) under the combination of DFSSATTEN
+and Nystromformer (Xiong et al., 2021).	Pretraining	Finetuning
+Nystromformer (float)	41.17	41.52
+Nystromformer (bfloat16)	-	41.59
+Nystromformer + DFSSATTEN 1:2 (float)	-	4191
+Nystromformer + DFSSATTEN 2:4 (bfloat16)	-	42.54
+Then we provide a complexity analysis of the combination following Xiong et al. (2021). The
+landmark selection with segement-means takes O(n), iterative approximation of the pseudoinverse
+takes O(m3). The matrix multiplication complexity of the standard Nystromformer takes O(nm2 +
+mndv+m3+nmdv). After applying our method, it can be reduced to O (nψ- -+ Inmd +m3+nmdv).
+The memory footprint can be reduced from O(mdq + nm + m2 + nm + ndv ) to O(mdq + nm +
+m2 - ndv). Given n m > dv ≈ dp, this could be a significant improvement that allows us to use
+more landmarks m to better approximate the full attention mechanism.
+Besides Nystromformer, we also illustrate two possible combinations with BigBird (Zaheer et al.,
+2020) and Linformer Wang et al. (2020) that can be explored in the future work.
+As shown in Figure 17 (A), Zaheer et al. (2020) use block sparsity with block size 64 and compute
+a full attention within each block. We can apply the 1:2 or 2:4 sparsity within each block to bring
+further speedup.
+Figure 17 (B) gives another example on how to combine our method with Linformer (Wang et al.,
+2020). Linformer uses low-rank approximation on the attention mechanism as follows:
+O = Softmax (Q (√^) ) FV,	(34)
+where E , F ∈ Rn×k are linear projection matrices and k n. We can first prune E and F along
+with other weight matrices to have 1:2 or 2:4 sparsity offline following Mishra et al. (2021). Then
+we compute EK and FV with Sparse Matrix-Matrix multiplication. Next, we multiply Q and
+(EK)T and the result is pruned to 50% structured fine-grained sparsity on the fly. After applying
+softmax to the nonzeros, we multiply it with FV.
+A.8 Visualize Attention Distribution
+To illustrate that our DFSSATTEN can well capture the fine-grained sparsity in attention, we vi-
+sualize the attention weight matrices in BERT-large on SQuAD v1.1 in Figure 18. In detail, we
+25
+Under review as a conference paper at ICLR 2022
+2 16
+Figure 17: Combination of our method with BigBird (Zaheer et al., 2020) and Linformer (Wang
+et al., 2020)
+run inference of the same input sample in BERT-large model pretrained under dense, 1:2, and 2:4
+settings, then collect the attention weight matrix in the first layer. It is obvious that the pattern in
+dense transformer and our DFSSATTEN are quite similar. The magnitude of nonzero values in DF-
+SSATTEN are a little bit higher than dense attention. This is because the softmax normalizes the
+values in each row with the exponential sum of each entry. After removing 50% smaller entries, the
+magnitude of remaining entries would be relatively higher. Nevertheless, we find that this does not
+influence the model accuracy, as the forthcoming normalization layers will take care of it.
+26
+Under review as a conference paper at ICLR 2022
+0：IndU- land-
+Dense (float)
+1:2 (float)
+0 and-τ=dlu
+Figure 18: Visualization of attention weight in dense transformer and DFSSATTEN
+27

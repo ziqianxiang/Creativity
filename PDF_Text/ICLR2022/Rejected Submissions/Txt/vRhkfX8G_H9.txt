@@ -1,0 +1,1250 @@
+﻿Under review as a conference paper at ICLR 2022
+SpSC: A Fast and Provable Algorithm for
+Sampling-Based GNN Training
+Anonymous authors
+Paper under double-blind review
+Ab stract
+Neighbor sampling is a commonly used technique for training Graph Neural
+Networks (GNNs) on large graphs. Previous work has shown that sampling-
+based GNN training can be considered as Stochastic Compositional Optimization
+(SCO) problems and can be better solved by SCO algorithms. However, we find
+that SCO algorithms are impractical for training GNNs on large graphs because
+they need to store the moving averages of the aggregated features of all nodes
+in the graph. The moving averages can easily exceed the GPU memory limit
+and even the CPU memory limit. In this work, we propose a variant of SCO
+algorithms with sparse moving averages for GNN training. By storing the moving
+averages in the most recent iterations, our algorithm only requires a fixed size
+buffer, regardless of the graph size. We show that our algorithm preserves the
+convergence rate of the original SCO algorithm when the buffer size satisfies
+certain conditions. Our experiments validate our theoretical results and show that
+our algorithm outperforms the traditional Adam SGD for GNN training with a
+small memory overhead.
+1	Introduction
+Graph Neural Networks (GNNs) have become the state-of-the-art models for machine learning
+tasks on graph-structured data. By recursively aggregating the features of neighboring nodes,
+GNNs learn an embedding of the nodes and use the embedding for downstream tasks such as node
+classification (Kipf & Welling, 2017; Duran & Niepert, 2017) or link prediction (Zhang & Chen,
+2017; 2018).
+Due to the recursive neighbor aggregation, training GNNs on large graphs is computationally
+challenging. To alleviate the computation burden, various neighbor sampling methods have been
+proposed (Hamilton et al., 2017; Ying et al., 2018; Chen et al., 2018; Zou et al., 2019; Li et al.,
+2018; Chiang et al., 2019; Zeng et al., 2020). The idea is to compute an unbiased estimation of the
+aggregation result in each layer based on a sampled subset of neighbors. These sampling techniques
+enable GNN training on large graphs. However, due to the composition of the aggregation functions
+in multiple layers, the stochastic gradient obtained with sampled neighbor aggregation is not an
+unbiased estimation of the true gradient, which undermines the convergence property of SGD-based
+training algorithms.
+Previous work has shown that sampling-based GNN training is actually a Stochastic Compositional
+Optimization (SCO) problem (Cong et al., 2020; 2021). Cong et al. (2021) show that SCO algorithms
+can achieve faster convergence than the commonly used Adam SGD for GNN training on small
+graphs. Despite their good convergence property, SCO algorithms are not widely adopted for GNN
+training due to two reasons. First, although SCO algorithms achieve smaller training losses, the
+obtained GNN models usually have poor generalization - the validation and test accuracy are lower
+than the models trained by Adam SGD. Second, SCO algorithms need to maintain the moving
+averages of aggregation results of all nodes in the graph. For large graphs, the moving averages may
+exceed the memory capacity of the GPU. While it is possible to store the moving averages in CPU
+memory, copying the data from CPU to GPU in each iteration is expensive, which may negate the
+benefits of the faster convergence of SCO algorithms.
+To address the above issues, we propose a Sparse Stochastic Compositional (SpSC) gradient method
+in this work. Our main idea is to store the moving averages for nodes sampled in the most recent
+1
+Under review as a conference paper at ICLR 2022
+(a) SCGD
+I	I	Sampled nodes found in buffer	I	I	Invalidated nodes
+I	I	Sampled nodes not found in buffer	I	I	UnSamPIed Nodes
+(b) SpSC
+Figure 1: Updating the moving average of Z(l). SCGD needs to store the moving averages for all
+nodes in the graph. In SpSC, We only stores the data for nodes sampled in the past t iterations.
+S
+签)
+iterations instead of all nodes. As only a small number of nodes are stored, our algorithm has
+small memory consumption even for large graphs. We provide a convergence analysis on SpSC
+and show that, when the number of stored iterations satisfies certain constraints, SpSC can preserve
+the asymptotic convergence rate of the original SCO algorithm. In practice, the sparse moving
+averaging slightly slows down the convergence of SCO algorithm, but it surprisingly overcomes
+its poor generalization problem and achieves higher accuracy for sampling-based GNN training.
+Compared with Adam SGD, our algorithm incurs a small overhead for updating the moving averages
+in each iteration, but the overhead can be easily justified by the faster convergence of our algorithm.
+Our experiments with two GNN models on different input graphs validate our theoretical results and
+show that our algorithm achieves higher accuracy than Adam SGD with the same or less amount of
+training time.
+2	Background and Motivation
+To facilitate our discussion, we first give background on sampling-based GNN training and its relation
+to stochastic compositional optimization.
+2.1	GNN Computation
+The computation at each layer of a GNN is conducted in two steps: aggregate and update. For
+each node v in the graph, the aggregate function gathers data from its neighboring nodes and
+returns the aggregation result as
+zv = Aggv (hne[v] , xv, xne[v] ).	(1)
+Here, hne[v] is the intermediate features of v ’s neighbors from the previous layer, xv is the input
+feature of v, and xne[v] is the input features of v’s neighbors. The update function uses the
+aggregated value to produce the intermediate features of v as
+hv = Updv(zv, xv).	(2)
+By stacking the intermediate features and the input features of all nodes, the computation at layer l
+can be written as
+Z(l) = Agg(H(l-1), X),	H(l) =Upd(Z(l),X,W(l)).	(3)
+Here, H(l-1) = [h(1l-1), . . . , h(Nl)] denotes the intermediate features of all nodes at layer l-1, Z(l) ∈
+RN×dl is the aggregated features of all nodes at layer l, X = [x1, . . . , xN] is the input features of all
+nodes, and W(l) is the learnable weights. As an example, Graph Convolutional Network (GCN) (Kipf
+& Welling, 2017) has Agg(H (l-1), X) = P H (l-1) where P is the normalized Laplacian matrix
+of the graph, and Upd(Z(l), X, W(l)) = σ(Z(l)W(l)) where σ is a non-linear activation function.
+Many other GNNs can be expressed in this form with different definitions of Agg and Upd (Zhou
+et al., 2018).
+2
+Under review as a conference paper at ICLR 2022
+2.2	Sampling-based GNN Training as Stochastic Compositional Optimization
+When the graph is large, the neigbhbor aggregation operation Agg incurs a large overhead, making
+the training of GNNs computationally challenging. Therefore, prior work has proposed to replace
+the Agg function with a sampled neighbor aggregation operation Agg. By sampling the neighboring
+nodes, an unbiased estimate of Z(l) is computed at each layer, i.e.,
+Ze(l) = Aggg(H(l-1), X)	(4)
+with E[Ze(l)] = Z(l). If we define the computation at layer l of the original GNN as a function
+f(l)(Z(l-1),W(l-1),...,W(T)) = [Z(l),W(l),...,W(T)]	(5)
+=[Agg(Upd(Z(l-1),X, W(l-1))), W(l),..., W(T)]],
+the computation with sampled neighbor aggregation can be written as a stochastic function
+fξ(l)(Ze(l-1), W (l-1),..., W (T)) = [Ze(l),W(l),...,W(T)]	(6)
+=[Aggg(Upd(Ze(l-1),X,W(l-1))),W(l),...,W(T)]]
+where ξl represents the sampled neighbors at layer l. Since Ze(l) is an unbiased estimate of Z(l), we
+have E[fξ(l)] = f(l), and the computation of a T -layer GNN can be written as
+F(θ) = EξT+1 hfξ(TT++11) EξT hfξ(TT) ...Eξ1[f(1)(θ)]...ii	(7)
+where θ = [X, W(1), ..., W(T)], f(T+1) is the loss function, and fξ(T +1) corresponds to the estimated
+loss with mini-batch sampling. Note that we put all the learnable weights in θ to formulate the
+computation as a stochastic compositional function. Our goal is to minimize F (θ), which is exactly a
+multi-level SCO problem.
+2.3	Large Memory Consumption Issue with A Naive Implementation
+SCO has been well studied in the past few years, and many algorithms with guaranteed convergence
+have been proposed (Zhang & Xiao, 2019; Yang et al., 2019; Chen et al., 2020; Yang et al., 2019;
+Balasubramanian et al., 2020; Chen et al., 2020; Lian et al., 2017; Wang et al., 2017b; Ghadimi
+et al., 2020). It seems straightforward to adopt these SCO algorithms to achieve faster training of
+GNNs. However, these algorithms have large memory consumption when applied to GNN training
+and cannot run on GPUs for large graphs.
+To see the problem, let us consider the implementation of the SCGD algorithm (Yang et al., 2019) for
+GNN training. Formally, the algorithm is written as
+(8)
+yk(l+)1=(1-βk)yk(l)+βkfξ(ll,)k(yk(l+-11)),	2≤l≤T,	(9)
+Θk+1 = θk - αk Vfξ1k (θk )Vf!2k (yk1))... VfξT+ι1) (y?)).	(10)
+,	,	+ ,
+The key idea is to store an auxiliary variable y(i) to maintain the moving average of each composite
+function. Since fξ(l) returns the exact values of W(l), ..., W(T), we only need to maintain a moving
+average of Ze(l) for each layer. The computation is shown in Figure 1a. The moving average of the
+aggregated features is stored in Y (l) with each row for one node. In each iteration, some nodes (rows)
+are sampled, and the estimated aggregation results Ze(l) are merged into Y (l) based on Formula (8)
+and (9). For the nodes that are not sampled, We simply multiply the corresponding rows of Z(I) by
+(1 - βk ). Since the number of rows in Y(l) is the number of nodes in the graph, Y(l) takes a lot
+of memory when the graph is large. For example, for training a 3-layer GCN on a graph with two
+million nodes, suppose the hidden state dimension dl = 512 and a floating point has 4 bytes, Y takes
+3 × 2M × 512 × 4 = 12GB of memory. All of the existing SCO algorithms need to maintain this
+moving average, which impedes their application to large-scale GNN training.
+3
+Under review as a conference paper at ICLR 2022
+3	Sparse Stochastic Compositional Gradient Descent
+To reduce the memory consumption of SCO algorithms for GNN training, we propose a Sparse
+Stochastic Compositional (SpSC) gradient method. Instead of storing the moving averages of all
+nodes in the graph, we only store the moving averages of nodes that are sampled in the most recent
+iterations.
+As shown in Figure 1b, we maintain a fixed size buffer of the moving averages. The buffer is divided
+into t chunks with each chunk for the ZQ) of one iteration. The size of each chunk is m√ ∙ di where
+ml is the maximum number of the nodes that can be sampled at layer l and dl is the hidden state
+dimension. Initially, the buffer is empty. In every iteration, we first check if the sampled nodes are in
+the buffer. For the nodes that are found in the buffer, we collect the corresponding rows of the buffer
+and add them to Zek(l) based on Formula (8) and (9). For the nodes that are not found in the buffer, we
+multiply the corresponding rows of Zek(l) by βk. The updated Zek(l) is then written to chunk-(k mod t).
+All the other chunks are multiplied by (1 - βk). Since the sampled nodes found in the buffer are
+updated to chunk-(k mod t), the original values in chunk-0 and chunk-1 are invalidated, as shown
+by the shadowed rows in Figure 1b. As the buffer size is a constant (T ∙ t ∙ m√ ∙ d) regardless of the
+graph size, our algorithm can be employed to train GNN on very large graphs.
+Our algorithm overwrites chunk-(k mod t) in iteration k . The information of the overwritten nodes is
+lost. The update of the moving averages can be written as
+k-1
+yk(l+)1=(1-βk)yk(l)+βkfξ(ll,)k(yk(l+-11))- Y (1 - βj)u(kl)	(11)
+j=k-t+1
+where
+Ukl)= P(ξι,k-t∕(ξι,k-t+ι ∪ …∪ ξι,k))ykl-1+1.	(12)
+P (ξι,k-t∕(ξι,k-t+ι ∪∙∙∙∪ ξι,k)) is a matrix with binary values representing the overwritten nodes
+in the current iteration k, i.e., the nodes that are sampled in iteration k - t and are not sampled
+in the following t iterations. Since we only store the moving averages of nodes that are sampled
+in the most recent t iterations, the information of the overwritten nodes is lost. These nodes are
+multiplied by (1 - βj) in every iteration after iteration k -1. The values of the overwritten rows are
+Qjk=-k1-t+1(1 - βj)u(kι). Our algorithm simply replaces Formula (8) and (9) in the SCGD algorithm
+with Formula (11).
+To study the convergence property of SpSC, we make the following assumptions that are commonly
+used in the analysis of SCO algorithms (Yang et al., 2019; Balasubramanian et al., 2020).
+Assumption 1. The composite functions f(ι) are Lι -smooth. That is, for any y and y0, we have
+kVfξ∣)(y) -Vfξ∣)(y0)k ≤ Lι ky - y0∣∣.
+Assumption 2. The stochastic gradients of the composite functions f(ι) are bounded in expectation,
+i.e.,E[kVfξ(lι)(y)k2] ≤Cι2.
+Assumption 3. The estimated aggregation results obtained by sampled neighbor aggregation
+is unbiased, i.e., E[fξ(ι) (y)] = f(ι) (y), and the stochastic gradient of f(ι) is unbiased, i.e.,
+E[Vfξ(lι)(y)] =Vf(ι)(y).
+Following the single-timescale analysis of the algorithm (Balasubramanian et al., 2020), we use large
+batches for estimating the composite functions and assume that the estimation variance is small.
+Assumption 4. The estimated aggregation results have small bounded variance, i.e., E[kfξ∣)k(y)-
+f(I)(y)k] ≤ βkV2.
+This is a reasonable assumption for GNN training on GPUs as we always sample a batch of nodes for
+neighbor aggregation to achieve better utilization of the GPU parallelism.
+In additional to the conventional assumptions, we make an assumption on the moving averages.
+Assumption 5. The moving average of the aggregated features are bounded, i.e., E[ky(ι) k2] ≤ D2.
+4
+Under review as a conference paper at ICLR 2022
+The convergence rate of our algorithm is summarized in the following theorem.
+Theorem 1. Under Assumptions 1-5, if we set β ≤ 1 — 2(-1/(2T-1)) and α = β ∙
+min (dTq2(1-C)2T J, pτ_a2+；6。 ^^T), the model parameters {θk} of our training
+algorithm with (11) for updating sparse moving averages satisfy
+1 K-1
+K EE[∣NF(θk)k]2 ≤O(β)+4CmaχT2
+k=0
+(I + Cmax)(I - β)2(tT) + (1 — β)2t+1 λ D
+αβ2	+	Taβ2 — D
+(13)
+where Cmax = max(C2C2 …C2, C3C4 …C2,…,C2, 1) for l = 2 ...T, t is the number of
+buffer chunks used in our algorithm.
+The last term on the RHS of (13) reveals how the convergence of the SCGD algorithm is affected by
+the sparse moving averages. The larger t we use (i.e., the more chunks we have in the buffer), the
+smaller (1 — β)2(t-1) and (1 — β)2t+1we have, and the faster convergence We achieve. In theory, if
+We can make (1 — β)2(t-1) = O(β4), the algorithm will achieve O(Y∖/K convergence rate. As
+β → 0, we need larger t to maintain the convergence rate, and eventually, we will need to store the
+moving average of all nodes in the graph.
+Applying Sparse Moving Averages to SCSC. Our sparse moving average can also be applied to
+other SCO algorithms. For example, the Stochastically Corrected Stochastic Compositional gradient
+method (SCSC) (Chen et al., 2020) has a correction term in the update of the moving averages.
+Because of the correction term, SCSC needs a relaxed assumption on the estimation error of the
+composite functions. More specifically, if we change (11) to
+k-1
+ykl+ι = (1 - βk)ykl) + fξl,l(yk+1)) —(1 —βk)%(yklT))-	Y (1-β)Ml (14)
+j=k-t+1
+and replace (8) and (9) with (14), we can relax Assumption 4 as
+Assumption 6. The estimated aggregation results have bounded variance, i.e., E[kfξ(l,)k(y) —
+f(l)(y)k] ≤V2.
+The convergence rate of SCSC with sparse moving averages is summarized as follows.
+Theorem 2. Under Assumptions 1-3 and 5-6, if we choose α^ = α = √√κ and βk = β = √cK, the
+model parameters {θk} of SCSC with (14) for updating sparse moving averages satisfy
+1 K-1
+K ∑E[kVF(θk)k2] ≤O(β) +
+k=0
++
+2(1 + β)(1 — β)2(tτ)
+αβ
+T
+XDl2
+l=1
+6(1 二 β)2(tτ)
+α
+T
+Cu X Dl2
+l=1
+(15)
+where Cu = max 4Cl2 + γl for l = 1 . . . T.
+The result suggests that, if we can set t such that (1 — β)2(t-1) = O(β3), the algorithm will achieve
+O(，1/K) convergence rate.
+4 Implementation Details
+Algorithm 1 describes an implementation of Formula (11) in our algorithm. For each layer, we
+allocate a buffer (buf) of size tml × dl for the moving averages. The buffered nodes are maintained
+in a list node Jist ∈ Rtml where node_list[i] is the index of the node stored at buf [i]. If buf [i] is
+empty, nodedist[i] is set to -1. In every iteration k, we first get the location of chunk-(k mod t).
+Then, we look up each of the sampled nodes in the buffer (line 3). The LookUp function computes
+5
+Under review as a conference paper at ICLR 2022
+Algorithm 1: Updating sparse moving average of aggregated features at layer l in iteration k
+Input: Sampled nodes S, Buffered nodes nodelist ∈ Rtml, buf (l) ∈ Rtml×dl, Zkl ∈ RlSl×dl
+// Get the location of chunk-(k mod t)
+ι start = (k mod t) * mi；
+2	end = Chunk-Start + |S|;
+// Look up the sampled nodes in the buffer
+3	idx_in_buf,idx_in_z = LookUp(S, nodeJist);
+// Update the moving average for the sampled nodes
+4	Zkl) = βk * Zekl); Zkl) [idx_in_z] = (1 — βk) * buf(l) [idxΛnJbuf] + Zkl)[idx_in_z];
+// Update the moving average for all buffered nodes
+5	buf (l) = (1 — βk) * buf (l) ; buf (l) [start : end] = Zek(l) ;
+// Invalidate the old buffer for the sampled nodes
+6	nodedist[idxJinJbuf] = 1;
+// Add the sampled nodes to nodeJIist
+7	nodeJist[start : end = S;
+the intersection of S and node JIiSt and returns the indices of the overlapping nodes in the two arrays.
+If a sampled node is not found in the buffer, we multiply the corresponding row of Zek(l) by βk . If a
+sampled node is in the buffer, we read in its current moving average and update the corresponding row
+(l)
+of Zk (line 4). For buffered nodes that are not sampled, we simply multiply their moving averages
+by (1 - βk) (line 5). For buffered nodes that are sampled, we invalidate their original buffer by setting
+node Jist [^idx JnJbuf ] to —1 (line 6). Last, we add the sampled nodes to the node list.
+Most of the operations in Algorithm 1 are simple vector operations, and they incur little overhead. The
+performance bottleneck is the LookUp function. With a naive implementation, it has O(tml log |S|)
+time complexity, assuming S is sorted. In our implementation, we use an auxiliary array node Joc ∈
+RN to store the locations of all nodes in the buffer and accelerate the LookUp function. Specifically, if
+node-i is in the buffer, we store its location in buffer in nodeJoc[i]; otherwise, nodeJoc[i] is set to-1.
+With the auxiliary array, the idx_in_z can be obtained by comparing nodeJoc[S] with zero, and the
+idx_inJ)uf is simply nodeJoc[S ][id^x_in_z]. Before updating the node Jist at line 7 of Algorithm 1,
+we remove the overwritten nodes from nodedoc by setting nodeJoc[nodeJist[start : end] to-1.
+Finally, we store the locations of the newly sampled nodes to nodedoc by setting nodedoc[S] to
+[start, start + 1, . . . , end]. It is easy to see that all these operations have O(|S|) time complexity.
+5 Evaluation
+5.1	Experimental Setup
+We conduct our experiments on a workstation with an Nvidia RTX 3090 GPU, an Intel Xeon Gold
+6226R CPU, and 512GB RAM. Our code is implemented with PyTorch 1.8.0 and PyTorch Geometric
+1.7.0.
+We evaluate our algorithm on five graphs as listed in Table 1. The reddit and yelp graph are
+adopted from GraphSAINT (Zeng et al., 2020), and the arxiv, proteins, products are from
+the Open Graph Benchmark (Hu et al., 2020).
+We apply our algorithm to two GNN models: GCN (Kipf & Welling, 2017) and GraphSAGE (Hamil-
+ton et al., 2017). Both models have three convolutional layers. We use Formula (11) for updating
+the moving average instead of Formula (14). This is because Formula (14) requires two forward
+passes which incurs extra overheads. The algorithm is run for 50 epochs. We set β to 0.2 initially,
+and decrease it to 0.1 at epoch 20, and further decrease it to 0.05 at epoch 40. The number of buffered
+chunks (t) is set to 8. We adopt the layer-wise sampling method in Zou et al. (2019) for neighbor
+sampling. The batch size is set to 4096, and the number of sampled neighbors in each layer is set to
+8192.
+5.2	Training Results
+Validation Accuracy. Figure 2a shows the validation accuracy of different algorithms for training
+a GCN on arxiv. We can see that full neighbor aggregation (Adam-Full) achieves the highest
+6
+Under review as a conference paper at ICLR 2022
+Table 1: Graph datasets (’m’ stands for multi-label classification).
+	reddit	yelp	arxiv	proteins	products
+#nodes	-233K-	717K	169K	132K 二	24M
+#edges	11.6M	7.0M	1.2M	79M	123M
+#classes	41	100 (m)	40	112(m)一	47	—
+UO 一sp-">
+u∙9ss">
+∙8∙7∙65
+10	20	30	40	50
+Epoch
+40
+50
+>0.80
+a 0.78
+5 0.76
+< 0.74
+U 0.72
+O
+W 0.70
+P 0.68
+§ 0.66
+0.64 .	.	.	.	.	.
+0	10	20	30	40	50
+Epoch
+(c) proteins GraphSAGE
+(a) arxiv GCN
+Auajnuu4 u∙9ss">
+(b) reddit GraphSAGE
+0	10	20	30	40	50
+Epoch
+(e) yelp GraphSAGE
+Figure 2: Validation accuracy over epochs.
+SParSe_SCO
+SCO
+Adam_Full
+Adam_Sample
+accuracy. This is reasonable because full neighbor aggregation returns unbiased estimates of gra-
+dients. If neighbor sampling is used, the accuracy clearly drops with the same training algorithm
+(Adam-Sample). Our algorithm (SParse_SCO) is able to improve the convergence of sampling-based
+GNN training and achieves almost the same accuracy as full neighbor aggregation. The results on
+reddit and yelp are similar. On products graph, Adamtull runs out of memory, so We only
+show the results of sampling-based training in Figure 2d. Interestingly, we find that our algorithm
+with neighbor sampling achieves even higher accuracy than Adam-Full on proteins graph, as
+shoWn in Figure 2c. The original SCO algorithm (Which stores the moving averages for all nodes
+in the graph) also has lower accuracy than Sparse-SCO. This is probably due to the overfitting of
+models by Adam-Full and SCO.
+Training Loss. Figure 3 shows the training loss of different algorithms on different graphs.
+For reddit and yelp, we are able to run full neighbor aggregation on our GPU. As expected,
+Adam-Full achieves the smallest training loss. Adam-Sample, however, has the slowest convergence.
+SCO achieves training loss close to Adam-Full. We run our algorithm with different t's. The larger t
+we use, the smaller training loss we obtain. The results are consistent with our theoretical analysis and
+also suggesting that the poor accuracy of the original SCO algorithm is probably due to overfitting.
+For products graph, we are not able to run full neighbor aggregation. The results show a clearly
+faster convergence of our algorithm than Adam SGD for sampling-based training.
+Test Accuracy. Table 2 lists the test accuracy of the models trained by different algorithms. For
+reddit and yelp, we follow the GraphSAINT paper (Zeng et al., 2020) and report the F1-micro
+score. For proteins, we follow the OGB (Hu et al., 2020) and report the ROC-AUC. We can see
+that our training algorithm achieves the highest test accuracy for both GCN and GraphSAGE on
+almost all the graphs. We do not include the results for GCN on yelp graph because its accuracy
+is apparently lower than GraphSAGE with all training algorithms, probably due to the limited
+expressiveness of the GCN model. While it is hard to draw a direct comparison with GraphSAINT
+because the sampling methods and the model architectures are different, our test accuracy on reddit
+and yelp matches the best accuracy reported by GraphSAINT (Zeng et al., 2020). It is worth noting
+that our algorithm achieves higher accuracy than Adam SGD with both full neighbor aggregation and
+neighbor sampling on proteins and products graph. The numbers are higher than the accuracy
+7
+Under review as a conference paper at ICLR 2022
+sso~∣ 6≡≡ajl
+。5 D 5 D
+16M
+SSO-j6WU"」！
+∙2Q∙8∙6
+20E
+40
+50
+20E
+40
+50
+20E
+40
+50
+(a)	reddit GraphSAGE
+(b)	yelp GraphSAGE
+(c)	products GCN
+W
+W
+W
+Figure 3:	Training loss over epochs.
+Table 2: Test accuracy of models trained by different algorithms on different graphs (’-’ means not
+available due to out of memory).
+(a) GCN
+	reddit	arxiv	proteins	products
+Adam_Full	-0961-	0.712	0749	-
+Adam-Sample	-0957-	0.663	0726	0790
+SCO	-0945-	0.698	0744	0773
+SParSe_SCO-	0.961	0711	0.770 一	0.802	—
+(b) GraphSAGE
+	reddit	yelp	arxiv	proteins	products
+AdamIull	-0963-	0.632	0.714	0758	-
+Adam_Sample	-0956-	0.631	0.685	07T8	0.787	—
+SCO	-0.913-	0.628	0.644	0.717	-
+SParSe_SCO~~	0.966	0.651	0.713	0.779 一	0.801	—
+of the same models reported in OGB Leaderboards (ogb, 2021). The results suggest that there is an
+improvement space for the accuracy of GNN models by using better training algorithms.
+Execution Time. Table 3 lists the time per epoch of different training algorithms on different graphs.
+Although full neighbor aggregation achieves good convergence in many cases, it incurs a much large
+computation overhead than sampled neighbor aggregation. The execution time of Adam_Full is 7x to
+55x longer than that of AdamSample. Compared with AdamSample, the SCO algorithm incurs a
+small overhead for updating the moving average of aggregation results. Our algorithm runs slightly
+slower than SCO because the LookUp operation in Algorithm 1 incurs an extra overhead. However,
+the execution time is still much smaller than full neighbor aggregation.
+Memory Consumption. Figure 4 shows the memory consumption of different algorithms. We
+collect the numbers by calling the max memory.allocated function in PyTorch at the end of the
+first epoch. For arxiv, reddit, proteins, and yelp, full neighbor aggregation takes much
+larger memory space than sampled aggregation. SCO and SParSe_SCO require additional memory for
+storing the moving averages. Because we only store the moving average of nodes sampled in recent
+iterations, Sparse-SCO uses less memory than SCO. On products graph, SCO requires extremely
+large memory due to the massive number of nodes, while our Sparse-SCO can run with only 2GB of
+GPU memory.
+6 Related Work
+To overcome the scalability limitation of GNN training, various neighbor sampling methods have
+been proposed, including node-wise sampling (Hamilton et al., 2017; Ying et al., 2018), layer-wise
+sampling (Chen et al., 2018; Huang et al., 2018; Zou et al., 2019), and subgraph sampling (Zeng
+et al., 2020; Chiang et al., 2019). These sampling-based training methods achieve good accuracy in
+practice (particularly on small graphs), but they lack theoretical justification.
+8
+Under review as a conference paper at ICLR 2022
+Table 3: Time per epoch of different training algorithms in seconds (’-’ means not available due to
+out of memory).
+(a) GCN
+	reddit	arxiv	proteins	products
+AdamIull-	-284-	-197-	2065	-
+Adam_Sample	-053-	-0:28-	0.55	1.01
+SCO	-072-	-0:37-	067	2.31
+SParSe_SCO~~	0.82	0.51	0.81	—	1.24
+(b) GraphSAGE
+	reddit	yelp	arxiv	proteins	products
+Adam_Full	-45.29-	23.07	-410-	4616	-
+Adam_Sample	-082-	2.38	-050-	0.93	1.47	—
+SCO	-109-	3.61	-061-	103	-
+SParSe_SCO-	1.26	2.93	0.85	1.26	—	1.87	—
+5
+E
+OJ
+Σ
+ɔ
+Q-
+3
+S' 2 5
+。2∙5
+二 2
+o 1.5
+2 1
+o 0.5
+(c) proteins
+GraphSAGE
+(b) reddit
+GraphSAGE
+12
+10
+8
+6
+4
+2
+0
+(a) arxiv
+GCN
+(d) products
+GCN
+(e) yelp
+GraphSAGE
+0
+
+-- 5 -
+m 05
+0
+Figure 4:	GPU memory consumption of different algorithms.
+Some recent works (Cong et al., 2020; 2021) point out that sampling-based GNN training is actually
+multi-level Stochastic Compositional Optimization (SCO). However, they either use this connection
+to justify their sampling techniques and fall back to Adam SGD for training (Cong et al., 2020), or
+they directly adopt an SCO algorithm without considering the large memory consumption issue (Cong
+et al., 2021).
+The research on SCO traces back to (Ermoliev, 1976) where a two-timescale stochastic approximation
+scheme was proposed for two-level problems. Various SCO algorithms and convergence analyses
+have been proposed ever since (Wang et al., 2017a;b; Lian et al., 2017; Yang et al., 2019; Zhang &
+Xiao, 2019; Chen et al., 2020; Balasubramanian et al., 2020; Ghadimi et al., 2020; Hu et al., 2019;
+Lin et al., 2018). Despite a substantial volume of work on SCO in recent years, none of the existing
+work has considered the large memory consumption issue and the data movement overhead of the
+algorithms. Our work is the first to establish a convergence analysis for SCO algorithms with sparse
+moving averages.
+7 Conclusion
+In this work, we propose a new variant of SCO algorithm for training graph neural networks on
+large graphs. Our main idea is to maintain a sparse moving average of the aggregation results in
+each convolutional layer. We study the convergence property of our algorithm and show that the
+algorithm can achieve O(，1/K) convergence rate when a sufficient amount of moving averages
+are maintained. Our experiments with two GNN models on different graphs validate our theoretical
+results and show a clear advantage of our algorithm against Adam SGD for GNN training.
+9
+Under review as a conference paper at ICLR 2022
+References
+Ogb leaderboards for node classification, 2021. URL https://ogb.stanford.edu/docs/
+leader_nodeprop/.
+Krishnakumar Balasubramanian, Saeed Ghadimi, and Anthony Nguyen. Stochastic multi-level
+composition optimization algorithms with level-independent convergence rates. arXiv preprint
+arXiv:2008.10526, 2020.
+Jie Chen, Tengfei Ma, and Cao Xiao. FastGCN: Fast learning with graph convolutional networks via
+importance sampling. In International Conference on Learning Representations, 2018.
+Tianyi Chen, Yuejiao Sun, and Wotao Yin. Solving stochastic compositional optimization is nearly
+as easy as solving stochastic optimization. arXiv preprint arXiv:2008.10847, 2020.
+Wei-Lin Chiang, Xuanqing Liu, Si Si, Yang Li, Samy Bengio, and Cho-Jui Hsieh. Cluster-gcn: An
+efficient algorithm for training deep and large graph convolutional networks. In Proceedings of
+the 25th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, pp.
+257-266, 2019.
+Weilin Cong, Rana Forsati, Mahmut Kandemir, and Mehrdad Mahdavi. Minimal variance sampling
+with provable guarantees for fast training of graph neural networks. In Proceedings of the 26th
+ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, pp. 1393-1403,
+2020.
+Weilin Cong, Morteza Ramezani, and Mehrdad Mahdavi. On the importance of sampling in learning
+graph convolutional networks. arXiv preprint arXiv:2103.02696, 2021.
+Alberto Garcia Duran and Mathias Niepert. Learning graph representations with embedding propaga-
+tion. In Advances in neural information processing systems, pp. 5119-5130, 2017.
+Yu. Ermoliev. Methods of stochastic programming. Monographs in Optimization and OR, 1976. In
+Russian.
+Saeed Ghadimi, Andrzej Ruszczynski, and Mengdi Wang. A single timescale stochastic approxima-
+tion method for nested stochastic optimization. SIAM Journal on Optimization, 30(1):960-979,
+2020.
+Will Hamilton, Zhitao Ying, and Jure Leskovec. Inductive representation learning on large graphs. In
+Advances in neural information processing systems, pp. 1024-1034, 2017.
+Weihua Hu, Matthias Fey, Marinka Zitnik, Yuxiao Dong, Hongyu Ren, Bowen Liu, Michele Catasta,
+and Jure Leskovec. Open graph benchmark: Datasets for machine learning on graphs. arXiv
+preprint arXiv:2005.00687, 2020.
+Wenqing Hu, Chris Junchi Li, Xiangru Lian, Ji Liu, and Huizhuo Yuan. Efficient smooth non-convex
+stochastic compositional optimization via stochastic recursive gradient descent. In Advances in
+Neural Information Processing Systems, pp. 6929-6937, 2019.
+Wenbing Huang, Tong Zhang, Yu Rong, and Junzhou Huang. Adaptive sampling towards fast graph
+representation learning. In Advances in neural information processing systems, pp. 4558-4567,
+2018.
+Thomas N. Kipf and Max Welling. Semi-supervised classification with graph convolutional networks.
+In International Conference on Learning Representations (ICLR), 2017.
+Ruoyu Li, Sheng Wang, Feiyun Zhu, and Junzhou Huang. Adaptive graph convolutional neural
+networks. In AAAI Conference on Artificial Intelligence, 2018.
+Xiangru Lian, Mengdi Wang, and Ji Liu. Finite-sum composition optimization via variance reduced
+gradient descent. In Artificial Intelligence and Statistics, pp. 1159-1167, 2017.
+Tianyi Lin, Chenyou Fan, and Mengdi Wang. Improved oracle complexity of variance reduced
+methods for nonsmooth convex stochastic composition optimization. arXiv, pp. arXiv-1802, 2018.
+10
+Under review as a conference paper at ICLR 2022
+Mengdi Wang, Ethan X Fang, and Han Liu. Stochastic compositional gradient descent: algorithms
+for minimizing compositions of expected-value functions. Mathematical Programming, 161(1-2):
+419-449, 2017a.
+Mengdi Wang, Ji Liu, and Ethan X Fang. Accelerating stochastic composition optimization. The
+Journal of Machine Learning Research, 18(1):3721-3743, 2017b.
+Shuoguang Yang, Mengdi Wang, and Ethan X Fang. Multilevel stochastic gradient methods for
+nested composition optimization. SIAM Journal on Optimization, 29(1):616-659, 2019.
+Rex Ying, Ruining He, Kaifeng Chen, Pong Eksombatchai, William L Hamilton, and Jure Leskovec.
+Graph convolutional neural networks for web-scale recommender systems. In Proceedings of
+the 24th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, pp.
+974-983, 2018.
+Hanqing Zeng, Hongkuan Zhou, Ajitesh Srivastava, Rajgopal Kannan, and Viktor Prasanna. Graph-
+saint: Graph sampling based inductive learning method. In International Conference on Learning
+Representations, 2020.
+Junyu Zhang and Lin Xiao. Multi-level composite stochastic optimization via nested variance
+reduction. arXiv preprint arXiv:1908.11468, 2019.
+Muhan Zhang and Yixin Chen. Weisfeiler-lehman neural machine for link prediction. In Proceedings
+of the 23rd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining,
+pp. 575-583, 2017.
+Muhan Zhang and Yixin Chen. Link prediction based on graph neural networks. In Advances in
+Neural Information Processing Systems, pp. 5165-5175, 2018.
+Jie Zhou, Ganqu Cui, Zhengyan Zhang, Cheng Yang, Zhiyuan Liu, Lifeng Wang, Changcheng Li,
+and Maosong Sun. Graph neural networks: A review of methods and applications. arXiv preprint
+arXiv:1812.08434, 2018.
+Difan Zou, Ziniu Hu, Yewen Wang, Song Jiang, Yizhou Sun, and Quanquan Gu. Layer-dependent
+importance sampling for training deep and large graph convolutional networks. In Advances in
+Neural Information Processing Systems, pp. 11249-11259, 2019.
+11
+Under review as a conference paper at ICLR 2022
+8 appendix
+Link to our source code: https://anonymous.4open.science/r/iclr2022_
+artifact-0FE6/
+8.1 Proof to Theorem 1
+Based on the discussion in Section 3, our proposed algorithm can be written as
+k-1
+yk(1+)1 =(1-βk)yk(1)+βkfξ(11,)k(θk)- Y (1-βj)u(k1),
+j=k-t+1
+(16)
+(17)
+θk+1 = θk - αk Nk,
+(18)
+with
+and
+Ukl)= P(ξι,k-t/(ξι,k-t+ι ∪ …∪ ξι,k))ykl+ t-i
+(19)
+(1)	(T)	(T -1)	(T +1)	(T)
+Vk = Vfξι,k(θk)…Yfξτ,k(yk+1	)Yfξτ+ι,Jyk+l).
+(20)
+8.1.1 Supporting lemma
+Lemma 3. The change of yk(l) in every iteration is bounded, i.e.,
+E
+2
+1
+and
+1
+(l ≤ 2)
+k-1
+Y (1 - βj)2E
+j=k-t+1
+k-1
+瓦 j=Yt+ι (Tj)2 E
+u(k1)2	+βk3V2
+(21)
+u(kl)2 +βk3V2
+(22)
+E
+2
+Proof. According to (17), we have
+—
+1-
+(1 - βj ) u(kl)
+k-1
+Y
+j=k-t+1
+(1 -βj)u(kl)
+(23)
+—
+Taking the square of both sides and using Assumption 4, we have
+E
+—
+1-
+2
+Elek (f(I) (ykl+ι1)) -ykl)) -	∏ J-βj) ukl)∣ 1 + β3v2
+2
+1
++瓦
+k-1
+Y (1 -βj)2E u(kl)
++ βk3V2
+j=k-t+1
+(24)
+□
+≤占k
+2
+12
+Under review as a conference paper at ICLR 2022
+Lemma 4. The difference between the stochastic gradient and the true gradient is bounded, i.e.,
+T+1 l-1
+|阳[口|Fk] -VF(θk)k ≤XX AM
+l=2 m=1
+[∣∣ykm)-f(m)(播-I))Il |Fk]
+T
+X AiE [II戒1-f(I) (⅛11))∣ I IFk]
+l = 1
+(25)
+where Al := Pm= l+1 Al,m∙
+This lemma is commonly used in the analysis of SCO algorithms Chen et al. (2020); Yang et al.
+(2019). Proof can be found in Chen et al. (2020), page 20-23.
+Lemma 5. The difference between the composite function and its moving average satisfies
+K-1 T	r	q-∣
+XXE Il娼1-f(l)(ykl+1I))II
+k=0 ι=1	L	」
+≤'Cm"":2"2 KdE [kVF(θk)k2]
+P	k=0
+,9r	T2κ ((1 - β)2t-1 , Cmax(I- β)2(tT) + (1-β)2t+∖ 炉
++ 2CmaxT K (—β— + --------------β-------- +	Tβ3	D D
++ 2CmaχT2K (βCmax +	(I -	T, ) V2 ,	(26)
+where CmaX = mαx(C^C3 …C2,C2C4 …C2,…,C2,1) for l = 2 ...T.
+Proof. According to (17), we have
+ykl+1- f(l) (⅛υ)
+k-1
+:(1 -βk) (ykl) - f(l) (⅛υ)) + βk (C=Gkl+1I)) - f(l) (ykl+1I)))-	∏	(1 - βj)UkI)
+j=k-t+1
+：(1 -βk) (ykl) - f(l) (yklT))) + (1 -βk) (f(l) (yklT))- f(l) (ykl+1I)))
+k-1
++ βk (珠(⅛υ)-f(l) (ykl+1I)))-	∏ (-W)UkI)
+j = k-t+1
+:(1 -βk) (ykl) - f(l) (ykl-1))) + f(l) (ykl-1)) - f(l) (⅛1I))
+I
+/
+k-1
++ βk (珠(⅛υ)-f(l) (ykl-1))) -	∏	(1-βj)记
+j = k-t+1
+(27)
+13
+Under review as a conference paper at ICLR 2022
+Taking the square of both sides of (27) and taking the expectation conditioned on Fk
+yk+)ι,∙∙∙ ,ykl-1)｝，
+,n
+we have:
+(1 - βj ) u(kl)
+(28)
+mps (i-βk) E ]M-f ⑷(ykl-1叩 +" ∙ ɪ E 卜啡
+k2
++ β2	Y (I-%) E ∣∣uk Il	+ βkV.
+k j=k-t+1
+Let us define
+∣∣∣yk(l+)1-f(l)(yk(l+-11)∣∣∣2
+(29)
+Formula (28) can be rewritten as
+Skl+ι ≤(1-βk)S(I)+J τ⅛E ]IIYk(l『
+k2
++ β2	Y (I- β)2E J]Ukl) J1	+β3V2.
+k	j =k-t+1
+Because
+E	IIIYk(l)III2	=EIIIf(l)(yk(l+-11))-f(l)(yk(l-1))III2
+(Assum≤ption2) Cl2E IIIyk(l+-11) - yk(l-1)III2,
+when l = 1,
+EIIIYk(1)III2 ≤ C12E hkθk+1 - θkk2i
+≤	C2E [kαkVk + αkVF(θk) - a®VF(θk)『]
+T
+≤	C2 ∙ ak ∙ (2E [kVF(θk)k2] + 2TX小鼠).
+l=1
+(30)
+(31)
+(32)
+plugging (32) into (30), we have
+k-1
+S((+1 ≤(I-βk)SkI) + 羽 Y (I-βj)2E ||ukI)II
+βk j=k-t+1
+k-1
+≤(I-βk)skI) + β2	Y (1 - βj)2E HukI)II
+k j=k-t+1
+21
++ β ∙二瓦∙ C1 akEkVF (θk )k +
++ βk3 V2
++ βk3 V2
+2	1
+βk 1 - βk
+T
+∙C2a2 T X A2skl+ι.
+l=1
+(33)
+14
+Under review as a conference paper at ICLR 2022
+When k = 0, ||u10||2 = 0, and
+T
+q(I) 门 R ( c(1) _|_	R	2 ,ς2τ∕2 -U 2	1	r'*2 2	∣∣ γ7 π(∩ ʌ ∣∣2 ∣	2	1	「2 2T X λ q(l八
+SI	≤ (1	- βo)So +	βo	(βo V + β	∙ 1 - 尸0CIαo	IlVF (θo)k + 行∙ J - 尸0CIα0T 2_^S1 )
+S------------------------------------{z---------------------------l=1------}
+= ∆01)
+= (1 - β0)S0(1) + β0∆(01).
+(34)
+Similarly, we have
+S2(1) ≤ (1 -β1)S1(1) +β1∆(11)
+(35)
+Here, for i > t,
+for 0 < i ≤ t,
+Sk(1+)1 ≤ (1-βk)Sk(1)+βk∆(k1).
+i-1
+∆(1)= β5	γ — )2E M)Il
+βi ji-t-1
+2
++βi2V2
+21
++ 济∙ LC2α2E kVF(θi)k2
+βi	1 - βi
+T
++ 落 Li C2α2T X S(+)ι ；
+(36)
+△if”2+β2 ∙ τ⅛ C2α2E hkvF(仇)『］
+2
++碎∙
+1
+1 - β
+T
+C12αi2TX	Si(+l)1
+l1
+(37)
+Because S0(1) = 0, we can recursively write:
+S(I) ≤βo∆01)
+S21) ≤(1- βι)βo∆01) + βι∆1)
+S31) ≤(1 - β2)(1 - βι)βo∆01) + (1 - β2)β1 ∆1) + β2∆21)
+.	(38)
+Sk+1 ≤(1 - βk) …(1 - β1 )户0&" + (1 - β) …(1 - 户2)户心10 + …
++ (1 - βk )βk-1 △(k1-)1 + βk △(k1)
+k
+=X wi,k∆(1),
+i1
+where wi,k = (1 - βk) …(1 - βi+ι)βi.
+For l > 1, (30) can be rewritten as
+Sk+ι ≤ QTk) Skl) + βkr⅛E M-I)-y∏2
+(Lemr3) (1 - βk) Skl) + FC^S(l-11) + βkZ(l,
+(1 - βk )
+1	k-1
++ β2	Y	Q-β )2 E
+k jk-t+1
+IIIu(kl)III2 +βk3V2
+(39)
+15
+Under review as a conference paper at ICLR 2022
+where
+1
+β3
+k-1
+Y (1-βj)2E IIIu(kl)III
+j=k-t+1
+2
++「,/+I-)2 E n
+UklT)I∣2]+ β2V2 + 1β-Ck V2
+(40)
+It follows that
+S(+ι ≤(1 -βk)sk2)+ nβ¾Sk+ι + βkZk2)
+(1 - βk)
+AccorT幽(1 - βk靖 + πβ¾ X Wi,k∆(1) + βkZ2
+(1 - βk) i=0
+=(I - β)Sk2)+ β ((1 Cek)2 X wi,kδ,1) +
+(41)
+Following the same steps as (38), by recursively plugging Sk(2) into Sk(2+)1, we can obtain
+S(+1 ≤ SW/ ((T¾ Xwi,k∆(1) +Zj
+=X (f⅛ X Wi,k∆(1) + X WjkZ?
+j=0 (1 - βj ) i=0	j=0
+kk2	k
+=X(X ⅛⅛) Wi,k ∆(1) + X Wi,k Zi(2)
+i=0 j=i	j	i=0
+(42)
+According to (38), it is easy to find Pjk=i wj,k < 1. Thus, we have
+X C2wj,k	≤ X C2wj,k ≤ C2 X ≤ C2
+匕(WjF ≤ 匕 IW ≤ IW 匕 j,k ≤ (1-并.
+(43)
+Combining (43) and (42), we have
+S(+l ≤ X ( (1 Ce)2 wi,kδ(I) + wi,kZi
+≤ S " ((1¾ ∆(1) +
+k
+= X wi,k∆i(2)
+i=0
+(44)
+Similarly, for any l > 1, we have
+k
+Sk(l+) 1 ≤ X wi,k∆i(l)
+i=0
+(45)
+16
+Under review as a conference paper at ICLR 2022
+where
+二 ∆(1)+Z(2)
+(1 - βi )
+22
+C2 C3
+2 ∆i(2) + Zi(2)
+(1 - βi)4
+C2C2 …
+∆(1) + ⅛ Zi(2) + Z⑶
+(46)
+(1- βi)2(
+C2 ∆(1) + C2 …C2 Z (2) + C4 …C2 Z(3) +	+
+IT) i +(1 - βi)2(l-2) i + (1 - βi)2(l-3) i +	+
+Let Cmax = max(C2C3 …C2, C3C4 …C2,…,C2,1),∀l ∈ [1, T] and ZmaX defined as follows:
+Zmax
+i-1	i-1
+W j=Y+ι(1-βj )2 D2+1 j=Y+ι(Tj )2 D2+β2V2+
+βi Cmax 2
+1 - β
+(47)
+Plugging (46) into (45), we can obtain
+k
+≤X
+i=0
+kl
+(I-Cm2Xt-1) Wi,k∆(1) + X Wi,k X
+Cmax
+(1 - βi)2(TT)
+(48)
+Summing (48) from l = 1 to T, setting βk = β and αk = α, then substituting ∆(k1) we have:
+K-1 T	K-1 k T	K-1 k	T l
+(l)	CmaX	(1)	CmaX
+S+ Z^Sk+1 ≤	(1 - β)2(T-1) wi,kδ	+	wi,k	(1 - β)2(T-1)
+K-1 K-1	K-1 K-1	2
+XX (1 -Cmβ)2(T-1) w3k-'δ + + XX (1
+-β)2(T-1) wi,K-1 Zi
+k=0 i=k	k=0 i=k
+K-1
+X
+k=0
+CmaXT
+(1 - β)2(TT)
+K-1 K-1
+∆(k1)+XX
+k=0 i=k
+CmaX T	maX
+(1 - β)2(T-1) wi,KTzi
+≤ a S Y X1 (β2V2+β2C⅞ E hkvF (θk)k2i+βCα⅞ X 铝
+k=0	l=1
+CmaxTD2K	CmaXT 2KZ max
++ β3(1 - β)2(T-1-t) + (1 - β)2(TT).
+(49)
+It follows that
+IXXs(+1 ≤e2(1-CmT-Tβ22C-Cβ) a2T2 X1 (β2V2+β2⅛E[wF(θk)k2i)
+β (1 - β)	- 2C1 CmaXαT	β (1 - β)
+k=0 l=1	k=0
+CmaXTD2K(1 - β)2t+1	CmaXT2e2(1 - β)KZmax
++ β3(1 - β)2TT- 2C2CmaXT2α2β + β2(1 - β)2TT- 2C2CmaXa2T2
+(50)
+17
+Under review as a conference paper at ICLR 2022
+If we set β ≤ 1 - 2T-1∣ 1 and α ≤ ^CeT J2(1-C)2T 1-1, We Can ensure β2(1 - β)2TT -
+2C2Cmaχa2T2 ≥ β2∕2, and (50) can be simplified as
+IX X S(l+1 ≤2CmaχTKβ2(1 - β)2V2 + 4Cmaβc2Tα2 X E [kVF(θk)k2i
+k=0 l=1	k=0
++ 2CmaxTκ( 1 - β)2t+1 D2 + 2CmaχT2K(1 - β)Zmax
+≤2CmaxTKβ2 (1 - β)2V2 +
+4Cmaχ C2Tα2
+β2
+K -1
+X E kVF(θk)k2
+k=0
++ 2CmaxTKI - β)2t+1 D2 + 2CmaχT2K(1 - β)卜2 + βCmβx) V2
+2CmaχT2K(1 - β)2 j
+β3
+(1 +
+Cmax
+1-β
+(51)
+)D2
++
+≤4CmaβC2Tα2 X E [kVF(θk)k2i
+k=0
+,9r	T2κ ((1-β)2tT +Cmax(1-β产tT) + (1-β)2t+1)炉
++ 2CmaxT K (一β— + ----------β-------- + Tβ3 D D
++ 2CmaχT2K (βCmaχ + β- βj(1+ T) V2
+□
+8.1.2 Remaining steps towards Theorem 1.
+Using the smoothness of F(θk), we have
+L2
+F (θk+1 ) ≤ F (θk ) + hvF(θk ),θk+1 - θk i + 2 kθk+1 - θk k
+=F(θk) - αk hvF(θk),gk+1i + 2αk ∣∣gk+1k2
+=F (θk ) - αkE hkVF (θk)∣∣[ +-2^k l∣gk+1k2 + αk hvF(θk ), VF (θk) - gk+1 i
+=F(θk) - αkE h∣VF(θk)k2i + Lak ∣gk+1∣2 + αk EF(θk), VF(θk) - Vki + αk EF(θk), Vk
+(52)
+gk+1i .
+Conditioning on Fk and taking expectation of both sides w.r.t. ξk, we have
+E[F(θk+1) |Fk]
+≤F(θk) - akE h∣VF(θk)k2i + LE h∣θk+1 - θk∣2 I Fki + ak NF(θk), E [VF(θk) - Vk∣Fk]i
+≤F(θk) - akE h∣VF(θk)∣2i + LC2 …CTak + akE [∣VF(θk)∣] ∣E [VkFk] - VF(θk)∣
+T
+e≤la	F (θk)	- akE	h∣VF (θk)∣2i +	L C2	…CT ak	+ ak X(Al	∣VF (θk )k E	[帧+1	-	f ⑷谥；II))FkIIi
+l=1
+T	T2
+≤F (θk)-ak (1- 4ak X A∖ E [∣VF (θk )k2] + βk X Enykl+1- f (l)(ykl+1I))IIFk
+CT2 a2k .
+(53)
+18
+Under review as a conference paper at ICLR 2022
+Summing from k = 0 to K - 1, we have
+K-1	K-1	K-1	T
+X E [F(θk+ι∣Fk)] ≤ X F(θk) - X ɑk(1 - * X若2加 UNF®)∣∣]2
+k=0	k=0	k=0	k l=1
+K-1	T	K-1
++ X βk X S(l+ι + X ⅞C2 …CT或.
+k=0	l=1	k=0
+(54)
+Substitute (50) into the above equation, we have
+K-1	K-1	T	K-1
+X E [F(θk+ι∣Fk)] ≤ X F(θk) - α(1 -点 X Aι) X E[∣NF®)k]2
+k=0	k=0	l=1	k=0
++ 4CmTTα2 X E [kVF(θk)k2i + LKC2 …CTɑ2
+k=0
+l 2C	T2 K "l-β)2j ICmax(1-β)2(tT)
++ 2CmaxT Kl +	+	r>e)
+β2	β2
++ 2CmaχT2K (β2Cmax +	-	+ T) ) V2.
+(1-β)2t+1 ʌ D2
+Tβ2 D
+(55)
+If We Set α ≤ PQ[雪+窑…申,We Can ensure 1 一卷 PT=I A2 - 4CmaβC2τα ≥ 2 ,and thus,
+K-1	K-1	K-1	LK
+X E [F(Θk+1 |Fk)] ≤ X F(θk) + 2 X E [kVF(θk)k]2 + 〒。2 …CTα2
+k=0	k=0	k=0
+l 2C T2 K ((1-β)2j ICmaX(1-β)2(I)
++ 2CmaxT Kl +	+	r>e)
+β2	β2
++ 2CmaχT2K (β2Cmaχ +	- IT(I + T) ) V2.
+(1-β)2t+1 ʌ D2
+Tβ2 D
+(56)
+Combining With the Condition for α and β in (50), if We set
+β ≤ 1 - 2(-1/(2T -1))
+.(ɪ ∣2(1- β)2TT-i
+α = β ∙ min I 2ClTV	Cmax
+2
+(57)
+We have
+Pi=I A2 + 16CmaXC2T )
+KX E [kVF(θk)k]2 ≤2("*"0*" + LC2 …CT
+k=0
++ 4Cmax T 2
++ 4Cmax T 2
+((1- β)2t-1 + CmaX(I- β)2"D + (1- β)2t+1 A D2
+V αβ2	+ αβ2	+ Tαβ2	)
+(β2Cmax + β3(1- β)(1+ T) A V 2
+Ia + αT	V
+≤O(β) + 4CmaxT2
+1 + CmaX)(I- β)2(tT) + (1- β)2t+1 λ d2
+aβ2	+	Taβ2	J
+(58)
+This Completes the proof of Theorem 1.If We Can set t suCh that (1 -β)2(t-1) = O(β4), the algorithm
+achieves O(1∕√K) convergence rate.
+19
+Under review as a conference paper at ICLR 2022
+8.2 Proof to Theorem 2
+The SCSC algorithm with our sparse moving average can be written as
+k-1
+yk+ι = (i - βk)yk1) + f黑(θk) - (1 - βk)/黑(θk-ι) - ∏ (1 - βj)uR	(59)
+j=k-t
+k-1
+yk+ι = (1 - βk W0 + C= (yk+II)) - (1 - βk fl (yk'T))- ∏ (1- βj )4°，2 ≤ ι ≤ t, (60)
+j=k-t
+θk+ι = θk - αkVk,	(61)
+with
+Ukl) = P (ξ1,k-t∕(ξ1,k-t+1 u∙∙∙u ξι,k ))yk+t-ι	(62)
+and
+Vk = Vfsk (θk WfIk (yk+-I))VfM；) (yk+1).	(63)
+8.2.1	Supporting lemma
+Lemma 6. The change of yk in every iteration is bounded, i.e.,
+E MIy) ∣∣[≤3 (二 j E ]a-f ⑴(yk:11M
+2	2	∖ 2	Γ	C-I
++ (i⅛) V2 +3C2-1E ]|心II)-「口	(64)
+k-1
++ 3 ∏ (1-βj)2E Mll
+j=k-t	L	-
+Proof. According to (60), we have
+(I- βk) (yk+1- yk") =βk (珠(ykl+II))- yk+1)
+k-1
++ (1 - βk) fk (⅛υ) - fZ (yΓr)) - ∏ (1 - % 赭)
+j = k-t
+=βk (f⑷(ykl+II)) -ykl+1) + βk (琰(ykl-II))- f⑷(ykl+II)))
+k-1
++ (1 - βk) f = (ykl+II))- fld- ∏ (1 - % M
+j = k-t
+(65)
+Taking the square of both sides of (65) gives US (64).	□
+Lemma 7. The difference between the composite function and its moving average is bounded, i.e.,
+E ]l虞1 - f⑷(yk+II)) ll[ ≤ (1 - βk) E ]lIykl)- f⑷(yk j)) ∣∣2
++ 4(1-βk)2 Cl2E llyklT)-ykl+1I)II	+2β2v2	(66)
+k-1
++ βr ∏ (1-βj )2 E Uukl)k2]
+Pk j=k-t
+20
+Under review as a conference paper at ICLR 2022
+Proof.
+y3- f ⑷(⅛1I))
+=(1 -嫌)W - f ⑷(yf T))) +(1 - βk) (f⑷ WD) - f⑷(⅛υ))
+'---------V----------}
+=TI
++氏 fk(⅛1I)) - f ⑷(⅛1I)))	(67)
+'---------V---------}
+：=72
+k-1
++ (i-βk)(珠(yf)-f黑(yk17))+ ∏ (i-βj) Uk)
+'----------V---------} j = k-t
+： = T3
+Conditioned on Fk, taking expectation over ξ,k, we have:
+E [(I - βk ) TI + βk T2 + (1 - βk ) ɪɜ]
+=E [(1 - βk) f⑴(yklT))- f⑷(ykl-?) + fξlL (yklR - (1 - βk) f()k (yk'))]
+=0
+Taking the square of both sides of (67) and taking the expectation conditioned on Fk
+,n
+{Fk,yk+ι,…，ykl+II)},
+we have:
+E %klL-f(l) (⅛1I))『
+=Ei1-βk) (ykl) - f(I) (ykl-1)))- ∏^,-βj) 〃kl)||
++ E [k (I- βk) TI + βkT2 + (1 - βk) T⅛∣∣2]
+γ	Cl r k-1
+≤ (1 - βk) E IykI)-f(l) (yklT) )|	+ ɪ ∏ (1-βj )2 E [kukI)k2]
+L	」	j=k-t
++ 2E [∣∣(1 - βk) Ti + βk T2k2 |Fk,„] +2(1 - βk )2 E [忸 ∣∣2 ∣Fk,/
+≤ (1 - βk) E 卜乩I)- f(l)侬T) )| | 2] +2(1 - βk )2 E [∣∣Tιk2 ∣Fk,n] + 2β2E [但『∣Fk,n]
+-1
++ 2(1 - βk)2 E [kT3k2 ∣Fk,n] + - ∏ (1-βj)2E UukI)H
+k j = k-t
+≤ (1 - βk) E [| | ykI)- f(l) (yklT) )∣ Ij +2(1 - βk )2 E [| I f(l) (ykl-i)) - f(l) (yf-I)) ∣ ∣ 2
++ 2(1 -βk)2E [|| f(l,l (ykl-I))-C= (ykl+iI))| | 2] + 2β2V2
+k-i
++ 于 ∏ (1-βj)2 E
+βk j=k11
+MI)k2]
+(68)
+21
+Under review as a conference paper at ICLR 2022
+≤ (1-βk)E	yk(l) -f(l) yk(l-1)2
++ 4 (1 - βk)2 Cl2E	yk(l-1) - yk(l+-11)2 + 2βk2V 2
+k-1
++ J Y (1-βj)2 E [kukl)k2i
+k j=k-t
+(69)
+□
+8.2.2 Remaining steps towards Theorem 2.
+Using the smoothness of F (θk), we have
+L2
+F (θk + 1) ≤ F (θk) + hVF (θk), θk + l - θk i + 2 kθk+ι - θk k
+L2
+=F (θk ) - αk hVF (θk ), Vk i + 2 kθk+ι - θk k
+=F(θk) - αkE[kVF(θk)k2] + L kθk+ι - θkk2 + αk EF(θk), VF®) - Vki .
+2	(70)
+Conditioning on Fk and taking expectation of both sides w.r.t. ξk, we have
+E[F(θk+1) |Fk]
+≤F(θk) - αkE [kVF(θk)k2i + 2E [Ui - θkk2 । Fki + αk NFa)，EVF®) - Vk∣Fk]i
+≤F(θk) - αkE [kVF(θk)k2i + 2C2 …CT+忌 + a&E [∣∣VF(θk)k] ∣∣E [V®Fk] - VF(θk)k
+T
+e≤ia F (θk) - αkE [kVF (θk)k2i + 2 C2 …%+ιαk + °k X AiE [kVF Iek )k] E [帆；1 - f(T )(yk+-1))∣ Fk ]
+l=1
+≤F(θk) - αk
+T
+E [kVF(θk)k2i + e XE ∣∣yk+1-f(T)(yk+-1))∣∣ 1Fk
+l=1
+(71)
+The subsequent analysis builds on the following Lyapunov function:
+T
+Vk ：= F(θk) - F(θ*)+ XE
+l=1
+yk(l) -f(l)(yk(l-1))2
+(72)
+where θ* is the optimal solution of the problem.
+Conditioning on Fk and taking expectation of Vk+1 w.r.t. ξk, we have
+22
+Under review as a conference paper at ICLR 2022
+EM+1|Fk] ≤Vk - αk (1 -轰 X A，E [∣∣VF (θk)『]+ ∣Cf …晶盾
+T r	T	.
++ (1 + βk) X E	帧+1- f ⑷(⅛I))Il	IFk- XE	帧)-f ⑷(yklτ) Il	IFk
+ι=ι L	」 ι=ι L
+T
+-β X E ∣∣ykl+ι-f (I) (ykl+II)) Il IFk
+ι=ι	L
+(Lem≤ia8)Vk-αk (1-a XT E [∣∣VF(θk)k2i + LCf …由高
+T
++ ((I + βk ) (I- βk) - 1) X E
+l = 1
++ 4(1+ βk)(1 - βk)2CfE [∣∣θk - θk-ιk2∣Fk]
+T
++ X [4 (I + βk) (I- βk)2Cl2 + γl] E [ I I yk+1I)- ykl I)IIIFki
+l=2
++ 2(1+ βk )βlNV2 +
+k-1	T
+ɪ Π (1-βj)2 XE [kukI)k2i
+βk
+j=k-t	l=1
+TT
+-X YlE [IIykl;ι1) - ykl-1)II∣Fki - β XE IIykl+1 - f ⑷喏：)“
+l=2	l=1
+≤Vk - αk (1 - 2β^ X A2) kVF (纵)∣∣2 + 2 cI …cT+1αk + 2(I + βk )βkNV 2
++ 4C2E[∣∣θk - θk-ι∣∣2∣Fk]
+T
++ X(4C2 + Yl) Enykl-I)-yklTI IFk
+TT
+-X YlE [IIykl;ι1) - ykl-1)IIIFki - β XE IIyk+1 - f(l)(ykl+II))II
+l=2	l=1
+k-1	T
++— π (1-βj)2XE [wkI)H
+Pk j = k-t	l=1
+23
+Under review as a conference paper at ICLR 2022
+(Lemr7)Vk-αk (1-羲 X A，E [kVF (θk)k2i + 2C2 -0+高
++ 4C2E [i® - θk-“『IF® ]
+： = Ik2
+T	「	C ∙
++3 X(4C2 + Y) CLlE 帧-2)-y"[∣ IFk
+l=2
+S----------------V----------------
+： = Ik3
+T
+-E YiE [∣Iy(-1 - ykl-1)∣∣ 1Fk]
+l=2
+X--------------------------------------/
+^^{^^™
+： = Ik4
++ 0(I + βk)βkN + (T-^ J E a。，2 + Y)) V2
+k k-1	T	k-1	T
++ — ∏ (1-βj )2 E E [∣∣uM2] +3 ∏ (1-βj )2 E(4Ci2 + γ) E
+Pk j=k-t	l=1	j=k-t	l=2
+UkIT)II2
+(73)
+If we define γι such that:
+3 (T⅛ )2 E (4Ci2+γι) <βk	(74)
+and
+3 (4Cι2 + γι) Ci2-I <γi-i,	(75)
+then
+Iki + Ik2 < 0	(76)
+Ik3 + Ik4 < 0∙
+(77)
+It follows that
+E [Vk+ι∣Fk] ≤Vk - αk (1 - 2βk E A2)E [∣∣VF (%)『]+ LLC2 …由信
++ (3(4C2 + γ2) + 4)C2E [I® - θk-ιk2 ∣Fk]
++ (2(1+ βk) βkN + (T-^ J E (4Cι2 + γι)) V2
+Ilak-I	T
++ — ∏ (1-βj)2EE [思)『]
+Pk j = k-t	Ι=1
+k-1	T
++ 3 ∏ (I- βj)2 E (4cι2+γι)E
+j=k-t	Ι=2
+Ukj)
+(78)
+24
+Under review as a conference paper at ICLR 2022
+Setting βk = αk PlT=-11 Al2 , we have
+E [Vk+ι∣Fk] ≤Vk — OkE[kVF (θk)k2] + LC2 …CT+ιαk + (3(4。2 + γ2) + 4)CfE [|® - θι∣∣2 |Fk]
++ 2 (1 + βk) βk2N +
++ 1+ β
++	βk
+k-1
+βk
+1 - 8k
+T
+2T
+X(4Cl2 + Yl)	V 2
+l=2
+j=k-t
+(1-βj)2	E
+k-1
++ 3 ∏ (1-βj)2 E (4C12 + Yl) E
+u(kl-1)2
+l=1
+j=k-t
+l=2
+(79)
+T
+Setting Ok = α = √a and βk = β = √^ and summing UP both sides of (79) from k = 0 to K - 1,
+we have
+1 K-1	2V
+κ E l∣vF (θk)k2 ≤Ka + LC2 …CT+ια + 2(3(4C2 + γ2) + 4)C4C2 …CT+ια
+k=0
++ 2 (2(1 + β)β2N + (占 J X (4Cι2 + Yl)
+2(1 + β) (1 - β)2(t-1) 1
+αβ
+K-1 T
+XXE	u(kl)
++ 6(1 - β)2(tτ)
+k=0 l=1
+K-1 T
+XX(4Cl2 + Yl) E ∣∣ukl
+k=0 l=2
+(80)
+(AssumPtion 5)
+≤O
+2(1 + β) (1 - β)2(t-1)
+αβ
+T
+XDl2
+l=1
+十 6(1 - β)2(t-1)
+T
+CuXDl2
+l=1
++
++
+2
+α
+α
+1
+K
+K
+where Cu = max 4Cl2 + Yl for l = 1 . . . T .
+This comPletes the Proof of Theorem 2. If we can set t such that (1 - β)2(t-1) = O(β3), the
+algorithm achieves O(1/√K) convergence rate.
+25

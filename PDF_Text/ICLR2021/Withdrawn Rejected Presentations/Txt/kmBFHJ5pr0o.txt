@@ -1,0 +1,1388 @@
+Under review as a conference paper at ICLR 2021
+Distributed Adversarial Training to Robus-
+tify Deep Neural Networks at Scale
+Anonymous authors
+Paper under double-blind review
+Ab stract
+Current deep neural networks are vulnerable to adversarial attacks, where adversar-
+ial perturbations to the inputs can change or manipulate classification. To defend
+against such attacks, an effective and popular approach, known as adversarial
+training, has been shown to mitigate the negative impact of adversarial attacks
+by virtue of a min-max robust training method. While effective, this approach is
+difficult to scale well to large models on large datasets (e.g., ImageNet) in general.
+To address this challenge, we propose distributed adversarial training (DAT), a
+large-batch adversarial training framework implemented over multiple machines.
+DAT supports one-shot and iterative attack generation methods, gradient quanti-
+zation, and training over labeled and unlabeled data. Theoretically, we provide,
+under standard conditions in the optimization theory, the convergence rate of DAT
+to the first-order stationary points in general non-convex settings. Empirically,
+on ResNet-18 and -50 under CIFAR-10 and ImageNet, we demonstrate that DAT
+either matches or outperforms state-of-the-art robust accuracies and achieves a
+graceful training speedup.
+1	Introduction
+The rapid increase of research in deep neural networks (DNNs) and their adoption in practice is, in
+part, owed to the significant breakthroughs made with DNNs in computer vision (Alom et al., 2018).
+Yet, with the apparent power of DNNs, there remains a serious weakness of robustness. That is,
+DNNs can easily be manipulated (by an adversary) to output drastically different classifications and
+can be done so in a controlled and directed way. This process is known as an adversarial attack and
+considered as one of the major hurdles in using DNNs in security critical and real-world applications
+(Goodfellow et al., 2015; Szegedy et al., 2013; Carlini & Wagner, 2017; Papernot et al., 2016; Kurakin
+et al., 2016; Eykholt et al., 2018; Xu et al., 2019b).
+Methods to train DNNs being robust against adversarial attacks are now a major focus in research
+(Xu et al., 2019a). But most are far from satisfactory (Athalye et al., 2018) with the exception of the
+adversarial training (AT) approach (Madry et al., 2017b). AT is a min-max robust training method that
+minimizes the worst-case training loss at adversarially perturbed examples. AT has inspired a wide
+range of state-of-the-art defenses (Kannan et al., 2018; Ross & Doshi-Velez, 2018; Moosavi-Dezfooli
+et al., 2019; Zhang et al., 2019b; Wang et al., 2019b; Sinha et al., 2018; Chen et al., 2019; Boopathy
+et al., 2020; Wong & Kolter, 2017; Dvijotham et al., 2018; Stanforth et al., 2019; Carmon et al., 2019;
+Shafahi et al., 2019; Zhang et al., 2019a; Wong et al., 2020), which ultimately resort to min-max
+optimization. However, these methods, together with AT, are generally difficult to scale well to large
+networks on large datasets.
+While scaling AT is important, doing so effectively is non-trivial. We find that scaling AT with the
+direct solution of distributing the data batch across multiple machines may not work and leaves
+many unanswered questions. First, if the direct solution does not allow for scaling batch size with
+machines, then it does not speed the process up and leads to a significant amount of communication
+costs (considering that the number of training iterations is not reduced over a fixed number of epochs).
+Second, without proper design, the direct application of a large batch size to distributed adversarial
+training introduces a significant loss in both normal accuracy and adversarial robustness (e.g., more
+than 10% performance drops for ResNet-18 on CIFAR-10 shown by our experiments). Third, the
+1
+Under review as a conference paper at ICLR 2021
+direct approach does not confer a general algorithmic framework, which is needed in order to support
+different variants of AT, large-batch optimization, and efficient communication.
+Taking all factors into consideration, a question that naturally arises is: Can we speed up AT by
+leveraging distributed learning with full utility of multiple computing nodes (machines), even when
+each only has access to limited GPU resources? Although a few works made empirical efforts to
+scale AT up by simply using multiple computing nodes (Xie et al., 2019; Kang et al., 2019; Qin
+et al., 2019), they were limited to specific use cases and lacked a thorough study on when and how
+distributed learning helps, either in theory or in practice. By contrast, we propose a principled and
+theoretically-grounded distributed (large-batch) adversarial training (DAT) framework by making
+full use of the computing capability of multiple data-locality (distributed) machines, and show that
+DAT expands the capacity of data storage and the computational scalability. We summarize our main
+contributions as below.
+Contributions (i) We provide a general problem formulation of DAT, which supports multiple
+distributed variants of AT, e.g., supervised AT and semi-supervised AT. (ii) We propose a principled
+algorithmic framework for DAT, which, different from conventional AT, supports large-batch DNN
+training (without losing performance over a fixed number of epochs) and allows the transmission of
+compressed gradients for efficient communication. (iii) We theoretically quantify the convergence
+speed of DAT to the first-order stationary points in general non-convex settings at a rate of O (1 /√T),
+where T is the total number of iterations. This result matches the standard convergence rate of classic
+training algorithms, e.g., stochastic gradient descent (SGD), for only the minimization problems. (iv)
+We make a comprehensive empirical study on DAT, showing that it not only speeds up in training
+large models on large datasets but also matches (and even exceeds) state-of-the-art robust accuracies
+in different attacking and learning scenarios. For example, DAT on ImageNet with 6 × 6 (machines
+× GPUs per machine) yields 38.45% robust accuracy (comparable to 40.38% from AT) but only
+requires 16.3 hours training time (6 times larger batch size allowed in DAT), exhibiting 3.1 times
+faster than AT on a single machine of 6 GPUs. We also make a significant effort to evaluate the
+empirical performance of DAT across different computing configurations at different learning regimes,
+e.g., semi-supervised learning and transfer learning.
+2	Related Work
+Training robust classifiers The lack of robustness of DNNs has promoted a rapid expansion of
+defenses against adversarial attacks, ranging from heuristic defenses to robust (min-max) optimization
+based approaches. However, many heuristic strategies are easily bypassed by stronger adversaries due
+to the presence of obfuscated gradients (Athalye et al., 2018). By contrast, the min-max optimization-
+based training methods are generally able to offer significant gains in robustness. AT (Madry et al.,
+2017b), the first known min-max optimization-based defense, has inspired a wide range of other
+effective defenses. Examples include adversarial logit pairing (Kannan et al., 2018), input gradient
+or curvature regularization (Ross & Doshi-Velez, 2018; Moosavi-Dezfooli et al., 2019), trade-off
+between robustness and accuracy (TRADES) (Zhang et al., 2019b), distributionally robust training
+(Sinha et al., 2018), dynamic adversarial training (Wang et al., 2019b), robust input attribution
+regularization (Chen et al., 2019; Boopathy et al., 2020), certifiably robust training (Wong & Kolter,
+2017; Dvijotham et al., 2018), and semi-supervised robust training (Stanforth et al., 2019; Carmon
+et al., 2019).
+In particular, some recent works proposed fast but approximate AT algorithms, such as ‘free’ AT
+(Shafahi et al., 2019), you only propagate once (YOPO) (Zhang et al., 2019a), and fast gradient
+sign method (FGSM) based AT (Wong et al., 2020). These algorithms achieve speedup in training
+by simplifying the inner maximization step of AT. Although there is vast literature on min-max
+optimization based robust training, it is designed for centralized model training and without care
+about the scalability issue in AT. In (Xie et al., 2019), although a distributed version of vanilla AT
+was implemented via the large-batch SGD algorithm (Goyal et al., 2017), it is significantly different
+from our proposal. Compared to (Xie et al., 2019), we adopt a different distributed training recipe
+(layer-wise adaptive learning rate method vs. SGD), and make in-depth theoretical analysis of
+quantifying the convergence rate of DAT.
+Distributed model training Distributed optimization has been found to be effective for the standard
+training of machine learning models (Dean et al., 2012; Goyal et al., 2017; You et al., 2019; Chen
+et al., 2020). In contrast to centralized optimization, distributed learning enables increasing the batch
+size proportional to the number of computing nodes/machines. However, it is challenging to train a
+2
+Under review as a conference paper at ICLR 2021
+model via large-batch optimization without incurring accuracy loss compared to the standard training
+with same number of epochs (Krizhevsky, 2014; Keskar et al., 2016). To tackle this challenge, it
+was shown in (You et al., 2017; 2018; 2019) that adaptation of learning rates to the increase of the
+batch size is an essential mean to boost the performance of large-batch optimization. A layer-wise
+adaptive learning rate strategy was then proposed to speed up the training as well as preserve the
+accuracy. Although these works have witnessed several successful applications of distributed learning
+in training standard image classifiers, they leave the question of how to build robust DNNs with DAT
+open. In this paper, we show that the power of layer-wise adaptive learning rate also applies to DAT.
+Since distributed learning introduces machine-machine communication overhead, another line of
+work (Alistarh et al., 2017; Yu et al., 2019; Bernstein et al., 2018; Wangni et al., 2018; Stich et al.,
+2018; Wang et al., 2019a) focused on the design of communication-efficient distributed optimization
+algorithms.
+The study on distributed learning is extensive, but the problem of distributed min-max optimization
+is less explored, with some exceptions (Srivastava et al., 2011; Notarnicola et al., 2018; Hanada
+et al., 2017; Tsaknakis et al., 2020; Liu et al., 2019a;b). A key difference to our work is that none
+of the aforementioned literature studied the large-batch min-max optimization with its applications
+to training robust DNNs, neither theoretically nor empirically. While there are recent proposed
+algorithms for training Generative Adversarial Nets (GANs) (Liu et al., 2019a;b), training robust
+DNNs against adversarial examples is intrinsically different from GAN training. In particular, training
+robust DNNs requires inner maximization with respect to each training data rather than empirical
+maximization with respect to model parameters. Such an essential difference leads to different
+optimization goals, algorithms, convergence analyses and implementations.
+3	Problem Formulation
+In this section, we first review the standard setup of adversarial training (AT) (Madry et al., 2017b).
+We then motivate the need of distributed AT (DAT) and propose a general min-max setup for DAT.
+Adversarial training AT (Madry et al., 2017b) is a min-max optimization method for training
+robust ML/DL models against adversarial examples (Goodfellow et al., 2015). Formally, AT solves
+the problem
+minimize E(x y)∈D maximize `(θ, x + δ; y) ,	(1)
+θ	kδk∞≤
+where θ ∈ Rd denotes the vector of model parameters, δ ∈ Rn is the vector of input perturbations
+within an '∞ ball of the given radius e, namely, kδ∣∣∞ ≤ e, (x, y) ∈ D corresponds to the training
+example x with label y in the dataset D, and ` represents a pre-defined training loss, e.g., the cross-
+entropy loss. The rationale behind problem (1) is that the model θ is robustly trained against the
+worst-case loss induced by the adversarially perturbed samples. It is worth noting that the AT problem
+(1) is different from conventional stochastic min-max optimization problems (e.g., GANs training
+(Goodfellow et al., 2014)). Note that in (1), the stochastic sampling corresponding to the expectation
+over (x, y) ∈ D is conducted prior to the inner maximization operation. Such a difference leads to
+the sample-specific adversarial perturbation δ(x) := maximizekδk∞≤ `(θ, x + δ; y).
+Distributed AT (DAT) The need of AT in a distributed setting arises from at least the following two
+aspects: 1) Training data are distributed, provided by multiple parties, which expands the individual
+capability of data storage or data privacy. 2) Computing units are often distributed, provided by
+distributed machines, which enables large-batch optimization and thus improves the AT’s scalability.
+Let us consider a popular parameter-server model of distributed learning (Dean et al., 2012). Formally,
+there exist M workers each of which has access to a local dataset D(i), and thus D = ∪iM=1D(i) .
+There also exists a server/master node (e.g., one of workers could perform as server), which collects
+local information (e.g., individual gradients) from the other workers to update the model parameters
+θ. Spurred by (1), DAT solves problems of the following generic form,
+minimize
+θ
+1M
+M E λ λE(xy)∈D(i)附θ; X, y)] + E(x,y)∈D(i) maximize φ(θ, 缶 X，U) 》
+M	kδk∞≤
+i=1 '------------------------{Z--------------------------}
+=: fi(θ; D(i))
+(2)
+3
+Under review as a conference paper at ICLR 2021
+where fi denotes the local cost function at the ith worker, φ is a robustness regularizer against the
+input perturbation δ, and λ ≥ 0 is a regularization parameter that strikes a balance between the
+training loss and the worst-case robustness regularization. In (2), if M = 1, D(1) = D, λ = 0 and
+φ = `, then the DAT problem reduces to the AT problem (1). We cover two categories of (2):
+•	DAT with labeled data: In (2), we consider φ(θ, δ; x, y) = `(θ, x + δ; y) with labeled training data
+(x, y) ∈ D(i) for i ∈ [M]. Here [M] denotes the integer set {1, 2, . . . , M}.
+•	DAT with unlabeled data: In (2), different from DAT with labeled data, we have D(i) with an
+unlabeled dataset U(i) (namely, U(i) ⊆ D(i)), and define the robust regularizer φ as (Stanforth et al.,
+2019; Zhang et al., 2019b):
+φ(θ, δ; x) = CE(Z(X + δ; θ),z(x; θ)).	(3)
+Here z(x; θ) represents the probability distribution over class labels predicted by the model θ, and
+CE denotes the cross-entropy function.
+4 A Unified Algorithmic Framework for DAT
+In this section, we will introduce the algorithmic framework of DAT, where we address three main
+challenges of algorithm design in DAT: a) inner maximization; b) gradient quantization/compression;
+and c) outer large-batch training by leveraging state-of-the-art adversarial defense and distributed
+optimization techniques. We also achieve the first theoretical convergence rate result of min-max
+optimization based robust training in a distributed large-batch setting.
+We first discuss the key components of DAT and their respective roles in performing scalable training;
+see the meta-form of DAT in Algorithm 1 (or detailed Algorithm A1). The proposed DAT contains
+three algorithmic blocks. In the first block (Steps 3-8 of Algorithm A1), every distributed worker calls
+for a maximization oracle to obtain the adversarial perturbation for each sample within a data batch,
+then computes the gradient of the local cost function fi in (2) with respect to (w.r.t.) model parameters
+θ. And every worker is allowed to quantize/compress the local gradient prior to transmission to a
+server. In the second block (Steps 9-10 of Algorithm A1), the server aggregates the local gradients,
+and transmits the aggregated gradient (or the quantized gradient) to the other workers. In the third
+block (Steps 11-13 of Algorithm A1), the model parameters are eventually updated by a minimization
+oracle at each worker based on the received gradient information from the server.
+In contrast to standard AT, DAT allows for using
+a M times larger batch size to update the model
+parameters θ. Thus, given the same number of
+epochs, DAT takes M fewer gradient updates
+than AT. In addition, distributed learning intro-
+duces communication overhead. To address this
+issue, it is optional to perform gradient quantiza-
+tion at both worker and server sides when a very
+large model is possibly trained. We elaborate on
+DAT in what follows.
+Inner maximization: Iterative and one-shot
+solutions In DAT, each worker calls for an
+inner maximization oracle to generate adversarial perturbations (Step 1 of Algorithm 1). We consider
+two solvers of perturbation generation: iterative projected gradient descent (PGD) method used in
+standard AT (Madry et al., 2017a) and one-shot fast gradient sign method (FGSM) (Goodfellow et al.,
+2015). We specify attack generation in the unified form
+Algorithm 1 Meta-form of DAT Algorithm A1 1 2 3 4 5 6 7 8 9 10 11
+1: for Iteration t = 1,2,... ,T
+2: for Worker i = 1, 2, . . . , M . Block 1
+3:	Sample-wise attack generation (A1)
+4:	Local gradient computation (A2)
+5:	Worker-server communication (optional)
+6: end for
+7: Gradient aggregation at server (A3) . Block 2
+8: Server-worker communication (optional)
+9: for Worker i = 1, 2, . . . , M . Block 3
+10:	Model parameter update (A4)
+11: end for
+δ(i) (x) = ZK,	Zk =Π[-e,e]d [zk-i + α ∙ sign(Vδφ(θt, Zk-1； x))], k ∈ [K],	(4)
+where K is the total number of iterations in the inner loop, the cases of K = 1 and K > 1 correspond
+to iterative PGD attack and FGSM attack respectively, Zk denotes the PGD update of δ at the kth
+iteration, z° is a given intial point, Π[-e,e]d (∙) denotes the projection onto the box constraint [-e, e]d,
+ɑ > 0 is a given step size, and sign(∙) denotes the element-wise sign operation. The recent work
+(Wong et al., 2020) showed that if FGSM is conducted with random initialization Z0 and a proper step
+4
+Under review as a conference paper at ICLR 2021
+size, e.g., α = 1.25, then FGSM can be as effective as iterative PGD in robust training. Indeed, we
+will show in Sec. 5 that the effectiveness of our proposed DAT-FGSM algorithm echoes the finding
+in Wong et al. (2020). We remark that other techniques (Shafahi et al., 2019; Zhang et al., 2019a)
+can also be used to simplify inner maximization, however, we focus on FGSM since it is the most
+computationally-light.
+Gradient quantization In contrast to standard AT, DAT requires worker-server communications
+(Steps 5 and 8 of Algorithm 1). That is, if a single-precision floating-point data type is used, then
+DAT needs to transmit 32d bits per worker-server communication at each iteration. Here recall that d
+is the dimension of θ. In order to reduce the communication cost, DAT has the option to quantize the
+transmitted gradients using a fixed number of bits fewer than 32. We specify the gradient quantization
+operation as the randomized quantizer (Alistarh et al., 2017; Yu et al., 2019). In Sec. 5 we will
+show that DAT, combined with gradient quantization, still leads to a competitive performance. For
+example, the robust accuracy of ResNet-50 trained by a 8-bit DAT (performing quantization at Step 5
+of Algorithm 1) for ImageNet is just 0.55% lower than the robust accuracy achieved by the 32-bit
+DAT. It is also worth mentioning that the All-reduce communication protocol can be regarded as a
+special case of the parameter-server setting considered in Algorithm 1 when every worker performs
+as a server. In this case, the communication network becomes fully connected and the server-worker
+quantization (Step 8 of Algorithm 1) can be mitigated.
+Outer minimization by layerwise adaptive learning rate (LALR) In DAT, the aggregated gra-
+dient (Step 7 in Algorithm 1) used for updating model parameters (Step 10 in Algorithm 1) is built on
+the data batch that is M times larger than standard AT. The recent works (You et al., 2019; 2017)
+showed that the use of LALR is the key to succeed in training standard DNNs with large data batch.
+Spurred by that, we incorporate LALR in DAT. Specifically, the parameter updating operation A in
+Eq. (A4) is given by
+τ(kθt,i k2) ∙ ηt
+θt + 1,i = θt,i ―	∙ ut,i, ∀i ∈ [h],	(5)
+kut,ik2
+where θt,i denotes the ith-layer parameters, h is the number of layers, ut is a descent direction
+computed based on the first-order information Q(gt), τ(∣∣θt,i∣∣2) = min{max{∣∣θt,ik2, g}, c。} is
+a layerwise scaling factor of the adaptive learning rate 忖7. 口之,Cl = 0 and Cu = 10 are set in our
+experiments (see Appendix 4.2 for results on tuning cu), and θt = [θt>,1, . . . , θt>,h]>. In (5), the
+specific form of the descent direction ut is determined by the optimizer employed. For example, if
+the adaptive momentum (Adam) method is used, then ut is given by the exponential moving average
+of past gradients scaled by square root of exponential moving averages of squared past gradients
+(Reddi et al., 2018; Chen et al., 2018). Such a variant of (5) that uses Adam as the base algorithm is
+also known as LAMB (You et al., 2019) in standard training. However, it was elusive if the advantage
+of LALR is preserved in large-batch min-max optimization. We show in both theory and practice that
+the use of LALR can significantly boost the performance of DAT with large data batch.
+Convergence Analysis of DAT
+To the best of our knowledge, none of existing work tackled the convergence of DAT and took into
+account LALR and gradient quantization even in standard AT, although AT has been proved with
+convergence guarantees (Wang et al., 2019b; Gao et al., 2019). DAT needs to quantify the descent
+errors from multiple sources (namely, gradient estimation, quantization, adaptive learning rate, and
+inner maximization oracle). In particular, the incorporation of LALR makes our analysis of DAT
+highly non-trivial. The fundamental challenge lies in the nonlinear coupling between the biased
+gradient estimate resulted from LALR and the additional error generated from alternating update
+in AT. In our theoretical results, we show that even in the case where the gradient estimate is a
+function of the AT variables, the estimate bias resulted from the layer-wise normalization can still
+be compensated by increasing the batch-size so that the convergence rate of DAT achieves a linear
+speedup of reducing gradient estimate error w.r.t. the increasing number of computing nodes.
+Upon defining Ψ(θ):= 吉 PM=I fi(θ; D⑶)in (2), We measure the convergence of DAT by the
+first-order stationarity of Ψ. Prior to convergence analysis, we impose the following assumptions:
+(A1) Ψ(θ) is With layer-Wise Lipschitz continuous gradients; (A2) φ(θ, δ; x) in Eq. (A1) is strongly
+concave With respect to δ and With Lipschitz continuous gradients; (A3) Stochastic gradient estimate
+5
+Under review as a conference paper at ICLR 2021
+in Eq. (A2) is unbiased and has bounded variance for each worker denoted by σ2 . Note that the
+validity of (A2) could be justified from distributional robust optimization (Sinha et al., 2018; Wang
+et al., 2019b). It is also needed for tractability of analysis. We refer readers to Appendix 2.1 for more
+justifications on our assumptions (A1)-(A3). In Theorem 1, we present the sub-linear rate of DAT.
+Theorem 1. Suppose that assumptions A1-A3 hold, the inner maximizer Eq. (A1) provides a ε-
+approximate solution (i.e., the '2-norm ofinner gradient is upper bounded by ε), and the learning
+rate is set by η 〜O(1∕√T), then {θt}T=ι generated by DATyields thefollowing convergence rate
+1T
+T ∑EkVθ Ψ(θt)k2 = O
+t=1
++ ɪ + min[d √d∖ + ε
++ √MB +	[4b, 2b ∫ +
+(6)
+where b denotes the number of quantization bits, and B = min{|Bt(i) |, ∀t, i} stands for the smallest
+batch size per worker.
+Proof: Please see Appendix 3.
+The error rate given by (6) involves four terms. The term O(1/，MB) characterizes the benefit
+of using the large per-worker batch size B and M computing nodes in DAT. It is introduced since
+the variance of adaptive gradients (i.e., σ2) is reduced by a factor 1/MB, where 1/M corresponds
+to the linear speedup by M machines. In (6), the term min{ -d,邸} arises due to the variance of
+compressed gradients, and the other two terms imply the dependence on the number of iterations
+T as well as the ε-accuracy of the inner maximization oracle. We highlight that our convergence
+analysis (Theorem 1) is not barely a combination of LALR-enabled standard training analysis (You
+et al., 2019; 2017) and adversarial training convergence analysis (Wang et al., 2019b; Gao et al.,
+2019). Different from the previous work, we address the fundamental challenges in (a) quantifying
+the descent property of the objective value at the presence of multi-source errors during alternating
+min-max optimization, and (b) deriving the theoretical relationship between large data batch (across
+distributed machines) and the eventual convergence error of DAT.
+5	Experiments: DAT for Robust Image Classification
+In this section, we empirically evaluate DAT and show its success in training robust deep neural
+networks (DNNs) over CIFAR and ImageNet datasets. We measure the performance of DAT in
+the following four aspects: a) accuracies against clean and adversarial test inputs, b) scalability to
+multiple computing nodes, c) incorporation of unlabeled data, and d) transferability of pre-trained
+model by DAT.
+DNN models and Datasets We use the DNN models Pre-act ResNet-18 (He et al., 2016b) and
+ResNet-50 (He et al., 2016a) for image classification, where the former is shortened as ResNet-18.
+We train these models under datasets CIFAR-10 and ImageNet, but preserve ResNet-18 for CIFAR-
+10 only. We also acquire unlabeled data from 80 Million Tiny Images following (Carmon et al.,
+2019). When studying pre-trained model’s transferability, CIFAR-100 is used as a target dataset for
+down-stream classification.
+Computing resources We train a DNN using p computing nodes, each of which contains q GPUs
+(Nvidia V100 or P100). Nodes are connected with 1Gbps ethernet. A configuration of computing
+resources is noted by p × q. Ifp > 1, then the training is conducted in a distributed manner. And
+we split training data into p subsets, each of which is stored at a local node. Based on our resources,
+in the CIFAR experiments, we consider p ∈ {1, 6, 18, 24} machines, each of which has 1 GPU. In
+the ImageNet experiments, we consider p ∈ {1, 6} machines, each of which has 6 GPUs. Based on
+our computing resource budget, we are not able to use as many GPUs as (Xie et al., 2019; Kannan
+et al., 2018). However, as will be evident later, our results clearly demonstrate the advantages of
+our proposal in applicability and scalability across various computing configurations and adversarial
+scenarios. In particular, our used batch size 6 × 512 = 3072 on ImageNet has only access to 36
+GPUs. By contrast, Xie et al. (2019) used the batch size 4096 across 128 GPUs.
+Training setting We consider 2 variants of DAT: 1) DAT-PGD, namely, AlgorithmA1 with apply-
+ing (iterative) PGD as the inner maximization oracle; and 2) DAT-FGSM, namely, AlgorithmA1 with
+6
+Under review as a conference paper at ICLR 2021
+use of FGSM as the inner maximization oracle. Additionally, We consider 4 training baselines: 1) Ar
+(Madry et al., 2017b); 2) FaStAT (Wong et al., 2020); 3) DAT w/o LALR, namely, a direct distributed
+implementation of AT, which is in the form of DAT-PGD or DAT-FGSM but without considering
+LALR; and 4) DAT-LSGD (Xie et al., 2019), namely, a distributed implementation of large-batch
+SGD (LSGD) for standard AT. We remark that both AT and Fast AT are centralized training methods.
+In our setup, the number of GPUs is limited to 6 at a single machine, and thus the largest batch size
+that the centralized method can use is around 2048 for CIFAR-10 and 85 for ImageNet in our case.
+We also find that the direct implementation of Fast-AT in a distributed way leads to a quite poor
+scalability versus the growth of batch size, and thus a worse distributed baseline than DAT-FGSM w/o
+LALR. Lastly, we remark that the work (Xie et al., 2019) proposed modifying a model architecture
+by incorporating feature denoising. In contrast, DAT does not call for architecture modification. Thus,
+to enable a fair comparison, we use the same training recipe LSGD as (Xie et al., 2019) in the DAT
+setting, leading to the considered distributed training baseline DAT-LSGD.
+Unless specified otherwise, we choose the training perturbation size = 8/255 and 2/255 for CIFAR
+and ImageNet respectively, where recall that was defined in (1). We also choose 10 steps and 4 steps
+for PGD attack generation in DAT (and its variants) under CIFAR and ImageNet, respectively. Such
+training settings are consistent with previous state-of-the-art (Zhang et al., 2019a; Wong et al., 2020).
+The number of training epochs is given by 100 for CIFAR-10 and 30 for ImageNet. Note that the
+adversarially robust deep learning could be sensitive to the step size (learning rate) choice (Rice et al.,
+2020). For example, the use of a cyclic learning rate trick can further accelerate the Fast AT algorithm
+(Wong et al., 2020). However, such a trick becomes less effective when the batch size becomes
+larger (namely, the number of iterations gets smaller); see Appendix 4.1. Meanwhile, the sensitivity
+of adversarially model training to step size can be mitigated by using early-stop remedy due to the
+existence of robust overfitting (Rice et al., 2020). Spurred by that, we use the standard piecewise
+decay step size and an early-stop strategy during robust training. We refer readers to Appendix 4.2
+for more implementation details.
+Evaluation setting For ad-
+versarial evaluation, we report
+robust test accuracy (RA) of
+Table 1: Overall performance of DAT (in gray color), compared with
+baselines, in TA (%), RA (%), communication time per epoch (seconds), and
+total training time (including communication time) per epoch (seconds). For
+brevity, ‘p × q’ represents ‘# nodes × # GPUs per node’, ‘Comm.’ represents
+communication cost, and 'Tr. Time, represents training time.
+Method	CIFAR-10, ResNet-18					
+	p × q	Batch size	TA(%)	RA(%)	Comm.	Tr. time
+AT	1 × 1	-2048	82.94	38.54	-NA-	-2Γ8-
+Fast AT	1 × 1	2048	81.58	38.34	NA	52
+DAT-PGD w/o LALR	18 × 1	18 × 2048	55.59	26.83	3.4	22
+DAT-FGSM w/o LALR	18 × 1	18 × 2048	52.35	28.90	3.1	8
+DAT-LSGD	18 × 1	18 × 2048	64.15	34.12	3.2	22
+DAT-PGD	18 × 1	18 × 2048	80.28	38.44	3.4	22
+DAT-FGSM	18 × 1	18 × 2048	73.42	38.55	3.1	8
+DAT-FGSM	24 × 1	24 × 2048	72.76	39.82	2.0	5
+	ImageNet, ResNet-50					
+AT	1 × 6	512	62.70	40.38	NA	6022
+Fast AT	1 × 6	512	58.99	40.78	NA	1544
+DAT-PGD w/o LALR	6 × 6	6 × 512	57.09	34.02	865	1932
+DAT-FGSM w/o LALR	6 × 6	6 × 512	55.04	35.03	863	1080
+DAT-PGD	6 × 6	6 × 512	63.75	38.45	898	1960
+DAT-FGSM	6 × 6	6 × 512	58.32	41.48	859	1109
+a learned model against PGD
+attacks (Madry et al., 2017b)
+and C&W attack (Carlini &
+Wagner, 2017). Unless speci-
+fied otherwise, we choose the
+perturbation size same as the
+training in evaluation, and
+the number of PGD steps is
+selected as 20 and 10 for CI-
+FAR and ImageNet, respec-
+tively. In addition to RA,
+we also measure the standard
+test accuracy (TA) of a model
+against normal examples. All
+experiments are run 3 times
+with different random seeds, and the mean metrics are reported1. In our experiments, we consider three
+different communication protocols, Ring-AllReduce (with one-sided quantization), parameter-server
+(with double quantization), and high performance computing (HPC) setting (without quantization).
+To measure the communication time, We use torch.distributed package with gloo and nccl as
+communication backend2. We then measure the time of required worker-server communications per
+epoch. We use a time module to measure communication time with torch.distributed.barrier
+to synchronize all processes on each node.
+1Code will be released
+2https://pytorch.org/docs/stable/distributed.html
+7
+Under review as a conference paper at ICLR 2021
+Overall performance of DAT In Table 1, we evaluate our proposals and baselines in TA, RA,
+communication and computation efficiency. Note that AT and Fast AT are centralized training
+methods in single node under the same number of epochs as distributed training.
+We observe that the direct extension
+from AT to DAT (namely, DAT-PGD w/o
+LALR) leads to significantly poor TA
+and RA. As the 18 times larger batch
+size is used, DAT-PGD w/o LALR yields
+more than 25% drop in TA and 10% drop
+in RA compared to the best AT case. We
+find that the performance of DAT-PGD
+WIo LALR rapidly degrades as the num-
+Figure 1: TA/RA comparison between DAT-FGSM and DAT-
+hɑr γλt r∙cτnτιιιfInC TlCriQQ Inr∙rαoQQQ I hɑ O	ɪ
+ber of computing nodes increases. The LSGD vs. node-GPU configurations. Left: (CIFAR-10, ResNet-
+.	.,
+similar conclusion holds for DAT-FGSM 18). Right: (ImageNet, ResNet-50).
+wIo LALR vs. Fast AT. Furthermore, we
+observe that DAT-PGD outperforms DAT-LSGD (Xie et al., 2019) with 16.13% and 4.32% im-
+provement in TA and RA, respectively. In Figure 1, we further compare our proposed DAT with
+the DAT-LSGD baseline in terms of TAIRA versus the number of computing nodes. Clearly, our
+approach scales more gracefully than the baseline (without losing much performance as the batch
+sizes increases along the number of computing nodes).
+Moreover, we consistently observe that DAT-PGD (or DAT-FGSM) is able to achieve competitive
+performance to AT (or Fast AT) and enables a graceful training speedup, e.g., by 3 times using 6
+machines for ImageNet. In practice, DAT is not able to achieve linear speed-up mainly because of the
+communication cost. For example, when comparing the computation time of DAT-PGD (batch size
+6 × 512) with that of AT (batch size 512) under ImageNet, the computation speed-up (by excluding the
+communication cost) is given by (6022)/(1960 - 898) = 5.67, consistent with the ideal computation
+gain using 6× larger batch size in DAT-PGD. Furthermore, we observe that when the largest batch
+size (24 × 2048) is used, DAT-FGSM takes only (500 seconds) to obtain satisfactory robustness.
+When comparing DAT-FGSM with DAT-
+PGD, we consistently observe that the
+former is capable of offering satisfactory
+(and even better) RA, but inevitably intro-
+duces a TA loss. This phenomenon also
+holds for Fast AT versus AT, e.g., 0.4%
+RA improvement vs. 3.71% TA degrada-
+tion for ImageNet. We also note that the
+per-epoch communication time decreases
+when the more GPU machines (24) are
+used, since a larger batch size allows a
+smaller number of iterations per epoch,
+Figure 2: RA against PGD attacks for model trained by DAT-
+PGD, DAT-FGSM, and AT following (ImageNet, ResNet-50)
+in Table 1. (Left) RA versus different perturbation sizes (over
+the divisor 255). (Right) RA versus different steps.
+leading to less frequent communications among machines. In Appendix 4.3, we present additional
+results on CIFAR-10 using ResNet-50.
+Robustness against different PGD attacks In Figure 2, we evaluate the adversarial robustness
+of ResNet-50 at ImageNet learned by DAT-PGD and DAT-FGSM against PGD attacks of different
+steps and perturbation sizes (i.e., values of ). We observe that DAT matches robust accuracies of
+standard AT even against PGD attacks at different values of and steps. We also note that although
+DAT-FGSM has the worst TA ( = 0), it yields slightly better robustness as attack steps increase. The
+similar results can be found in Appendix 4.4 for (CIFAR-10, ResNet-18) against PGD (and C&W)
+attacks.
+DAT under unlabeled data In Ta-
+ble 2, we report TA and RA of DAT in the
+semi-supervised setting (Carmon et al.,
+2019) with the use of 500K unlabeled im-
+ages mined from Tiny Images (Carmon
+et al., 2019). Compared to the DAT su-
+pervised learning results at (CIFAR-10,
+Table 2: DAT in semi-supervised learning with unlabeled data,
+where the computing resource configuration and batch size are
+set the same as the 8th and 10th rows of (CIFAR-10, ResNet-18)
+in Table 1. The relative improvement over RA or TA obtained in
+supervised learning (CIFAR-10 only) is marked by red color.
+Method
+DAT-PGD
+DAT-FGSM
+CIFAR-10 + 500K unlabeled Tiny Images, ResNet-18
+TA (%)
+87.00 (↑ 7.62)
+88.00 (↑ 12.42)
+RA(%)
+47.34(↑ 8.40)
+45.84(↑ 4.92)
+Comm.
+86
+86
+Tr. time
+451
+124
+8
+Under review as a conference paper at ICLR 2021
+ResNet-18) in Table 1, we observe that although the communication and computation costs increase
+due to the use of additional unlabeled images, both TA and RA are significantly improved. In
+particular, the performance of DAT-FGSM matches that of DAT-PGD. This suggests that unlabeled
+data might provide a solution to compensate the TA loss induced by FGSM-based robust training
+algorithms.
+DAT from pre-training to fine-tuning In Figure 3, we
+investigate if a DAT pre-trained model (ResNet-50) over
+a source dataset (ImageNet) can offer a fast fine-tuning
+to a down-stream target dataset (CIFAR-100). Here we
+up-sample a CIFAR image to the same dimension of an
+ImageNet image before feeding it into the pre-trained
+model (Shafahi et al., 2020). Compared with the direct
+application of DAT to the target dataset (without pre-
+training), the pre-training enables a fast adaption to the
+down-stream CIFAR task in both TA and RA within just 3
+epochs. Thus, the scalability of DAT to large datasets and
+multiple nodes offers a great potential in the pre-training
++ fine-tuning paradigm. The similar results can be found
+in Appendix 4.5 on CIFAR-10.
+TA: Pre-training on ImageNet
+—⅛- RA： Pre-training on ImageNet
+TA： No Pre-training
+Fine-tuning epochs
+Figure 3: Fine-tuning ResNet-50 (pre-trained
+on ImageNet) under CIFAR-100. Here DAT-
+PGD is used for both pre-training and fine-
+tuning at 6 nodes with batch size 6 × 128.
+Quantization effect In Appendix 4.6, we also study how the performance of DAT is affected by
+gradient quantization. We find that when the number of bits is reduced from 32 to 8, the resulting
+TA and RA becomes worse than the best 32-bit case. For example, in the worst case (8-bit 2-sided
+quantization) of CIFAR-10, TA drops 1.52% and 6.32% for DAT-PGD and DAT-FGSM, respectively.
+And RA drops 4.74% and 5.58%, respectively. Note that our main communication configuration is
+given by Ring-AllReduce that calls for 1-sided (rather than 2-sided) quantization. We also observe
+that DAT-FGSM is more sensitive to effect of gradient quantization than DAT-PGD. Even in the
+centralized setting, the use of 8-bit quantization can lead to a non-trivial drop in TA (see Table A5).
+However, the use of quantization reduces the amount of data transmission per iteration. We also show
+that if a high performance computing cluster of nodes (with NVLink high-speed GPU interconnect
+(Foley & Danskin, 2017)) is used, the communication cost can be further reduced.
+LALR vs. centralized and distributed solu-
+tions We examine the effect of LALR on both
+centralized and distributed robust training meth-
+ods given a batch size that is affordable to a
+single machine. We consider a variant of AT by
+incorporating LALR, termed as AT w/ LALR.
+As presented in Table 3, when the batch size is
+not large, both centralized and distributed meth-
+Table 3: Effect of LALR on centralized and distributed
+training under CIAR-10 With same batch size (2048).
+Method	# machines X batch size per machine	TA(%)	RA(%)
+DAT-PGD (W/ LALR)	6 X 341	83.48	39.76
+AT W/ LALR	1 X 2048	83.56	39.84
+DAT W/o LALR	6 X 341	82.42	38.41
+AT (W/o LALR)	1 X 2048	82.94	38.54
+ods lead to very similar performance although the former is slightly better as it is free of machine
+synchronization and communication. And the performance is not sensitive to LALR. By contrast, if
+the batch size is large (inapplicable to centralized cases as Table 1), then DAT + LALR outperforms
+DAT (namely, LALR matters).
+6	Conclusions
+We proposed distributed adversarial training (DAT) to scale up the training of adversarially robust
+DNNs over multiple machines. We shoWed that DAT is general in that it enables large-batch min-max
+optimization and supports gradient compression and different learning regimes. We proved that under
+mild conditions, DAT is guaranteed to converge to a first-order stationary point With a sub-linear rate.
+Empirically, We provided comprehensive experiment results to demonstrate the effectiveness and the
+usefulness of DAT in training robust DNNs With large datasets and multiple machines. In the future,
+it Will be WorthWhile to examine the speedup achieved by DAT in the extreme training cases, e.g.,
+using a significantly large number of PGD attack steps and/or computing nodes during training.
+9
+Under review as a conference paper at ICLR 2021
+References
+Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan Vojnovic. QSGD: Communication-
+efficient SGD via gradient quantization and encoding. In Advances in Neural Information Process-
+ing Systems ,pp.1709-1720, 2017.
+Md Zahangir Alom, Tarek M Taha, Christopher Yakopcic, Stefan Westberg, Paheding Sidike,
+Mst Shamima Nasrin, Brian C Van Esesn, Abdul A S Awwal, and Vijayan K Asari. The his-
+tory began from alexnet: A comprehensive survey on deep learning approaches. arXiv preprint
+arXiv:1803.01164, 2018.
+Anish Athalye, Nicholas Carlini, and David Wagner. Obfuscated gradients give a false sense of
+security: Circumventing defenses to adversarial examples. arXiv preprint arXiv:1802.00420, 2018.
+J. Bernstein, Y.-X. Wang, K. Azizzadenesheli, and A. Anandkumar. signSGD: compressed optimisa-
+tion for non-convex problems. arXiv preprint arXiv:1802.04434, 2018.
+Akhilan Boopathy, Sijia Liu, Gaoyuan Zhang, Pin-Yu Chen, Shiyu Chang, and Luca Daniel. Visual
+interpretability alone helps adversarial robustness, 2020. URL https://openreview.net/
+forum?id=Hyes70EYDB.
+Nicholas Carlini and David Wagner. Towards evaluating the robustness of neural networks. In IEEE
+Symposium on Security and Privacy (SP), pp. 39-57. IEEE, 2017.
+Yair Carmon, Aditi Raghunathan, Ludwig Schmidt, John C Duchi, and Percy S Liang. Unlabeled
+data improves adversarial robustness. In Advances in Neural Information Processing Systems, pp.
+11190-11201, 2019.
+Chia-Yu Chen, Jiamin Ni, Songtao Lu, Xiaodong Cui, Pin-Yu Chen, Xiao Sun, Naigang Wang,
+Swagath Venkataramani, Vijayalakshmi Srinivasan, Wei Zhang, and Kailash Gopalakrishnan.
+Scalecom: Scalable sparsified gradient compression for communication-efficient distributed train-
+ing. In Advances in Neural Information Processing Systems, 2020.
+Jiefeng Chen, Xi Wu, Vaibhav Rastogi, Yingyu Liang, and Somesh Jha. Robust attribution regular-
+ization. In Advances in Neural Information Processing Systems, pp. 14300-14310, 2019.
+Xiangyi Chen, Sijia Liu, Ruoyu Sun, and Mingyi Hong. On the convergence of a class of adam-type
+algorithms for non-convex optimization. In International Conference on Learning Representations,
+2018.
+Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc’aurelio
+Ranzato, Andrew Senior, Paul Tucker, Ke Yang, et al. Large scale distributed deep networks. In
+Advances in Neural Information Processing Systems, pp. 1223-1231, 2012.
+Krishnamurthy Dvijotham, Sven Gowal, Robert Stanforth, Relja Arandjelovic, Brendan O’Donoghue,
+Jonathan Uesato, and Pushmeet Kohli. Training verified learners with learned verifiers. arXiv
+preprint arXiv:1805.10265, 2018.
+Kevin Eykholt, Ivan Evtimov, Earlence Fernandes, Bo Li, Amir Rahmati, Florian Tramer, Atul
+Prakash, Tadayoshi Kohno, and Dawn Song. Physical adversarial examples for object detectors. In
+Prof. of the 12th USENIX Workshop on Offensive Technologies (WOOT 18), 2018.
+Denis Foley and John Danskin. Ultra-performance pascal GPU and NVLink interconnect. IEEE
+Micro, 37(2):7-17, 2017.
+Ruiqi Gao, Tianle Cai, Haochuan Li, Cho-Jui Hsieh, Liwei Wang, and Jason D Lee. Convergence
+of adversarial training in overparametrized neural networks. In Advances in Neural Information
+Processing Systems, pp. 13029-13040, 2019.
+Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair,
+Aaron Courville, and Yoshua Bengio. Generative adversarial nets. In Advances in Neural
+Information Processing Systems, pp. 2672-2680, 2014.
+10
+Under review as a conference paper at ICLR 2021
+Ian Goodfellow, Jonathon Shlens, and Christian Szegedy. Explaining and harnessing adversarial
+examples. 2015 ICLR, arXiv preprint arXiv:1412.6572, 2015.
+Priya Goyal, Piotr Dolldr, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, AaPo Kyrola,
+Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet
+in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Kenta Hanada, Ryosuke Morita, Takayuki Wada, and Yasumasa Fujisaki. SimPle synchronous
+and asynchronous algorithms for distributed minimax oPtimization. SICE Journal of Control,
+Measurement, and System Integration,10(6):557-562, 2017.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. DeeP residual learning for image
+recognition. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition,
+PP. 770-778, 2016a.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Identity maPPings in deeP residual
+networks. In European Conference on Computer Vision, PP. 630-645. SPringer, 2016b.
+Daniel Kang, Yi Sun, Dan Hendrycks, Tom Brown, and Jacob Steinhardt. Testing robustness against
+unforeseen adversaries. arXiv preprint arXiv:1908.08016, 2019.
+Harini Kannan, Alexey Kurakin, and Ian Goodfellow. Adversarial logit Pairing, 2018.
+Nitish Shirish Keskar, Dheevatsa Mudigere, Jorge Nocedal, Mikhail Smelyanskiy, and Ping Tak Peter
+Tang. On large-batch training for deeP learning: Generalization gaP and sharP minima. arXiv
+preprint arXiv:1609.04836, 2016.
+Alex Krizhevsky. One weird trick for Parallelizing convolutional neural networks. arXiv preprint
+arXiv:1404.5997, 2014.
+Alexey Kurakin, Ian Goodfellow, and Samy Bengio. Adversarial examPles in the Physical world.
+arXiv preprint arXiv:1607.02533, 2016.
+Mingrui Liu, Youssef Mroueh, Wei Zhang, Xiaodong Cui, Tianbao Yang, and Payel Das. Decentral-
+ized Parallel algorithm for training generative adversarial nets. arXiv preprint arXiv:1910.12999,
+2019a.
+Weijie Liu, Aryan Mokhtari, Asuman Ozdaglar, Sarath Pattathil, Zebang Shen, and Nenggan
+Zheng. A decentralized Proximal Point-tyPe method for saddle Point Problems. arXiv preprint
+arXiv:1910.14380, 2019b.
+Songtao Lu, Meisam Razaviyayn, Bo Yang, Kejun Huang, and Mingyi Hong. Finding second-order
+stationary Points efficiently in smooth nonconvex linearly constrained oPtimization Problems. In
+Advances in Neural Information Processing Systems, 2020.
+A. Madry, A. Makelov, L. Schmidt, D. TsiPras, and A. Vladu. Towards deeP learning models resistant
+to adversarial attacks. arXiv preprint arXiv:1706.06083, 2017a.
+Aleksander Madry, Aleksandar Makelov, Ludwig Schmidt, Dimitris TsiPras, and Adrian Vladu.
+Towards deeP learning models resistant to adversarial attacks. arXiv preprint arXiv:1706.06083,
+2017b.
+Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Jonathan Uesato, and Pascal Frossard. Ro-
+bustness via curvature regularization, and vice versa. In Proceedings of the IEEE Conference on
+Computer Vision and Pattern Recognition, PP. 9078-9086, 2019.
+Ivano Notarnicola, Mauro Franceschelli, and GiusePPe Notarstefano. A duality-based aPProach for
+distributed min-max oPtimization. IEEE Transactions on Automatic Control, 64(6):2559-2566,
+2018.
+Nicolas PaPernot, Ian Goodfellow, Ryan Sheatsley, Reuben Feinman, and Patrick McDaniel. clever-
+hans v1.0.0: an adversarial machine learning library. arXiv preprint arXiv:1610.00768, 2016.
+11
+Under review as a conference paper at ICLR 2021
+Chongli Qin, James Martens, Sven Gowal, Dilip Krishnan, Krishnamurthy Dvijotham, Alhussein
+Fawzi, Soham De, Robert Stanforth, and Pushmeet Kohli. Adversarial robustness through local
+linearization. In Advances in Neural Information Processing Systems, pp. 13847-13856, 2019.
+Sashank J. Reddi, Satyen Kale, and Sanjiv Kumar. On the convergence of adam and beyond. In
+International Conference on Learning Representations, 2018.
+Leslie Rice, Eric Wong, and J Zico Kolter. Overfitting in adversarially robust deep learning. arXiv
+preprint arXiv:2002.11569, 2020.
+Andrew Slavin Ross and Finale Doshi-Velez. Improving the adversarial robustness and interpretability
+of deep neural networks by regularizing their input gradients. In Thirty-Second AAAI Conference
+on Artificial Intelligence, 2018.
+Ali Shafahi, Mahyar Najibi, Mohammad Amin Ghiasi, Zheng Xu, John Dickerson, Christoph Studer,
+Larry S Davis, Gavin Taylor, and Tom Goldstein. Adversarial training for free! In Advances in
+Neural Information Processing Systems, pp. 3353-3364, 2019.
+Ali Shafahi, Parsa Saadatpanah, Chen Zhu, Amin Ghiasi, Christoph Studer, David Jacobs, and
+Tom Goldstein. Adversarially robust transfer learning. In International Conference on Learning
+Representations, 2020. URL https://openreview.net/forum?id=ryebG04YvB.
+Aman Sinha, Hongseok Namkoong, and John Duchi. Certifiable distributional robustness with
+principled adversarial training. In International Conference on Learning Representations, 2018.
+URL https://openreview.net/forum?id=Hk6kPgZA-.
+KUnal Srivastava, Angelia NediC, and Dusan Stipanovic. Distributed min-max optimization in
+networks. In Proc. of the 17th International Conference on Digital Signal Processing (DSP), pp.
+1-8, 2011.
+Robert Stanforth, Alhussein Fawzi, Pushmeet Kohli, et al. Are labels required for improving
+adversarial robustness? arXiv preprint arXiv:1905.13725, 2019.
+Sebastian U Stich, Jean-Baptiste Cordonnier, and Martin Jaggi. Sparsified sgd with memory. In
+Advances in Neural Information Processing Systems, pp. 4447-4458, 2018.
+Christian Szegedy, Wojciech Zaremba, Ilya Sutskever, Joan Bruna, Dumitru Erhan, Ian Goodfellow,
+and Rob Fergus. Intriguing properties of neural networks. arXiv preprint arXiv:1312.6199, 2013.
+Ioannis Tsaknakis, Mingyi Hong, and Sijia Liu. Decentralized min-max optimization: Formulations,
+algorithms and applications in network poisoning attack. In Proc. of IEEE International Conference
+on Acoustics, Speech and Signal Processing, pp. 5755-5759, 2020.
+Jianyu Wang, Vinayak Tantia, Nicolas Ballas, and Michael Rabbat. Slowmo: Improving
+communication-efficient distributed sgd with slow momentum. arXiv preprint arXiv:1910.00643,
+2019a.
+Yisen Wang, Xingjun Ma, James Bailey, Jinfeng Yi, Bowen Zhou, and Quanquan Gu. On the
+convergence and robustness of adversarial training. In International Conference on Machine
+Learning, pp. 6586-6595, 2019b.
+Jianqiao Wangni, Jialei Wang, Ji Liu, and Tong Zhang. Gradient sparsification for communication-
+efficient distributed optimization. In Advances in Neural Information Processing Systems, pp.
+1299-1309, 2018.
+Eric Wong and J Zico Kolter. Provable defenses against adversarial examples via the convex outer
+adversarial polytope. arXiv preprint arXiv:1711.00851, 2017.
+Eric Wong, Leslie Rice, and J. Zico Kolter. Fast is better than free: Revisiting adversarial training. In
+International Conference on Learning Representations, 2020. URL https://openreview.
+net/forum?id=BJx040EFvH.
+Cihang Xie, Yuxin Wu, Laurens van der Maaten, Alan L Yuille, and Kaiming He. Feature denoising
+for improving adversarial robustness. In Proc. of the IEEE Conference on Computer Vision and
+Pattern Recognition, pp. 501-509, 2019.
+12
+Under review as a conference paper at ICLR 2021
+Han Xu, Yao Ma, Haochen Liu, Debayan Deb, Hui Liu, Jiliang Tang, and Anil Jain. Adversarial
+attacks and defenses in images, graphs and text: A review. arXiv preprint arXiv:1909.08072,
+2019a.
+Kaidi Xu, Gaoyuan Zhang, Sijia Liu, Quanfu Fan, Mengshu Sun, Hongge Chen, Pin-Yu Chen, Yanzhi
+Wang, and Xue Lin. Evading real-time person detectors by adversarial t-shirt. arXiv preprint
+arXiv:1910.11099, 2019b.
+Yang You, Igor Gitman, and Boris Ginsburg. Scaling SGD batch size to 32k for imagenet training.
+arXiv preprint arXiv:1708.03888, 6, 2017.
+Yang You, Zhao Zhang, Cho-Jui Hsieh, James Demmel, and Kurt Keutzer. Imagenet training in
+minutes. In Proc. of the 47th International Conference on Parallel Processing, pp. 1. ACM, 2018.
+Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan
+Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization for deep
+learning: Training bert in 76 minutes. In International Conference on Learning Representations,
+2019.
+Yue Yu, Jiaxiang Wu, and Longbo Huang. Double quantization for communication-efficient dis-
+tributed optimization. In Advances in Neural Information Processing Systems, pp. 4440-4451,
+2019.
+Dinghuai Zhang, Tianyuan Zhang, Yiping Lu, Zhanxing Zhu, and Bin Dong. You only propagate
+once: Accelerating adversarial training via maximal principle. arXiv preprint arXiv:1905.00877,
+2019a.
+Hongyang Zhang, Yaodong Yu, Jiantao Jiao, Eric P Xing, Laurent El Ghaoui, and Michael I Jordan.
+Theoretically principled trade-off between robustness and accuracy. International Conference on
+Machine Learning, 2019b.
+13
+Under review as a conference paper at ICLR 2021
+Appendix
+1	DAT Algorithm Framework
+Algorithm A1 Distributed adversarial training (DAT) for solving problem (2)
+1:
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+13:
+14:
+Input: Initial θ1, dataset D(i) for each of M workers, and T iterations
+for Iteration t = 1,2,...,T
+for Worker i = 1,2,...,M	. Worker
+Draw a finite-size data batch Bi ⊆ D(* i)
+For each data sample X ∈ Bi, call for an inner maximization oracle:
+δ(i) (x) := arg max φ(θt, δ; x),	(A1)
+kδk∞≤e
+where we omit the label or possible pseudo-label y of X for brevity
+Computing local gradient of f in (2) with respect to θ given perturbed samples:
+g(i) = λEx∈B(i) [Vθ'(θt; x)] + Ex∈B(i) [Vθφ(θt; X + δ(i)(x))]	(A2)
+(Optional) Call for gradient quantizer Q(∙) and transmit Q(g(i)) to server
+end for
+Gradient aggregation at server:	. Server
+gt = M P= Q(g(i))	(A3)
+(Optional) Call for gradient quantizer gt — Q(gt), and transmit gt to workers:
+for Worker i = 1,2,...,M	. Worker
+Call for an outer minimization oracle A(∙) to update θ:
+θt+ι = A(θtgt,ηt),	ηt is learning rate	(A4)
+end for
+end for
+Additional details on gradient quantization Let b denote the number of bits (b ≤ 32), and thus
+there exists S = 2b quantization levels. We specify the gradient quantization operation Q(∙) in
+Algorithm A1 as the randomized quantizer (Alistarh et al., 2017; Yu et al., 2019). Formally, the
+quantization operation at the ith coordinate ofa vector g is given by (Alistarh et al., 2017)
+Q(gi) = kg∣∣2 ∙ sign(gi) ∙ ξi(gi,s), ∀i ∈ {1, 2,...,d}.	(A5)
+In (A5), ξi(gi, s) is a random number drawn as follows. Given |gi|/kgk2 ∈ [l/s, (l + 1)/s] for some
+l ∈ N+ and 0 ≤ l < s, we then have
+ξi (gi , s)
+l/s
+(l + 1)/s
+with probability 1 - (s|gi |/kgk2 - l)
+with probability (s|gi|/kgk2 - l),
+(A6)
+where |a| denotes the absolute value of a scalar a, and kak2 denotes the `2 norm of a vector a. The
+rationale behind using (A5) is that Q(gi) is an unbiased estimate ofgi, namely, Eξi(gi,s) [Q(gi)] = gi,
+with bounded variance. Moreover, we at most need (32 + d + bd) bits to transmit the quantized
+Q(g), where 32 bits for kgk2, 1 bit for sign of gi and b bits for ξi(gi, s), whereas it needs 32d bits
+for a single-precision g. Clearly, a small b saves the communication cost. We note that if every
+worker performs as a server in DAT, then the quantization operation at Step 10 of Algorithm A1 is no
+longer needed. In this case, the communication network becomes fully connected. With synchronized
+communication, this is favored for training DNNs under the All-reduce operation.
+14
+Under review as a conference paper at ICLR 2021
+2	Theoretical Results
+In this section, we will quantify the convergence behaviour of the proposed DAT algorithm. First, we
+define the following notations:
+Φi(θ, x) =	max φ(θ, δ(i); x),	and Φi (θ) = Ex∈D(i) Φi(θ; x).	(A7)
+kδ(i)k∞≤
+We also define
+li(θ) = Eχ∈D(i) l(θ; x),	(A8)
+where the label y of x is omitted for labeled data. Then, the objective function of problem (2) can be
+expressed in the compact way
+1M
+Ψ(θ) = MM ∑>li(θ)+Φi(θ)	(A9)
+M i=1
+and the optimization problem is then given by minθ Ψ(θ).
+Therefore, it is clear that if a point θ? satisfies
+kVθΨ(θ?)k≤ ξ,	(A10)
+then we say θ? is a ξ approximate first-order stationary point (FOSP) of problem (2).
+Prior to delving into the convergence analysis of DAT, we make the following assumptions.
+2.1	Assumptions
+A1. Assume objective function has layer-wise Lipschitz continuous gradients with constant Li for
+each layer
+kViΨ(θ∙,i) -ViΨ(θ0,i)k ≤ Likθ∙,i - θ0,ik,∀i ∈ [h].	(A11)
+where ViΨ(θ∙i) denotes the gradient w.r.t. the variables at the ith layer. Also, We assume that Ψ(θ)
+is lower bounded, i.e., Ψ? := minθ Ψ(θ) > 一∞ and bounded gradient estimate, i.e., kVg(i) k ≤ G.
+A2. Assume that φ(θ, δ; x) is strongly concave with respect to δ with parameter μ and has the
+following gradient Lipschitz continuity with constant Lφ :
+kVθφ(θ, δ; x) - Vθφ(θ, δ0; x)k ≤ Lφkδ - δ0k.	(A12)
+A3. Assume that the gradient estimate is unbiased and has bounded variance, i.e.,
+Ex∈B(i) [Vθ l(θ; x)] =Vθl(θ), ∀i,	(A13)
+Ex∈B(i) [VθΦ(θ; x)] =VθΦ(θ), ∀i,	(A14)
+where recall that B(I) denotes a data batch used at worker i, Vθl(θ) := M PM=I Vθli(θ) and
+VθΦ(θ) ：= -MM PM1 VθΦi(θ)=and
+Ex∈B(i) kVθl(θ; x) - Vθl(θ)k2 ≤ σ2, ∀i	(A15)
+Ex∈B(i) kVθΦ(θ; x) - VθΦ(θ)k2 ≤ σ2,∀i.	(A16)
+Further, we define a component-wise bounded variance of the gradient estimate
+Ex∈B(i)k[Vθl(θ; x)]jk - [Vθl(θ)]jkk2 ≤ σj2k, ∀i,	(A17)
+Eχ∈B(i) k [VθΦ(θ; x)]jk - [VθΦ(θ)]jk k2 ≤ σjk, ∀i,	(A18)
+where j denotes the index of the layer, and k denotes the index of entry at each layer. Under A3, we
+have Pjh=1 Pdkj=1 max{σj2k, σj02k} ≤ σ2
+A4. Assume that the component wise compression error has bounded variance
+E[(Q([g(i)(θ)]jk) - [g(i)(θ)]jk)2] ≤δj2k,∀i.	(A19)
+The assumption A4 is satisfied as the randomized quantization is used (Alistarh et al., 2017,
+Lemma 3.1).
+15
+Under review as a conference paper at ICLR 2021
+2.2	Oracle of maximization
+In practice, Φi (θ; x), ∀i may not be obtained, since the inner loop needs to iterate by the infinite
+number of iterations to achieve the exact maximum point. Therefore, we allow some numerical error
+term resulted in the maximization step at (A1). This consideration makes the convergence analysis
+more realistic.
+First, we have the following criterion to measure the closeness of the approximate maximizer to the
+optimal one.
+Definition 1. Under A2, if point δ(x) satisfies
+max hδ — δ*(x), Vδφ(θ, δ*(x); x)〉≤ ε	(A20)
+then, it is a ε approximate solution to δ*(x), where
+δ*(x) := argmaxφ(θ, δ; x).	(A21)
+δ
+and x denotes the sampled data.
+Condition (A20) is standard for defining approximate solutions of an optimization problem over a
+compact feasible set and has been widely studied in (Wang et al., 2019b; Lu et al., 2020).
+In the following, we can show that when the inner maximization problem is solved accurately enough,
+the gradients of function φ(θ, δ(x); x) at δ(x) and δ* (x) are also close. A similar claim of this fact
+has been shown in (Wang et al., 2019b, Lemma 2). For completeness of the analysis, we provide the
+specific statement for our problem here and give the detailed proof as well.
+Lemma 1. Let δ(k be the (με)∕Lφ approximate solution of the inner maximization problem for
+worker k, i.e., maxδ(k) φ(θ, δ(k); xt), where xt denotes the sampled data at the tth iteration of DAT.
+Under A2, we have
+∣∣Vθφ(θt, δ(k)(xt); Xt) -Vθφ(θt, (δ*)tk)(xt); x)『≤ ε.	(A22)
+Throughout the convergence analysis, We assume that δ(k) (Xt), ∀k, t are all the (με)∕Lφ approximate
+solutions of the inner maximization problem. Let us define
+∣∣[Vφ(θt, δ(k)(xt); xt)]ij — [Vφ(θt, (δ*')(k(xt); xt]ij∣∣ = εij.	(A23)
+From Lemma 1, we know that when δ(k) (Xt) is a (με)∕Lφ approximate solution, then
+h di	h di	2
+XXεij = XX∣∣[Vφ(θt, δF)(Xt);xt)]ij - [Vφ(θt, (δ*)tfc)(xt);xt]ij∣∣ ≤ ε. (A24)
+i=1 j=1	i=1 j=1
+2.3	Formal statements of convergence rate guarantees
+In what follows, we provide the formal statement of convergence rate of DAT. In our analysis, we
+focus on the 1-sided quantization, namely, Step 10 of Algorithm A1 is omitted, and specify the outer
+minimization oracle by LAMB (You et al., 2019), see Algorithm A2. The addition and multiplication
+operations in LAMB are component-wise.
+Theorem 2. Under A1-A4, suppose that {θt} is generated by DAT for a total number of T iterations,
+and let the problem dimension at each layer be di = d∕h. Then the convergence rate of DAT is given
+by
+T X Ei" ψ(θt)k2 ≤ ηt∆Cτ+2 (+3)+4δ2 + κ√3 kχkι+丝".
+t=1	t
+(A25)
+where ∆Ψ := E[Ψ(θ1)] — Ψ?], ηt is the learning rate, κ = cu∕cl, cl and cu are constants used
+in LALR (5), X is an error term with the (ih + j)th entry being y (IM『j + εj + δj, ε and
+16
+Under review as a conference paper at ICLR 2021
+εij were given in (A24), L = [Li,... ,Lh ]T, C = 4 Jh(Iie2), 0 < β2 < 1 is given in LAMB,
+B = min{|B(i)|, ∀i}, and G is given in A1.
+Remark 1. When the batch size is large, i.e., B 〜 √T, then the gradient estimate error will
+be O(σ2∕√T). Further, it is worth noting that different from the convergence results of LAMB,
+there is a linear speedup of deceasing the gradient estimate error in DAT with respect to M, i.e.,
+O(σ2∕(M√T)), which is the advantage of using multiple computing nodes.
+Remark2. Note that A4 implies E[(Q([g(k)(θ)]ij) - [g(k)(θ)]ijk2] ≤ P3 Pd= 1 δj ：= δ2. From
+(Alistarh et al., 2017, Lemma 3.1), we know that δ2 ≤ min{d∕s2, √d∕s}G2. Recall that S = 2b,
+where b is the number of quantization bits.
+Therefore, with a proper choice of the parameters, we can have the following convergence result that
+has been shown in Theorem 1.
+Corollary 1. Under the same conditions of Theorem 2, if we choose
+ηt 〜O(1∕√T), ε 〜O(ξ2),
+(A26)
+we then have
+T
+X EkVθ Ψ(θt)k2
+t=1
+1
+T
+≤
+δψ + (I + λ)σ2 + CuKkLkI + O
+ClC √T	MB	2C √T
+(A27)
+In summary, when the batch size is large enough, DAT converges to a first-order stationary point of
+problem (2) and there is a linear speed-up in terms of M with respect to σ2 . Next, we provide the
+details of the proof.
+3	Detailed Proofs of Convergence Analysis
+3.1	Preliminaries
+In the proof, we use the following inequality and notations.
+1.	Young’s inequality with parameter is
+hx,yi ≤ *Ilxk2 + 2l∣yk2,	(A28)
+where x, y are two vectors.
+2.	Define the historical trajectory of the iterates as Ft = {θt-1, . . . , θ1}.
+3.	We denote vector [x]i as the parameters at the ith layer of the neural net and [x]ij represents the
+j th entry of the parameter at the ith layer.
+4.	We define
+MM
+gt := M X Ext∈B(i) (λvl(θt; xt) + vθφ(θt, δ(i)(xt); Xt)) = M X g(i).	(A29)
+i=1	i=1
+17
+Under review as a conference paper at ICLR 2021
+3.2	Details of LAMB algorithm
+Algorithm A2 LAMB (You et al., 2019)
+Input: learning rate ηt, 0 < β1,β2 < 1, scaling function T(∙), Z > 0
+for t = 1, . . . do
+mt = β1mt-1 + (1 - βι)gt, where gt is given by (A3)
+Vt = β2vt-1 + (1 - β2)g2
+mt = mt/(1 - β1t )
+vt = vt/(1 - β2t)
+Compute ratio Ut = √m+
+end for
+Update
+θ θ _ ηtτ(kθt,ik)11	Za30
+θt+1,i = θt,i	H u ut,i.	(A30)
+kut,i k
+3.3	Proof of Lemma 1
+Proof. From A2, we have
+∣∣Vφ (θt, δ(i)(xt);Xt) -Vφ(θt, (δ*)(i)(xt);Xt)Il ≤ Lφkδ(i)(xt)-(δ*)ti)(xt)k.	(A31)
+Also, we know that function φ(θ, δ, x) is strongly concave with respect to δ, so we have
+μkδ(i)(xt) - (δ*)(i)(xt)k
+≤ DVδφ(θt, (δ*)(i)(xt); xt) - Vδφ(θt, δ(i)(xt); xt), δ(i)(xt) - (δ*)(i)(xt)E . (A32)
+Next, we have two conditions about the qualities of solutions δ(i)(xt) and (δ*)(i)(xt). First, we
+know that δ(i)(xt) is a-ε approximate solution to (δ*)(i)(xt), so we have
+((δ*)F(Xt)- δ(i)(xt), Vδφ(θt, δ(i)(xt); Xt)E ≤ ε.	(A33)
+Second, since (δ*)f)(xt) is the optimal solution, it satisfies
+D(δ(i)(xt) - (δ*)(i)(xt), Vδφ(θt, (δ*)(i)(xt);Xt)E ≤ 0.	(A34)
+Adding them together, we can obtain
+(δ(i)(xt) - (δ*N(Xt), Vδφ(θt, (δ*)(i)(xt); xt) - Vδφ(θt, δ(i)(xt); Xt)E ≤ ε. (A35)
+Substituting (A35) into (A32), we can get
+μkδ(i)(xt) - (δ*)ti)(xt)k2 ≤ ε.	(A36)
+Combining (A31), we have
+∣∣Vφ(θt, δ(i)(xt); xt) - Vφ(θt, (δ*)(i)(xt);xt)∣∣2 ≤ Lφε.	(A37)
+□
+3.4 Descent of quantized LAMB
+First, we provide the following lemma as a stepping stone for the subsequent analysis.
+Lemma 2. Under A1-A3, suppose that Sequence {θt} is generated by DAT Then, we have
+E[-hVΨ(θt),gti] ≤-
+EkVΨ(θt)k2
+2
++ε+
+(1 + λ)σ2
+MB
+(A38)
+18
+Under review as a conference paper at ICLR 2021
+Proof. From (A21), (A7) and A2, we know that
+VθΦi(θ, X) = Vθφ(θ, (δ*)⑴(x); x),	(A39)
+so we can get
+1M
+VθΨ(θ) = M EλVθli(θ)+ VθΦi(θ)	(A40)
+i=1
+1M
+=λVθ I(θ) + ME
+Ex∈D(i)Vθφ(θ,(δ*)⑴(x); x)	(A41)
+M i=1
+=g(θ)∙	(A42)
+Then, we have
+EhVΨ(θt), gti =EhVΨ(θt), gti + EhVΨ(θt), gt- gti	(A43)
+=EFtExtIFt hVΨ(θt), gti + EhVΨ(θt), gt- gti	(A44)
+(A42)EkVΨ(θt)k2 + EhVΨ(θt), gt- gti	(A45)
+=EkVΨ(θt)k2 + EhVΨ(θt), gt - g：i + EhVΨ(θt), g： - gti	(A46)
+where
+1M
+gt := M ^X Ext∈D(i) (λVl(θt, xt)+ Vθ φ(θt, (δ*),(xt); Xt)) = λVl(θt) + VΦ(θt), (A47)
+i=1
+and
+1M
+g： := M XEχt∈B(i) (λVl(θt, xt)+ Vθφ(θt,(δ*)F(Xt);Xt)) .	(A48)
+M i=1
+Next, we can quantify the different between gt and gt： by gradient Lipschitz continuity of function
+T(∙) as the following
+(a) 1 M
+Ekgt- g：k2 ≤ M XEFtExtFt [kVθφ(θt,(δ*)⑴(xt); xt)-Vθφ(θt, δ⑺(xt); xt)k2]
+i=1
+where in (a) we use Jensen’s inequality.
+And the difference between gt and g： can be upper bounded by
+1M
+Ekgt-g：k2 =EFt M EExtIFtVθφ(θt, (δ*产(xt);xt)-Vθφ(θt)
+i=1
+2
+1
++ λEFt M ∑ ExtIFt Vl(θt; xt) -Vl(θt)
+A3 (1 + λ)σ2
+=MB
+Applying Young’s inequality with parameter 2, we have
+E[-hVΨ(θt),gti] ≤ - EkVΨ(θt)k2 + EkVψ(θt)k2 + Ekgt- g：k2 + Ekg： - gtk2
+(A49) EkVΨ(θt)k2	(1 + λ)σ2
+≤	2	+ ε + MB
+(A24)
+≤ε
+(A49)
+(A50)
+(A51)
+(A52)
+(A53)
+□
+19
+Under review as a conference paper at ICLR 2021
+3.5 Proof of Theorem 2
+Proof. We set β1 = 0 in LAMB for simplicity. From gradient Lipschitz continuity, we have
+A1	h	h L
+ψ(θt+1) ≤ ψ(θt) + y^h[Vθψ(θt)]i, θt+1,i - θt,ii +	-2 kθt+1,i - θt,ik
+≤)ψ(θt) -ηt XX XX T (II*) /[VΨ(θt)]ij,借 \ + XX n2cIL
+i=1 j=1	t,i	i=1
+'---------------------------------}
+(A54)
+(A55)
+{z^^^
+:=R
+where in (a) we use (A30), and the upper bound of τ(kθt,ik).
+Next, we split term R as two parts by leveraging sign([VΨ(θt)]ij) and sign([ut]ij) as follows.
+h	di
+R=-ηtX X τ(kθt,ik)[VΨ(θt)]ij
+i=1 j=1
+h	di
+- ηt X X τ(kθt,ik)[VΨ(θt)]ij
+i=1 j=1
+[ut]ij
+ut,ik
+[ut]ij
+ut,ik
+1 (Sign(VΨ(θt)]ij ) = sign([ut ]ij))
+1 (Sign(Vψ(θt)]ij) = sign([ut ]ij))
+(A56)
+(a)	ʌ Ji,	∕1 _ &
+≤ - ntcι XX√ -GdL vɑθt)]ij [gt]ijl (Sign(V [ψ(θt)]ij) = sign([gt ]ij))
+i=1 j=1	i
+h	di
+- ηt X X τ(kθt,ik)[VΨ(θt)]ij
+i=1 j=1
+[ut]ij
+ut,ik
+1 (Sign(Vψ(θt)]ij) = sign([ut ]ij))
+(A57)
+(b)	ʌ &	∕1 _ β0
+≤ - ntcι XXV G2d. vɑθt)]ij[gt]ij
+i=1 j=1	i
+h	di
+- ηt X X τ(kθt,ik)[VΨ(θt)]ij
+i=1 j=1
+[ut]ij
+ut,ik
+1 (Sign(Vψ(θt)]ij) = sign([ut]ij)).
+(A58)
+where in (a) We use the fact that ∣∣ut,i∣∣ ≤ ʌ/ɪ-d^ and √vt ≤ G, and in (b) We add
+-Irntc XXrI-d2[vψ(θt)]ij[gt]ij-l (Sign(Vψ(θt)]ij) = sign([gt]ij)) ≥ 0.
+i=1 j=1	i
+Taking expectation on both SideS of (A58), we have the following:
+E[R] ≤ -ntcι JhiU XX XX E[VΨ(θt)]ij [gt]ij
+i=1 j=1
+I
+}
+∙∙^^^^^^^^^^^^^^^^^^^^^^^≡{^^^^^^^^^^^^^^^^^^^^^^^^≡""
+:=U
+h	di
++ ηtcuXX
+E [[VΨ(θt)]ijl (Sign(VΨ(θt)]ij) = Sign([ut]j))].
+(A59)
+(A60)
+i=1 j=1
+{z^^
+:=V
+}
+20
+Under review as a conference paper at ICLR 2021
+Next, we will get the upper bounds of U and V separably as follows. First, we write the inner product
+between [VΨ(θ)]ij and [gt ]j more compactly,
+U ≤- ηtcι∖IhQI-β2 XE h[VΨ(θ)]i, [gt]ii	(A61)
+Gd
+i=1
+≤-ηtcι Jh(G-j2)X E h[VΨ(θt)]i, [gt]i - [gt]i + [gt]ii	(A62)
+i=1
+≤-ηtcι {hQG-β2 (E hVΨ(θ), gti + X E h[VΨ(θt)]i, [gt]i - [gt]ii) .	(A63)
+Applying Lemma 2, we can get
+,,(A38)	∕h(1 - β2) IELT/八、“2	∕h(1 - β2) (	(1 + λ)σ2∖
+U ≤ -ηtclV	G2d	2ekvψWt)k + ηtcιV	G2d	ε++	MB )
+-ηtcι∖IhQr-乎) XE h[VΨ(θt)]i, [gt]i - [gt]ii	(A64)
+G2 d
+i=1
+(a)	Ih(I - β2) 1 llπτ ,八、“2	∕h(1 - β2) (	(1 + λ)σ2∖
+≤ - ηtcl∖∣	G2d	2Ekvψ(θt)k + ηtcιV	G2d	ε++	MB )
++ 等,h(1- ：2 EkVΨ(θt)k2 + Clntr h(I-j2)Ekgt- gtk2	(A65)
+4 Gd	Gd
+≤) -吧~rh1-β2) 1 EkVΨ(θt)k2 + ntcι>亘(ε + (I + λ)σ2)
+—4 V G2d 2 k ( t)k + IItcN G2d V + MB )
++ nt cι { h(1- F s2	(A66)
+G2 d
+where we use the in (a) we use Young’s inequality (with parameter 2), and in (b) we have
+1 M	2 A4
+Ekgt- gtk2 = E M X Q(g(i)) - g(i)	≤ δ2.	(A67)
+i=1
+Second, we give the upper of V:
+h	di
+V ≤ntcu
+i=1 j=1
+[vψ(θt )]j∙F (SignaVαθt)]ij) = Signagt ]ij))
+'-----------------------V--------------}
+:=W
+(A68)
+where the upper bound of W can be quantified by uSing Markov’S inequality followed by JenSen’S
+inequality aS the following:
+W =P(Sign([VΨ(θt)]ij) = sign([gt]ij))
+≤P[∣[VΨ(θt)]ij-[gt]ij| > [VΨ(θt)]ij]
+≤E[[VΨ(θt)]ij - [gt]ij]
+≤	∣[VΨ(θt)]ij |
+≤ PE[([VΨ(θt)]ij - [gt]ij)2]
+一	∣[VΨ(θt)]ij |
+(A≤2) PE[([gt]ij- [g"ij + [g"j - [gt]ij + [gt]ij- [gt]ij)2]
+≤	∣[VΨ(θt)]ij |
+(a)「r M|B|j + eij + δij
+≤ ʌ/3 J__________________
+∣[VΨ(θt)]j∣
+(A69)
+(A70)
+(A71)
+(A72)
+(A73)
+21
+Under review as a conference paper at ICLR 2021
+where (a) is true due to the following relations: i) from (A51), we have
+E[([gt]ij - [g"ij)2] ≤ (1 +：F2 ；	(A74)
+MB
+ii) from (A49), we can get
+E[([gt]ij - [g"ij)2] ≤ εij；	(A75)
+and iii) from (A67), we know
+E[([gt]ij - [gt]ij)2] ≤ δj	(A76)
+Therefore, combining (A55) with the upper bound of U shown in (A66) and V shown in (A68)(A73),
+we have
+E[Ψ(θt+ι)] ≤E[Ψ(θt)] - ηtcι J41G-j)4 E∣∣VΨ(θt)k2 + ηtcιq心肃2 (ε + ^^)
+rh(1 - β2) 2	√-G3 S(1 + λ)σlj	二 η2Cu Ph=I Li
++ ηtclV G2d δ + ηtcuv3∑∑M —mb — + εij + δij +	2	.
+i=1 j =1
+(A77)
+Note that the error vector χ is defined as the following
+VZ(IM∣B∣11 + ε11 + δ2ι
+.
+.
+.
+X =	r (i+λσij + εij+%
+and we have
+ʌ/ (-M-Bhrh + εhdh + δldh
+-LJ
+L =	:	∈ Rh.
+.
+Lh
+Recall
+Rearranging the terms, we can arrive at
+∈ Rd ,
+(A78)
+(A79)
+(A80)
+∕⅛P1 (kVΨ(θt)k2) ≤E[ψ(θt)]- E[ψ(θt+1)] +4Cδ2 + 2C (ε + 巾)
+G2d 4	ηtcl	MB
+=C
++ √3κkχkι + T⅛.	(A81)
+Applying the telescoping sum over t = 1, . . . , T, we have
+ɪ XXEkVθΨ(θt)k2 ≤E[ψ(θ1)]- E[ψ(θT +1)] +2 (ε + (≡ħ2) +4δ2
+T t=1	ηtclCT	MB
++ κ√3 kXki + 7妙.	(A82)
+C	2C
+□
+22
+Under review as a conference paper at ICLR 2021
+4 Additional Experiments
+4.1	Discussion on cyclic learning rate
+It was shown in (Wong et al., 2020) that the use of a cyclic learning rate (CLR) trick can further
+accelerate the Fast AT algorithm in the small-batch setting (Wong et al., 2020). In Figure A1, we
+present the performance of Fast AT with CLR versus batch sizes. We observe that when CLR meets
+the large-batch setting, it becomes significantly worse than its performance in the small-batch setting.
+The reason is that CLR requires a certain number of iterations to proceed with the cyclic schedule.
+However, the use of large data batch only results in a small amount of iterations by fixing the number
+of epochs.
+Batch Size for Cyclic LR
+Figure A1: TA/RA of Fast AT with CLR versus batch sizes.
+4.2	Training details
+CIFAR-10 AT and Fast AT experiments are conducted at a single computing node with 16-core CPU,
+128GB RAM and 1 Nvidia P100 GPU. The training epoch is 100 by calling for the momentum
+SGD optimizer. The weight decay and momentum parameters are set to 0.0005 and 0.9. The initial
+learning rate is set with 0.05 (tuned over {0.005,0.01,0.05,0.1}), which is decayed by × 1/10 atthe
+training epoch 70, 85 and 95, respectively.
+CIFAR-10 DAT experiments are conducted at {1, 6, 12, 18} computing nodes with 16-core CPU,
+128GB RAM and 1 Nvidia P100 GPU. The training epoch is 100 by calling for the LAMB optimizer.
+The weight decay is set to 0.0005. β1 and β2 are set to 0.9 and 0.999. The initial learning rate is
+tuned over {0.01,0.05,0.1,0.2}, which is decayed by ×1∕10 at the training epoch 70, 85 and 95,
+respectively. To execute algorithms with the initial learning rate η1 greater than 0.1, we choose the
+model weights after 10-epoch warm-up as its initialization for DAT, where each warm-up epoch k
+uses the linearly increased learning rate (k∕10)ηι.
+ImageNet AT and Fast AT experiments are conducted at a single computing node with dual 22-core
+CPU, 512GB RAM and 6 Nvidia V100 GPUs. The training epoch is 30 by calling for the momentum
+SGD optimizer. The weight decay and momentum parameters are set to 0.0001 and 0.9. The initial
+learning rate is set to 0.1 (tuned over {0.01,0.05,0.1,0.2}), which is decayed by ×1∕10 at the
+training epoch 20, 25, 28, respectively.
+ImageNet DAT experiments are conducted at {1, 3, 6} computing nodes with dual 22-core CPU,
+512GB RAM and 6 Nvidia V100 GPUs. The training epoch is 30 by calling for the LAMB optimizer.
+The weight decay is set to 0.0001. β1 and β2 are set to 0.9 and 0.999. The initial learning rate is
+tuned over {0.01, 0.05, 0.1, 0.2, 0.4}, which is decayed by ×1∕10 at the training epoch 20,25,28,
+respectively. To execute algorithms with the initial learning rate η1 greater than 0.2, we choose the
+model weights after 5-epoch warm-up as its initialization for DAT, where each warm-up epoch k uses
+the linearly increased learning rate (k∕5)ηι.
+23
+Under review as a conference paper at ICLR 2021
+Empirical model convergence. In Figure A2, we present the training accuracy and the loss value
+of DAT-PGD. As we can see, our proposal converges well within 100 and 30 epochs in the setting of
+(CIFAR-10, ResNet-18) and (ImageNet, ResNet-50), respectively
+SSol 6u-IneJ.L
+(a) CIFAR-10, ResNet-18	(b) ImageNet, ResNet-50
+Figure A2: Training accuracy and objective value (loss) of DAT-PGD against training epochs. (a) DAT-PGD
+for (CIFAR-10, ResNet-18) using 6 × 1 computing configuration and 6 × 2048 batch size. (b) DAT-PGD for
+(ImageNet, ResNet-50) using 6 × 6 computing configuration and 6 × 512 batch size.
+Tuning LALR hyperparameter cu. We also evaluate the
+sensitivity of the performance of DAT to the choice of the
+hyperparameter cu in LALR. In Table A1, we fix cl = 0 (this
+is a natural choice) but varies cu ∈ {8, 9, 10, 11, 12} when
+DAT-FGSM is executed under CIFAR-10 using 18x2048 batch
+size, where cu = 10 is our default choice. As we can see, both
+RA and TA are not quite sensitive to cu and the default choice
+yields the RA-best model (in spite of minor improvement).
+Table A1: TA/RA of DAT-FGSM
+under (CIFAR-10, ResNet-18) using
+18x2048 batch size versus different
+choices of LALR hyperparameter CU.
+Value of cu	TA(%)	RA(%)
+cu = 8	73.57	38.19
+cu = 9	73.72	38.00
+cu = 10	73.42	38.55
+cu = 11	73.75	38.18
+cu = 12	73,63	37.87
+24
+Under review as a conference paper at ICLR 2021
+4.3	Overall performance of (CIFAR- 1 0, ResNet-50)
+In Table A2, we observe that in the large-batch setting, the proposed DAT-PGD and DAT-FGSM
+algorithms outperform the baseline algorithm DAT-PGD w/o LALR, and result in competitive
+performance to AT and Fast AT, which call for more iterations by using a smaller batch size.
+Table A2: Overall performance of DAT (in gray color), compared with baselines, in TA (%), RA (%),
+communication time per epoch (seconds), and total training time (including communication time) per epoch (in
+seconds). For brevity, ‘p × q’ represents ‘# nodes × # GPUs per node’, ‘Comm.’ represents communication
+cost, and 'Tr. Time, represents training time.
+Method	CIFAR-10,ResNet-50	一					
+	P × q	Batch size	TA(%)	RA(%)	Comm. per epoch (s)	Tr. Time per epoch (s)
+AT	1 × 1	256	85.94	43.06	NA	894
+Fast AT	1 × 1	256	75.28	40.48	NA	288
+DAT-PGD w/o LALR	6 × 1	6 × 256	74.45	33.35	68	236
+DAT-PGD	6 × 1	6 × 256	84.79	42.16	68	236
+DAT-FGSM	6 × 1	6 × 256	75.72	40.09	68	116
+25
+Under review as a conference paper at ICLR 2021
+4.4	Robustness against PGD and C&W attacks
+In Figure A3, we evaluate the adversarial robustness of ResNet-18 at CIFAR-10 learned by DAT-PGD
+and DAT-FGSM against PGD attacks of different steps and perturbation sizes (namely, values of ).
+We consistently observe that DAT matches robust accuracies of standard AT even against PGD attacks
+at different values of and steps. Specifically, DAT has slightly smaller RA than AT when facing
+weak PGD attacks with less than (5/255) and steps less than 5. Moreover, although DAT-FGSM
+has the worst RA against weak PGD attacks (which reduces to TA at = 0), it outperforms other
+methods when the attacks become stronger in CIFAR-10 experiments. In Figure A4, we present the
+additional robust accuracies against C&W attacks (Carlini & Wagner, 2017) of different perturbation
+sizes. As we can see, the results are consistent with the aforementioned ones against PGD attacks.
+80
+60
+40
+20
+0
+0	5	10	15	20	25	30
+Perturbation Size
+Ooooo
+8 7 6 5 4
+>uro^⊃uu<nqoα
+Figure A3: RA against different PGD attacks for the model trained by DAT-PGD, DAT-FGSM, and AT under
+(CIFAR-10, ResNet-18). (Left) RA against PGD attacks with different perturbation sizes (over the divisor 255).
+(Right) RA against PGD attacks with different steps.
+(a) CIFAR-10, ResNet-18
+(b) ImageNet, ResNet-50
+Figure A4: RA against different C&W attacks for the model trained by DAT-PGD, DAT-FGSM, and AT under
+the setting (CIFAR-10, ResNet-18) and (ImageNet, ResNet-50), respectively. Here for ease of C&W attack
+generation at ImageNet, we randomly select 1000 test ImageNet images (1 image per class) to generate C&W
+attacks.
+26
+Under review as a conference paper at ICLR 2021
+4.5	DAT from pre-training to fine-tuning
+In Figure A5, we investigate ifaDAT pre-trained model (ResNet-50) over a source dataset (ImageNet)
+can offer a fast fine-tuning to a down-stream target dataset (CIFAR-10). Compared with the direct
+application of DAT to the target dataset (without pre-training), the pre-training enables a fast adaption
+to the down-stream CIFAR-10 task in both TA and RA within just 5 epochs.
+Fine-tuning epochs
+Figure A5: Fine-tuning ResNet-50 (pre-trained on ImageNet) under CIFAR-10. Here DAT-PGD is used for
+both pre-training and fine-tuning at 6 nodes with batch size 6 × 128.
+4.6	Quantization
+In Table A3, we present the performance of DAT by making use of gradient quantization. Two quanti-
+zation scenarios are covered: 1) quantization is conducted at each worker (Step 7 of Algorithm A1),
+and 2) quantization is conducted at both worker and server sides (Step 7 and 10 of Algorithm A1). As
+we can see, when the number of bits is reduced from 32 to 8, the communication cost and the amount
+of transmitted data is saved by 2 and 4 times, respectively. Although the use of gradient quantization
+introduces a performance loss to some extent, the resulting TA and RA are still comparable to the
+best 32-bit case. In the worst case of CIFAR-10 (8-bit 2-sided quantization), TA drops 0.91% and
+6.33% for DAT-PGD and DAT-FGSM, respectively. And RA drops 4.73% and 5.22%, respectively.
+However, 8-bit 2-sided quantization transmitted the least amount of data per iteration.
+To further reduce communication cost, we also conduct DAT at a HPC cluster. The computing
+nodes of the cluster are connected with InfiniBand (IB) and PCIe Gen4 switch. To compare with
+results in Table 1, we use 6 of 57 nodes of the cluster. Each node has 6 Nvidia V100s which are
+interconnected with NVLink. We use Nvida NCCL as communication backend. In Table A4, we
+present the performance of DAT for ImageNet, ResNet-50 with use of HPC compared to standard
+(non-HPC) distributed system. As we can see, the communication cost is largely alleviated, and thus
+the total training time is further reduced.
+In Table A5, we conduct an additional experiment by integrating a centralized method with gradient
+quantization operation on CIFAR-10 under the batch size 2048 and 6 × 2048, respectively. We
+specify the centralized method as Fast AT with LALR, where LALR is introduced to improve the
+scalability of Fast AT under the larger batch size 6 × 2048. Due to the centralized implementation,
+we only need 1-sided gradient quantization (namely, no server-worker communication is involved).
+As we can see, when the batch size 2048 is used, Fast AT w/ LALR performs as well as Fast AT even
+at the presence of 8-bit gradient quantization. On the other hand, as the larger batch size 6 × 2048 is
+used, Fast AT w/ LALR can still preserve the performance at the absence of gradient quantization.
+By contrast, Fast AT w/ LALR at the presence of quantization encounters 6.05% TA drop. This
+suggests that even in the non-DAT setting, 8-bit gradient quantization hurts the performance as the
+batch size becomes large. Thus, in DAT it is not surprising that 8-bit quantized gradients could cause
+a non-trivial accuracy drop, particularly for using 2-sided gradient quantization and a much larger
+data batch size (≥ 18x2048 on CIFAR-10). One possible reason is that the quantization error cannot
+easily be mitigated as the number of iterations decreases (due to increased batch size under a fixed
+number of epochs).
+27
+Under review as a conference paper at ICLR 2021
+Table A3: Effect of gradient quantization on the performance of DAT for various numbers of bits. The training
+settings of (CIFAR-10, ResNet-18) and (ImageNet, ResNet-50) are consistent With those in Table 1.
+Method	CIFAR-10, ResNet-18				
+	# bits	TA(%)	RA (%)	Comm. per epoch (s)	Data transmitted per iteration (MB)
+DAT-PGD	32	80.38	38.94	8.5	1278
+DAT-PGD	16	79.38	38.32	8.3	639
+DAT-PGD	8	78.18	37.34	4.3	320
+DAT-PGD	8 (2-sided)	78.86	34.2	5.0	107
+DAT-FGSM	32	75.58	40.92	8.5	1278
+DAT-FGSM	16	75.74	40.86	8.3	639
+DAT-FGSM	8	72.48	38.98	4.3	320
+DAT-FGSM	8 (2-sided)	69.26	35.34	5.0	107
+Method	ImageNet, ResNet-50				
+	# bits	TA(%)	RA (%)	Comm. per epoch (s)	Data transmitted per iteration (MB)
+DAT-PGD	32	63.75	38.45	898	2924
+DAT-PGD	16	61.77	38.40	850	1462
+DAT-PGD	8	56.53	37.90	592	731
+DAT-PGD	8 (2-sided)	53.09	34.59	1091	244
+DAT-FGSM	32	58.32	41.48	859	2924
+DAT-FGSM	16	54.71	39.29	849	1462
+DAT-FGSM	8	50.11	36.38	594	731
+DAT-FGSM	8 (2-Sided)	48.27	33.20	1013		244	
+Table A4: Comparison to training over a high performance computing (HPC) cluster of nodes
+Method	ImageNet, ResNet-50				
+	# bits	TA(%)	RA (%)	Comm. per epoch (s)	Tr. time per epoch (s)
+DAT-PGD	32	63.75	38.45	898	1960
+DAT-FGSM	32	58.32	41.48	859	1109
+DAT-PGD (HPC)	32	63.43	38.55	15	1074
+DAT-FGSM (HPC)	32	57.60	41.70	15	310
+Table A5: Effect of 8-bit quantization on centralized robust training Fast AT w/ LALR.
+Method	CIFAR-10, ResNet-18			
+	8-bit quantization (s)	Batch size	TA(%)	RA (%)
+Fast AT	No	-2048-	81.58	38.34
+Fast AT w/ LALR	Yes	2048	80.66	38.60
+Fast AT w/ LALR	No	6 X 2048	80.08	38.51
+Fast AT w/ LALR	Yes	6 X 2048	75.53	38.45
+28

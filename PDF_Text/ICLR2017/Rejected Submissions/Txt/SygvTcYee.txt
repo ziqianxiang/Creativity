@@ -1,0 +1,638 @@
+Under review as a conference paper at ICLR 2017
+ParMAC: Distributed Optimisation of Nested
+Functions, with Application to Learning Bi-
+nary Autoencoders
+Miguel A. Carreira-Perpinan & Mehdi Alizadeh
+EECS, University of California, Merced
+http://eecs.ucmerced.edu
+Ab stract
+Many powerful machine learning models are based on the composition of mul-
+tiple processing layers, such as deep nets, which gives rise to nonconvex objec-
+tive functions. A general, recent approach to optimise such “nested” functions is
+the method of auxiliary coordinates (MAC). MAC introduces an auxiliary coordi-
+nate for each data point in order to decouple the nested model into independent
+submodels. This decomposes the optimisation into steps that alternate between
+training single layers and updating the coordinates. It has the advantage that it
+reuses existing single-layer algorithms, introduces parallelism, and does not need
+to use chain-rule gradients, so it works with nondifferentiable layers. We describe
+ParMAC, a distributed-computation model for MAC. This trains on a dataset dis-
+tributed across machines while limiting the amount of communication so it does
+not obliterate the benefit of parallelism. ParMAC works on a cluster of machines
+with a circular topology and alternates two steps until convergence: one step trains
+the submodels in parallel using stochastic updates, and the other trains the coor-
+dinates in parallel. Only submodel parameters, no data or coordinates, are ever
+communicated between machines. ParMAC exhibits high parallelism, low com-
+munication overhead, and facilitates data shuffling, load balancing, fault tolerance
+and streaming data processing. We study the convergence of ParMAC and its par-
+allel speedup, and implement ParMAC using MPI to learn binary autoencoders for
+fast image retrieval, achieving nearly perfect speedups in a 128-processor cluster
+with a training set of 100 million high-dimensional points.
+1	Introduction
+Serial computing has reached a plateau and parallel, distributed architectures are becoming widely
+available, from machines with a few cores to cloud computing with 1000s of machines. The combi-
+nation of powerful nested models with large datasets is akey ingredient to solve difficult problems in
+machine learning, computer vision and other areas, and it underlies recent successes in deep learning
+(Hinton et al., 2012; Le et al., 2012; Dean et al., 2012). Unfortunately, parallel computation is not
+easy, and many good serial algorithms do not parallelise well. The cost of communicating (through
+the memory hierarchy or a network) greatly exceeds the cost of computing, both in time and energy,
+and will continue to do so for the foreseeable future. Thus, good parallel algorithms must minimise
+communication and maximise computation per machine, while creating sufficiently many subprob-
+lems (ideally independent) to benefit from as many machines as possible. The load (in runtime) on
+each machine should be approximately equal. Faults become more frequent as the number of ma-
+chines increases, particularly if they are inexpensive machines. Machines may be heterogeneous and
+differ in CPU and memory; this is the case with initiatives such as SETI@home, which may become
+an important source of distributed computation in the future. Big data applications have additional
+restrictions. The size of the data means it cannot be stored on a single machine, so distributed-
+memory architectures are necessary. Sending data between machines is prohibitive because of the
+size of the data and the high communication costs. In some applications, more data is collected
+than can be stored, so data must be regularly discarded. In others, such as sensor networks, limited
+battery life and computational power imply that data must be processed locally.
+1
+Under review as a conference paper at ICLR 2017
+In this paper, we focus on machine learning models of the form y = FK+1(. . . F2(F1(x)) . . . ), i.e.,
+consisting of a nested mapping from the input x to the output y. Such nested models involve multiple
+parameterised layers of processing and include deep neural nets, cascades for object recognition in
+computer vision or for phoneme classification in speech processing, wrapper approaches to classifi-
+cation or regression, and various combinations of feature extraction/learning and preprocessing prior
+to some learning task. Nested and hierarchical models are ubiquitous in machine learning because
+they provide a way to construct complex models by the composition of simple layers. However,
+training nested models is difficult even in the serial case because function composition produces
+inherently nonconvex functions, which makes gradient-based optimisation difficult and slow, and
+sometimes inapplicable (e.g. with nonsmooth or discrete layers).
+Our starting point is a recently proposed technique to train nested models, the method of auxiliary
+coordinates (MAC) (Carreira-Perpifian and Wang, 2012; 2014). This reformulates the optimisation
+into an iterative procedure that alternates training submodels independently with coordinating
+them. It introduces significant model and data parallelism, can often train the submodels using
+existing algorithms, and has convergence guarantees with differentiable functions to a local
+stationary point, while it also applies with nondifferentiable or even discrete layers. MAC has been
+applied to various nested models (Carreira-Perpifian and Wang, 2014; Wang and Carreira-Perpinan,
+2014; Carreira-Perpinan and Raziperchikolaei, 2015; Raziperchikolaei and Carreira-Perpinan,
+2016; Carreira-PerpinanandVladymyrov, 2015). However, the original papers proposing MAC
+(Carreira-Perpifian and Wang, 2012; 2014) did not address how to run MAC on a distributed
+computing architecture, where communication between machines is far costlier than computation.
+This paper proposes ParMAC, a parallel, distributed framework to learn nested models using MAC,
+analyses its parallel speedup and convergence, implements it in MPI for the problem of learning
+binary autoencoders, and demonstrates its ability to train on large datasets and achieve large
+speedups on a distributed cluster.
+Related work Distributed optimisation and large-scale machine learning have been steadily gain-
+ing interest in recent years, with the development of parallel computation abstractions tailored
+to machine learning, such as Spark (Zaharia et al., 2010), GraphLab (Low et al., 2012), Petuum
+(Xing et al., 2015) or TensorFlow (Abadi et al., 2015), which have the goal of making cloud com-
+puting easily available to train machine learning models. Most work has centred on convex optimi-
+sation, particularly when the objective function has the form of empirical risk minimisation (data
+fitting term plus regulariser) (Cevher et al., 2014). This includes many important models in machine
+learning, such as linear regression, LASSO, logistic regression or SVMs. Such work is typically
+based on stochastic gradient descent (SGD) (Bottou, 2010), coordinate descent (CD) (Wright, 2016)
+or the alternating direction method of multipliers (ADMM) (Boyd et al., 2011). This has resulted in
+several variations of parallel SGD (Bertsekas, 2011; Zinkevich et al., 2010; Niu et al., 2011), paral-
+lel CD (Bradley et al., 2011; Richtarik and Takac, 2013; Liu and Wright, 2015) and parallel ADMM
+(Boyd et al., 2011; Ouyang et al., 2013; Zhang and Kwok, 2014).
+Little work has addressed nonconvex models. Most of it has focused on deep nets (Dean et al.,
+2012; Le et al., 2012). Google’s DistBelief (Dean et al., 2012) uses asynchronous parallel SGD
+(with gradients for the full model computed with backpropagation) to achieve data parallelism, and
+some form of model parallelism. The latter is achieved by carefully partitioning the neural net into
+pieces and allocating them to machines to compute gradients. This is difficult to do and requires a
+careful match of the neural net structure (number of layers and hidden units, connectivity, etc.) to the
+target hardware. Also, parallel SGD can diverge with nonconvex models, which requires heuristics
+to make sure we average replica models that are close in parameter space and thus associated with
+the same optimum. Although this has managed to train huge nets on huge datasets by using tens
+of thousands of CPU cores, the speedups achieved were very modest. Other work has used similar
+techniques but for GPUs (Coates et al., 2013; Seide et al., 2014).
+Finally, there also exist specific approximation techniques for certain types of large-scale ma-
+chine learning problems, such as spectral problems, using the NyStrOm formula or other landmark-
+based methods (Williams and Seeger, 2001; Bengio et al., 2004; Drineas and Mahoney, 2005;
+Talwalkar et al., 2008; Vladymyrov and Carreira-Perpinan, 2013; 2016).
+ParMAC is specifically designed for nested models, which are typically nonconvex and include deep
+nets and many other models, some of which have nondifferentiable layers. As we describe below,
+ParMAC has the advantages of being simple and relatively independent of the target hardware, while
+achieving high speedups.
+2
+Under review as a conference paper at ICLR 2017
+2	Optimising nested models using auxiliary coordinates (MAC)
+Many optimisation problems in machine learning involve mathematically “nested” functions of the
+form F(x; W) = FK+1(. . . F2(F1(x; W1); W2) . . . ; WK+1) with parameters W, such as deep
+nets. Such problems are traditionally optimised using methods based on gradients computed using
+the chain rule. However, such gradients may sometimes be inconvenient to use, or may not exist
+(e.g. if some of the layers are nondifferentiable, as with binary autoencoders). Also, they are hard
+to parallelise, because of the inherent sequentiality in the chain rule. The method of auxiliary co-
+ordinates (MAC) (Carreira-Perpinan and Wang, 2012; 2014) is designed to optimise nested models
+without using chain-rule gradients while introducing parallelism. The idea is to break nested func-
+tional relationships judiciously by introducing new variables (the auxiliary coordinates) as equality
+constraints. These are then solved by optimising a penalised function using alternating optimi-
+sation over the original parameters (which we call the W step) and over the coordinates (which
+we call the Z step). The result is a coordination-minimisation (CM) algorithm: the minimisation
+(W) step updates the parameters by splitting the nested model into independent submodels and
+training them using existing algorithms, and the coordination (Z) step ensures that corresponding
+inputs and outputs of submodels eventually match. MAC algorithms have been developed for sev-
+eral nested models so far: deep nets (Carreira-Perpifian and Wang, 2014), low-dimensional SVMS
+(Wang and Carreira-Perpinan, 2014), binary autoencoders (Carreira-Perpinan and Raziperchikolaei,
+2015), affinity-based loss functions for binary hashing (Raziperchikolaei and Carreira-Perpifian,
+2016) and parametric nonlinear embeddings (Carreira-Perpinan and Vladymyrov, 2015). Although
+this paper proposes and analyses ParMAC in general, our MPI implementation is for the particular
+case of binary autoencoders. These define a nonconvex nondifferentiable problem, yet its MAC
+algorithm is simple and effective.
+MAC algorithm for binary autoencoders A binary autoencoder (BA) is a usual autoencoder but
+with a binary code layer. It consists of an encoder h(x) that maps a real vector x ∈ RD onto
+a binary code vector with L < D bits, z ∈ {0, 1}L, and a linear decoder f(z) which maps z
+back to RD in an effort to reconstruct x. We will call h a binary hash function (see later). Let
+us write h(x) =	(Ax) (A includes a bias by having an extra dimension x0 = 1 for each x)
+where A ∈ RL×(D+1) and (t) is a step function applied elementwise, i.e., (t) = 1 ift ≥ 0 and
+(t) = 0 otherwise. Given a dataset of D-dimensional patterns X = (x1, . . . , xN), our objective
+function, which involves the nested model y = f (h(x)), is the usual least-squares reconstruction
+error EBA(h, f) = EnN=I HXn - f(h(xn))H2∙ Optimising this nonconvex, nonsmooth function is
+NP-complete. Where the gradients do exist wrt A they are zero, so optimisation of h using chain-
+rule gradients does not apply. We introduce as auxiliary coordinates the outputs of h, i.e., the codes
+for each of the N input patterns, and obtain the following equality-constrained problem:
+N
+min E	IlXn	- f(Zn)II2	s.t.	Zn	=	h(xn),	Zn	∈	{0,1}L, n =1,...,N.	(1)
+h,f,Z
+n=1
+Note the codes are binary. We now apply the quadratic-penalty method and minimise the following
+objective function while progressively increasing μ, so the constraints are eventually satisfied:
+N
+Eq (h, f, Z; μ) = E IlXn - f (Zn)H2 + μ IIZn - h(Xn)H2 s.t. Zn ∈ {0,1}L, n =1,...,N. (2)
+n=1
+Finally, we apply alternating optimisation over Z and W = (h, f). This gives the following steps:
+•	Over Z for fixed (h, f), this is a binary optimisation on NL variables, but it separates into
+N independent optimisations each on only L variables, with the form ofa binary proximal
+operator (where we omit the index n): minz ∣∣x - f (z)∣∣2 + μ∣∣Z - h(x)∣∣2 s.t. Z ∈ {0, 1}l.
+This can be solved approximately by alternating optimisation over bits.
+•	Over W = (h, f) for fixed Z, we obtain L + D independent problems: for each of the
+L single-bit hash functions (which try to predict Z optimally from X), each solvable by
+fitting a linear SVM; and for each of the D linear decoders in f (which try to reconstruct X
+optimally from Z), each a linear least-squares problem.
+The user must choose a schedule for the penalty parameter μ (sequence of values 0 < μι < … <
+μ∞). This should increase slowly enough that the binary codes can change considerably and explore
+3
+Under review as a conference paper at ICLR 2017
+input Xd×n = (xι,..., XN), L ∈ N
+Initialise Zl×n = (zi,...,zn) ∈ {0,1}LN
+for μ = 0 <μι < …< μ∞
+Parfor l = 1,...,L	W step： h
+hι(∙) — fit SVM to (X, Zι∙)
+parfor d = 1,...,D	W step： f
+fd(∙) J least-squares fit to (Z, Xd∙)
+parfor n = 1, ...,N	Z Step
+Zn J arg minzn ∈{0,1}L IIXn - f (Zn )『+ μ IIZn — h(Xn)∣∣2
+if no change in Z and Z = h(X) then stop
+return h, Z = h(X)
+X training points
+Z auxiliary coordinates
+h: RD → {0, 1}L,
+h= (h1,. ..,hL)
+encoders (hash fcn.)
+f: RL → RD,
+f= (f1,...,fD)
+decoders
+Figure 1:	MAC algorithm for binary autoencoders. “parfor” indicates a for loop whose iterations
+are carried out in parallel. The steps over h and f can be run in parallel as well.
+better solutions before the constraints are satisfied and the algorithm stops. With BAs, MAC stops
+for a finite value of μ, which occurs whenever Z does not change compared to the previous Z step.
+This gives a practical stopping criterion. Carreira-Perpinan and Raziperchikolaei (2015) give proofs
+of these statements and further details about the algorithm. Fig. 1 gives the MAC algorithm for BAs.
+The BA was proposed as a way to learn good binary hash functions for fast, approximate information
+retrieval (Carreira-Perpifian and Raziperchikolaei, 2015). Binary hashing (Grauman and Fergus,
+2013) has emerged in recent years as an effective way to do fast, approximate nearest-neighbour
+searches in image databases. The real-valued, high-dimensional image vectors are mapped onto a
+binary space with L bits and the search is performed there using Hamming distances at a vastly
+faster speed and smaller memory (e.g. N = 109 points with D = 500 take 2 TB, but only 8 GB
+using L = 64 bits, which easily fits in RAM). As shown by Carreira-Perpinan and Raziperchikolaei
+(2015), training BAs with MAC beats approximate optimisation approaches such as relaxing the
+codes or the step function in the encoder, and yields state-of-the-art binary hash functions h in un-
+supervised problems, improving over established approaches such as iterative quantisation (ITQ)
+(Gong et al., 2013). We focus mostly on linear hash functions because these are, by far, the most
+used type of hash functions in the literature of binary hashing, due to the fact that computing the
+binary codes for a test image must be fast at run time.
+MAC in general With a nested function with K layers, we can introduce auxiliary coordinates at
+each layer. For example, with a neural net, this decouples the weight vector of every hidden unit in
+the W step, which can be solved as a logistic regression (see Carreira-Perpinan and Alizadeh, 2016).
+For a large net with a large dataset, this affords an enormous potential for parallel computation.
+MAC and EM MAC is very similar to expectation-maximisation (EM) at a conceptual level. EM
+(McLachlan and Krishnan, 2008) applies generally to many probabilistic models. The resulting
+algorithm can be very different (e.g. EM for Gaussian mixtures vs EM for hidden Markov models),
+but it always alternates two steps that conceptually do the following. The E step updates in parallel
+the posterior probabilities. This separates over data points and is like the Z step in MAC, where
+the posterior probabilities are the auxiliary coordinates, and where the step may be in closed-form
+or require optimisation, depending on the model. The M step updates in parallel the “submodels”.
+For a mixture with M components, these are the M Gaussians (means, covariances, proportions).
+This separates over submodels and is like the W step in MAC. For BAs, the submodels are the L
+encoders (linear SVMs) and the D decoders (linear regressors); for a neural net, each weight vector
+of a hidden unit is a submodel (a logistic regressor). For Gaussian mixtures, the M step can be done
+exactly in one “epoch” because it is a simple average. For MAC, it usually requires optimisation,
+and so multiple epochs. In fact, ParMAC applies to EM by using e = 1 epoch: in the W step, the
+Gaussians visit each machine circularly and (their averages) are updated on its data; in the Z step,
+each machine updates its posterior probabilities.
+In the rest of the paper, some readers may find this analogy useful and think of EM for Gaussian mix-
+tures instead of MAC, replacing “submodels” and “auxiliary coordinates” in MAC with “Gaussians”
+and “posterior probabilities” in EM, respectively.
+4
+Under review as a conference paper at ICLR 2017
+Wh	Wh	Wh	Wh
+1	L______I	—	13 I________I	j 25 I____________I	37 I_______
+2	Γ_______1	14	Γ________1	26	Γ________1	38	Γ_______
+3	「	[	15	「	[	27	「	1	39	「
+4	L_______1	16	L________J	28	L________J	40	I_______
+5	Γ_____1	17 Γ________1	29 Γ_______1	41 Γ_______1
+6	I	I	18	I	I	30	I	I	42	I
+7	L_______I	191__________I	311__________I	431__________
+8	Γ______1	20	Γ______1	32	Γ______1	44	Γ_____
+9	I	I	21	I	I	33	I	I	45	∣	∣
+10	L______I	221__________I	341__________I	461_________I
+11	23	35	47 C_________1
+12	「	]	24	「	[	36	「	[	48	「	]
+10
+1
+2
+3
+4
+Q
+Xn yn Zn
+Machine 1
+20
+11
+12
+13
+14
+Xn yn Zn
+Machine 2
+30
+21
+22
+23
+24
+Xn yn Zn
+Machine 3
+40
+31
+32
+33
+34
+Xn yn Zn
+Machine 4
+Figure 2:	ParMAC model with P = 4 machines, M = 12 submodels “wh” and N = 40 data points.
+Submodels h, h + M, h + 2M and h + 3M are copies of submodel h, but only one of them is the
+most currently updated. At the end of the W step all copies are identical.
+3	ParMAC: a parallel, distributed computation model for MAC
+A specific MAC algorithm depends on the model and objective function and on how the auxiliary
+coordinates are introduced. We can achieve steps that are closed-form, convex, nonconvex, binary,
+or others. However, we will assume the following always hold: (1) Separability over data points.
+In the Z step, the N subproblems for z1 , . . . , zN are independent, one per data point. Each zn
+step depends on the current model. (2) Separability over submodels. In the W step, there are
+M independent submodels, where M depends on the problem. For example, M is the number
+of hidden units in a deep net, or the number of hash functions and linear decoders in a BA. Each
+submodel depends on all the data and coordinates. We now show how to turn this into a distributed,
+low-communication ParMAC algorithm.
+The basic idea in ParMAC is as follows. With large datasets in distributed systems, it is imperative
+to minimise data movement over the network because the communication time generally far exceeds
+the computation time in modern architectures. In MAC we have 3 types of data: the original train-
+ing data (X, Y), the auxiliary coordinates Z, and the model parameters (the submodels). Usually,
+the latter type is far smaller. In ParMAC, we never communicate training or coordinate data; each
+machine keeps a disjoint portion of (X, Y, Z) corresponding to a subset of the points. Only model
+parameters are communicated, during the W step, following a circular topology, which implicitly
+implements a stochastic optimisation. The model parameters are the hash functions h and the de-
+coder f for BAs, and the weight vector wh of each hidden unit h for deep nets. Let us see this in
+detail (refer to fig. 2).
+Assume we have P identical processing machines, each with its own memory and CPU, connected
+through a network in a circular unidirectional topology. Each machine stores a subset of the data
+points and corresponding coordinates (xn, yn, zn) such that the subsets are disjoint and their union
+is the entire data. Before the Z step starts, each machine contains all the (just updated) submodels.
+This means that in the Z step each machine processes its auxiliary coordinates {zn} independently
+of all other machines, i.e., no communication occurs. The W step is more subtle. At the beginning
+of the W step, each machine will contain all the submodels and its portion of the data and (just
+updated) coordinates. Each submodel must have access to the entire data and coordinates in order
+to update itself and, since the data cannot leave its home machine, the submodel must go to the data.
+We achieve this in the circular topology with an asynchronous processing, as follows. Each machine
+keeps a queue of submodels to be processed, and repeatedly performs the following operations:
+extract a submodel from the queue, process it on its data and send it to the machine’s successor
+5
+Under review as a conference paper at ICLR 2017
+(which will insert it in its queue). If the queue is empty, the machine waits until it is nonempty. The
+queue of each machine is initialised with a portion M/P of submodels associated with that machine
+(e.g. in fig. 2, machine 1's queue contains submodels 1-3, machine 2 submodels 4-6, etc.). Each
+submodel carries a counter that is initially 1 and increases every time it visits a machine. When
+it reaches P , the submodel has visited all machines in sequence and has completed an epoch. We
+repeat this for e epochs and, to ensure all machines have all final submodels before starting the Z
+step, we run a communication-only epoch e + 1 (without computation), where submodels simply
+move from machine to machine.
+Since each submodel is updated as soon as it visits a machine, rather than computing the exact
+gradient once it has visited all machines and then take a step, the W step is really carrying out
+stochastic steps for each submodel. For example, if the update is done by a gradient step, we are
+actually implementing stochastic gradient descent (SGD) where the minibatches are of size N/P
+(or smaller, if we subdivide a machine’s data portion into minibatches, which should be typically
+the case in practice). From this point of view, we can regard the W step as doing SGD on each
+submodel in parallel by having each submodel visit the minibatches in each machine.
+As described, and as implemented in our experiments, the entire model parameters are communi-
+cated e + 1 times in a MAC iteration if running e epochs in the W step. We can also run e epochs
+with only 2 rounds of communication by having a submodel do e consecutive passes within each
+machine’s data. This reduces the amount of shuffling, but should not be a problem if the data are
+randomly distributed over machines.
+Extensions of ParMAC Data shuffling, which improves the SGD convergence speed, can be
+achieved without data movement by accessing the local data in random order at each epoch (within-
+machine), and by randomising the circular topology at each epoch (across-machine). Load bal-
+ancing is simple because the work in both W and Z steps is proportional to the number of data
+points N . Hence, if the processing power of machine p is proportional to αp > 0, we allocate
+to it Nap∕(αι + •…+ αp) data points. Streaming, i.e., discarding old data and adding new data
+during training, can be done by adding/removing data within-machine, or by adding/removing ma-
+chines and updating the circular topology. Fault tolerance is possible because we can still learn
+a good model even if we lose the data from a machine that fails, and because in the W step we
+can revert to older copies of the lost submodels residing in other machines. See further details in
+Carreira-Perpifian and Alizadeh (2016).
+A theoretical model of the parallel speedup We can estimate the runtime of the W and Z steps
+assuming there are M independent submodels of the same size in the W step, using e epochs, on a
+dataset with N training points, distributed over P identical machines (each with N/P points). Let
+trW be the computation time per submodel and data point in the W step, trZ the computation time
+per data point in the Z step, and tcW the communication time per submodel in the W step. Then the
+runtime of the W and Z steps is TW (P) = \M/P] (tW N + tW)Pe +「M/P]tWP and TZ(P)=
+M NtZ, respectively. Hence the parallel speedup is (see details in Carreira-Perpifian and Alizadeh,
+2016):
+S(P)
+T⑴
+τ (P)
+P「m/p] MP
+N P 2 + ρ2P + ρ1[m/p ] M
+P1= tZ∕(e +1)tW, P2 = etW∕(e + 1)tW
+P = Pi + P2 = (etW + tZ)∕(e +1)tW	( )
+where P, P1 and P2 are ratios of computation vs communication, dependent on the optimisation
+algorithm in the W and Z steps, and on the performace of the distributed system and MPI library.
+Hence, if P ≤ M and M is divisible by P We have S (P) = P∕(1 + PN) and if P > M We
+have S(P) = PM/(P2 + PiM + N). In practice, typically we have P ≪ 1 (ρbecause communication
+dominates computation in current architectures) andP2N ≫ 1 (large dataset). Ifwe take P ≪ P2N,
+then S (P) ≈ P if P ≤ M and S (P) ≈ ρM∕(ρ2 + pi M) if P > M. Hence, the speedup is
+nearly perfect if using fewer machines than submodels, and otherwise it peaks at S； = pM∕(p2 +
+2∙∖∕pιM∕N) > M for P = P； = VPIMN > M and decreases thereafter. This affords very large
+speedups for large datasets and large models. This theoretical speedup matches well our measured
+ones (see the experiments section), and can be used to determine optimal values for the number of
+machines P to use in practice (subject to additional constraints, e.g. cost of the machines).
+6
+Under review as a conference paper at ICLR 2017
+Eq. (3) also shows that we can leave the speedup unchanged by trading off dataset size and com-
+putation/communication times, as long as one of these holds: NtrW and NtrZ remain constant; or
+N/tcW remains constant; or trW/tcW and trZ/tcW remain constant.
+In the BA, we have submodels of different size: encoders of size D and decoders of size L < D.
+We can model this by “grouping” the D decoders into L groups of D/L decoders each, resulting
+in M = 2L equal-size submodels (assuming the ratio of computation and communication times of
+decoder vs encoder is L/D < 1).
+Convergence of ParMAC The only approximation that ParMAC makes to the original MAC algo-
+rithm is using SGD in the W step. Since we can guarantee convergence of SGD under certain condi-
+tions (e.g. Robbins-Monro schedules), we can recover the original convergence guarantees for MAC
+to a local stationary point with differentiable layers (see details in Carreira-Perpifian and Alizadeh,
+2016). This convergence guarantee is independent of the number of layers, models and proces-
+sors. With nondifferentiable layers, the convergence properties of MAC (and ParMAC) are not well
+known. In particular, for the binary autoencoder the encoding layer is discrete and the problem is
+NP-complete. While convergence guarantees are important theoretically, in practical applications
+with large datasets in a distributed setting one typically runs SGD for just a few epochs, even one
+or less than one (i.e., we stop SGD before passing through all the data). This typically reduces the
+objective function to a good enough value as fast as possible, since each pass over the data is very
+costly. In our experiments, 1-2 epochs in the W step make ParMAC very similar to MAC using an
+exact step.
+Circular vs parameter-server topologies We also considered implementing ParMAC using a
+parameter-server (PS) topology rather than a circular one, but the latter is better. With a PS we do
+parallel SGD on each submodel independently, i.e., each worker runs SGD on its own submodel
+replica for a while, sends it to the PS, and this broadcasts an “average” submodel back to the work-
+ers, asynchronously. The circular topology does true SGD on each submodel independently from
+the others. We can show the runtime per iteration using a PS is equal to that of the circular topol-
+ogy only if the server can communicate with P workers simultaneously (rather than sequentially),
+otherwise it is slower. The reason is the PS has more communication. The PS has some additional
+disadvantages: parallel SGD converges more slowly than true SGD and is difficult to apply if the W
+step is nonconvex; and it needs extra machine(s) to act as parameter server(s). The fundamental is-
+sue is that both topologies differ in how they employ the available parallelism: the circular topology
+updates different, independent submodels, while the PS updates replicas of the same submodels.
+4	Experiments
+MPI implementation of ParMAC for BAs. We have used C/C++, the GSL and BLAS libraries for
+mathematical operations, and the Message Passing Interface (MPI) (Gropp et al., 1999) for inter-
+process communication. MPI is a widely used framework for high-performance parallel computing,
+available in multiple platforms. It is particularly suitable for ParMAC because of its support of the
+SPMD (single program, multiple data) model. In MPI, processes in different machines communicate
+through messages. To receive data, We use the synchronous blocking receive function MPi_Recv；
+the process calling this blocks until the data arrives. To send data we use the buffered blocking send
+function MPI-Bsend. We allocate enough memory and attach it to the system. The process calling
+MPI-Bsend blocks until the buffer is copied to the MPI internal memory; after that, the MPI library
+takes care of sending the data. See a code snippet in Carreira-Perpinan and Alizadeh (2016).
+Distributed-memory cluster. We used General Computing Nodes from the UCSD Triton Shared
+Computing Cluster (TSCC), available to the public for a fee. Each node contains 2 8-core Intel
+Xeon E5-2670 processors (16 cores in total), 64GB RAM (4GB/processor) and a 500GB hard
+drive. The nodes are connected through a 10GbE network. We used up to P = 128 proces-
+sors. Carreira-Perpinan and Alizadeh (2016) give detailed specs as well as experiments in a shared-
+memory machine.
+Datasets. We have used 3 well-known colour image retrieval benchmarks. (1) CIFAR (Krizhevsky,
+2009) contains 60 000 images (N = 50 000 training and 10 000 test), represented by D = 320 GIST
+features. (2) SIFT-IM (Jegouetal., 2011a) contains N = 106 training and 104 test images, each
+7
+Under review as a conference paper at ICLR 2017
+represented by D = 128 SIFT features. (3) SIFT-IB (Jegouetal., 2011a) has three subsets: 109
+base vectors where the search is performed, N = 108 learning vectors used to train the model and
+104 query vectors.
+Performance measures. Regarding the quality of the BA and hash functions learnt, we report the
+retrieval precision (%) in the test set using as true neighbours the K nearest images in Euclidean
+distance in the original space, and as retrieved neighbours in the binary space we use the k nearest
+images in Hamming distance. We set (K, k) = (1 000, 100) for CIFAR and (10 000, 10 000) for
+SIFT-1M. For SIFT-1B, as suggested by the dataset creators, we report the recall@R: the average
+number of queries for which the nearest neighbour is ranked within the top R positions (for varying
+values of R); in case of tied distances, we place the query as top rank. All these measures are
+computed offline once the BA is trained. Carreira-Perpifian and Alizadeh (2016) give additional
+measures and experiments.
+Models and their parameters. We use BAs with linear encoders (linear SVM) except with SIFT-1B,
+where we also use kernel SVMs. The decoder is always linear. We set L = 16 bits (hash functions)
+for CIFAR and SIFT-1M and L = 64 bits for SIFT-1B. We initialise the binary codes from truncated
+PCA ran on a subset of the training set (small enough that it fits in one processor). To train the
+encoder (L SVMs) and decoder (D linear mappings) with stochastic optimisation, we used the SGD
+code from (Bottou and Bousquet, 2008), using its default parameter settings. The SGD step size is
+tuned automatically in each iteration by examining the first 1 000 datapoints. We use a multiplicative
+μ schedule μ% = μ0ai where the initial value μo and the factor a > 1 are tuned offline in a trial
+run using a small subset of the data. For CIFAR We use μo = 0.005 and a = 1.2 over 26 iterations
+(i = 0,..., 25). For SIFT-IM and SIFT-IB we use μo = 10-4 and a = 2 over 10 iterations.
+Effect of stochastic steps in the W step Fig. 3 shows the effect on the precision on CI-
+FAR of varying the number of epochs within the W step and shuffling the data as a function
+of the number of processors P . As the number of epochs increases, the W step is solved
+more exactly (8 epochs is practically exact in
+only a small degradation. The reason is that,
+contain sufficient redundance that few epochs
+This is also helped by the accumulated effect
+of epochs over MAC iterations. Running more
+epochs increases the runtime and lowers the
+parallel speedup in this particular model, be-
+cause we use few bits (L = 16) and therefore
+few submodels (M = 2L = 32) compared to
+the number of machines (up to P = 128), so
+the W step has less parallelism. The positive
+effect of data shuffling in the W step is clear:
+shuffling generally increases the precision with
+no increase in runtime.
+this data). Fewer epochs, even just one, cause
+although these are relatively small datasets, they
+are sufficient to decrease the error considerably.
+P = 1, different e	e = 8, different P
+runtime	iteration
+Figure 3: Precision in CIFAR dataset.
+Speedup The fundamental advantage of ParMAC and distributed optimisation in general is the
+ability to train on datasets that do not fit in a single machine, and the reduction in runtime because
+of parallel processing. Fig. 4 shows the “strong scaling” speedups achieved, as a function of the
+number of machines P for fixed problem size (dataset and model), in CIFAR and SIFT-1M (N =
+50K and 1M training points, respectively). Even though these datasets and especially the number of
+independent submodels (M = 2L = 32 effective submodels of the same size, as discussed earlier)
+are relatively small, the speedups we achieve are nearly perfect for P ≤ M and hold very well for
+P > M up to the maximum number of machines we used (P = 128 in the distributed system). The
+speedups flatten as the number of W-step epochs (and consequently the amount of communication)
+increases, because for this experiment the bottleneck is the W step, whose parallelisation ability
+(i.e., the number of concurrent processes) is limited by M = 2L (the Z step has N independent
+processes and is never a bottleneck, since N is very large). However, as noted earlier, using 1 to 2
+epochs gives a good enough result, very close to doing an exact W step. The runtime for SIFT-1M
+on P = 128 machines with 8 epochs was 12 minutes and its speedup 100×. This is particularly
+remarkable given that the original, nested model did not have model parallelism.
+8
+Under review as a conference paper at ICLR 2017
+SIFT-1B
+CIFAR
+number of machines P
+Figure 4: Speedup S(P) as a function of the number of machines P (top: experiment, bottom:
+theory). The dataset size and number of submodels (N, M) is (50 000, 32) for CIFAR, (106, 32) for
+SIFT-1M and (108, 128) for SIFT-1B.
+SIFT-IM
+number of machines P
+too long to run
+number of machines P
+Fig. 4 also shows the speedups predicted by our theoretical model. We set the parameters e and
+N to their known values, and M = 2L = 32 for CIFAR and SIFT-1M and M = 2L = 128 for
+SIFT-1B. For the time parameters, we set trW = 1 to fix the time units, and we set tcW and trZ by
+trial and error to achieve a reasonably good fit to the experimental speedups: tcW = 104 for both
+datasets, and trZ = 200 for CIFAR and 40 for SIFT-1M. Although these are fudge factors, they are
+in rough agreement with the fact that communicating a weight vector over the network is orders of
+magnitude slower than updating it with a gradient step, and that the Z step is quite slower than the
+W step because of the binary optimisation it involves.
+Large-scale experiment SIFT-1B is one of the largest datasets, if not the largest one, that are
+publicly available for comparing nearest-neighbour search algorithms with known ground-truth (i.e.,
+precomputed exact Euclidean distances for each query to its k nearest vectors in the base set). The
+training set contains N = 100M vectors, each consisting of 128 SIFT features. We used L = 64
+hash functions (M = 128 submodels): linear SVMs as before, and kernel SVMs. These have fixed
+Gaussian radial basis functions (2 000 centres picked at random from the training set and bandwidth
+σ = 160), so the only trainable parameters are the weights, and the MAC algorithm does not change
+except that it operates on a 2 000-dimensional input vector of kernel values, instead of the 128 SIFT
+features. We use e = 2 epochs with shuffling. All these decisions were based on trials on a subset of
+the training dataset. We initialised the binary codes from truncated PCA trained on a subset of size
+1M (recall@R=100: 55.2%), which gave results comparable to the baseline in (JegoU et al., 2011b).
+We ran ParMAC on the whole training set in the distributed system with 128 processors for 6 it-
+erations and achieved a recall@R=100 of 61.5% in 29 hours (linear SVM) and 66.1% in 83 hours
+(kernel SVM). Using a scaled-down model and training set, we estimated that training in one ma-
+chine (with enough RAM to hold the data and parameters) would take months. The theoretical
+speedup (fig. 4 right plot, using the same parameters as in SIFT-1M), is nearly perfect (note the plot
+goes up to P = 1 024 machines, even though our experiments are limited to P = 128). This is
+because M is quite larger and N is much larger than in the previous datasets.
+5	Discussion
+Developing parallel, distributed optimisation algorithms for nonconvex problems in machine learn-
+ing is challenging, as shown by recent efforts by large teams of researchers (Le et al., 2012;
+Dean et al., 2012). One important advantage of ParMAC is its simplicity. Data and model paral-
+9
+Under review as a conference paper at ICLR 2017
+lelism arise naturally thanks to the introduction of auxiliary coordinates. The corresponding opti-
+misation subproblems can often be solved reusing existing code as a black box (as with the SGD
+training of SVMs and linear mappings in the BA). A circular topology is sufficient to achieve a
+low communication between machines. There is no close coupling between the model structure and
+the distributed system architecture. This makes ParMAC suitable for architectures as different as
+supercomputers and data centres.
+Further improvements can be made in specific problems. For example, we may have more paral-
+lelisation or less dependencies (e.g. the weights of hidden units in layer k of a neural net depend
+only on auxiliary coordinates in layers k and k + 1). This may reduce the communication in the W
+step, by sending to a given machine only the model portion it needs, or by allocating cores within a
+multicore machine accordingly. The W and Z step optimisations can make use of further paralleli-
+sation by GPUs or by distributed convex optimisation algorithms. Many more refinements can be
+done, such as storing or communicating reduced-precision values with little effect of the accuracy.
+In this paper, we have tried to keep our implementation as simple as possible, because our goal was
+to understand the parallelisation speedups of ParMAC in a setting as general as possible, rather than
+trying to achieve the very best performance for a particular dataset, model or distributed system.
+6	Conclusion
+We have proposed ParMAC, a distributed model for the method of auxiliary coordinates for training
+nested, nonconvex models in general, analysed its parallel speedup and convergence, and demon-
+strated it with an MPI-based implementation for a particular case, to train binary autoencoders. MAC
+creates parallelism by introducing auxiliary coordinates for each data point to decouple nested terms
+in the objective function. ParMAC is able to translate the parallelism inherent in MAC into a dis-
+tributed system by 1) using data parallelism, so that each machine keeps a portion of the original
+data and its corresponding auxiliary coordinates; and 2) using model parallelism, so that independent
+submodels visit every machine in a circular topology, effectively executing epochs of a stochastic
+optimisation, without the need for a parameter server and therefore no communication bottlenecks.
+The convergence properties of MAC (to a stationary point of the objective function) remain essen-
+tially unaltered in ParMAC. The parallel speedup can be theoretically predicted to be nearly perfect
+when the number of submodels is comparable or larger than the number of machines, and to eventu-
+ally saturate as one continues to increase the number of machines, and indeed this was confirmed in
+our experiments. ParMAC also makes it easy to account for data shuffling, load balancing, streaming
+and fault tolerance. Hence, we expect that ParMAC could be a basic building block, in combination
+with other techniques, for the distributed optimisation of nested models in big data settings.
+Acknowledgments
+Work supported by a Google Faculty Research Award and by NSF award IIS-1423515. We thank
+Ramin Raziperchikolaei (UC Merced) for discussions about binary autoencoders, Dong Li (UC
+Merced) for discussions about MPI and performance evaluation on parallel systems, and Quoc Le
+(Google) for discussions about Google’s DistBelief system.
+References
+M. Abadi et al. TensorFlow: Large-scale machine learning on heterogeneous systems, 2015. White paper.
+Y. Bengio, J.-F. Paiement, P. Vincent, O. Delalleau, N. Le Roux, and M. Ouimet. Out-of-sample extensions for
+LLE, Isomap, MDS, Eigenmaps, and spectral clustering. NIPS, 2004.
+D. P. Bertsekas. Incremental gradient, subgradient, and proximal methods for convex optimization: A survey.
+In S. Sra, S. Nowozin, and S. J. Wright, editors, Optimization for Machine Learning. MIT Press, 2011.
+L. Bottou. Large-scale machine learning with stochastic gradient descent. COMPSTAT, 2010.
+L. Bottou and O. Bousquet. The tradeoffs of large scale learning. NIPS, 2008.
+S. Boyd, N. Parikh, E. Chu, B. Peleato, and J. Eckstein. Distributed optimization and statistical learning via the
+alternating direction method of multipliers. Foundations and Trends in Machine Learning, 3, 2011.
+J. Bradley, A. Kyrola, D. Bickson, and C. Guestrin. Parallel coordinate descent for L1 -regularized loss mini-
+mization. ICML, 2011.
+M. A. Carreira-PerPinan and M. Alizadeh. ParMAC: Distributed optimisation of nested functions, With appli-
+cation to learning binary autoencoders. arXiv:1605.09114 [cs.LG], May 30 2016.
+10
+Under review as a conference paper at ICLR 2017
+M. A. Carreira-PerPinan and R. Raziperchikolaei. Hashing with binary autoencoders. CVPR, 2015.
+M. A. Carreira-Perpinan and M. Vladymyrov. A fast, universal algorithm to learn parametric nonlinear embed-
+dings. NIPS, 2015.
+M. A. Carreira-Perpinan and W. Wang. Distributed optimization of deeply nested systems. arXiv:1212.5921
+[cs.LG], Dec. 24 2012.
+M. ,A. Carreira-Perpinan and W. Wang. Distributed optimization of deeply nested systems. AISTATS, 2014.
+V. Cevher, S. Becker, and M. Schmidt. Convex optimization for big data: Scalable, randomized, and parallel
+algorithms for big data analytics. IEEE Signal Processing Magazine, 31(5):32-43, Sept. 2014.
+A. Coates, B. Huval, T. Wang, D. Wu, B. Catanzaro, and A. Ng. Deep learning with COTS HPC systems.
+ICML, 2013.
+J.	Dean, G. Corrado, R. Monga, K. Chen, M. Devin, Q. Le, M. Mao, M. Ranzato, A. Senior, P. Tucker, K. Yang,
+and A. Ng. Large scale distributed deep networks. NIPS, 2012.
+P. Drineas and M. W. Mahoney. On the NyStrOm method for approximating a Gram matrix for improved
+kernel-based learning. J. Machine Learning Research, 6:2153-2175, Dec. 2005.
+Y. Gong, S. Lazebnik, A. Gordo, and F. Perronnin. Iterative quantization: A Procrustean approach to learning
+binary codes for large-scale image retrieval. IEEE PAMI, 2013.
+K.	Grauman and R. Fergus. Learning binary hash codes for large-scale image search. In R. Cipolla, S. Battiato,
+and G. Farinella, editors, Machine Learning for Computer Vision, pages 49-87. Springer-Verlag, 2013.
+W. Gropp, E. Lusk, and A. Skjellum. Using MPI: Portable Parallel Programming with the Message-Passing
+Interface. MIT Press, second edition, 1999.
+G.	Hinton, L. Deng, D. Yu, G. Dahl, A. Mohamed, N. Jaitly, A. Senior, V. Vanhoucke, P. Nguyen, T. N. Sainath,
+and B. Kingsbury. Deep neural networks for acoustic modeling in speech recognition: The shared views of
+four research groups. IEEE Signal Processing Magazine, 29(6):82-97, Nov. 2012.
+H.jegou, M. Douze, and C. Schmid. Product quantization for nearest neighbor search. IEEE PAMI, 33, 2011a.
+H.	Jegou, R. Tavenard, M. Douze, and L. Amsaleg. Searching in one billion vectors: Re-rank with source
+coding. ICASSP, 2011b.
+A. Krizhevsky. Learning multiple layers of features from tiny images. Master’s thesis, U. Toronto, 2009.
+Q. Le, M. Ranzato, R. Monga, M. Devin, G. Corrado, K. Chen, J. Dean, and A. Ng. Building high-level features
+using large scale unsupervised learning. ICML, 2012.
+J. Liu and S. J. Wright. Asynchronous stochastic coordinate descent: Parallelism and convergence properties.
+SIAM J. Optimization, 25(1):351-376, 2015.
+Y. Low, D. Bickson, J. Gonzalez, C. Guestrin, A. Kyrola, and J. M. Hellerstein. Distributed GraphLab: A
+framework for machine learning and data mining in the cloud. Proc. VLDB Endowment, 5, 2012.
+G.	J. McLachlan and T. Krishnan. The EM Algorithm and Extensions. Wiley, second edition, 2008.
+F. Niu, B. Recht, C. Re, and S. J. Wright. HOGWILD!: A lock-free approach to parallelizing stochastic gradient
+descent. NIPS, 2011.
+H.	Ouyang, N. He, L. Tran, and A. Gray. Stochastic alternating direction method of multipliers. ICML, 2013.
+R. Raziperchikolaei and M. A. Carreira-Perpinan. Optimizing affinity-based binary hashing using auxiliary
+coordinates. NIPS, 2016.
+P. RichtOrik and M. Takac. Distributed coordinate descent method for learning with big data. arXiv:1310.2059
+[stat.ML], Oct. 8 2013.
+F. Seide, H. Fu, J. Droppo, G. Li, and D. Yu. 1-bit stochastic gradient descent and its application to data-parallel
+distributed training of speech DNNs. Interspeech, 2014.
+A. Talwalkar, S. Kumar, and H. Rowley. Large-scale manifold learning. CVPR, 2008.
+M. Vladymyrov and M. A. Carreira-Perpinan. Locally Linear Landmarks for large-scale manifold learning.
+ECML, 2013.
+M. Vladymyrov and M. A. Carreira-Perpinan. The Variational Nystrom method for large-scale spectral prob-
+lems. ICML, 2016.
+W. Wang and M. A. Carreira-Perpinan. The role of dimensionality reduction in classification. AAAI, 2014.
+C. K. I. Williams and M. Seeger. Using the Nystrom method to speed up kernel machines. NIPS, 2001.
+S. J. Wright. Coordinate descent algorithms. Math. Prog., 151(1):3-34, June 2016.
+E. P. Xing, Q. Ho, W. Dai, J. K. Kim, J. Wei, S. Lee, X. Zheng, P. Xie, A. Kumar, and Y. Yu. Petuum: A new
+platform for distributed machine learning on big data. IEEE Trans. Big Data, 1(2):49-67, Apr.-June 2015.
+M. Zaharia, M. Chowdhury, M. J. Franklin, S. Shenker, and I. Stoica. Spark: Cluster computing with working
+sets. In Proc. 2nd USENIX Conf. Hot Topics in Cloud Computing (HotCloud 2010), 2010.
+R. Zhang and J. Kwok. Asynchronous distributed ADMM algorithm for global variable consensus optimization.
+ICML, 2014.
+M. Zinkevich, M. Weimer, A. Smola, and L. Li. Parallelized stochastic gradient descent. NIPS, 2010.
+11

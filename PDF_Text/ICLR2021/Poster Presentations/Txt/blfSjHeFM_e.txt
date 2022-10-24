@@ -1,0 +1,1017 @@
+Published as a conference paper at ICLR 2021
+MALI: A memory efficient and reverse accu-
+rate integrator for Neural ODEs
+Juntang Zhuang; Nicha C. Dvornek; Sekhar Tatikonda; James S. Duncan
+{j.zhuang; nicha.dvornek; sekhar.tatikonda; james.duncan} @yale.edu
+Yale University, New Haven, CT, USA
+Ab stract
+Neural ordinary differential equations (Neural ODEs) are a new family of deep-
+learning models with continuous depth. However, the numerical estimation of
+the gradient in the continuous case is not well solved: existing implementations
+of the adjoint method suffer from inaccuracy in reverse-time trajectory, while the
+naive method and the adaptive checkpoint adjoint method (ACA) have a mem-
+ory cost that grows with integration time. In this project, based on the asyn-
+chronous leapfrog (ALF) solver, we propose the Memory-efficient ALF Integra-
+tor (MALI), which has a constant memory cost w.r.t number of solver steps in
+integration similar to the adjoint method, and guarantees accuracy in reverse-time
+trajectory (hence accuracy in gradient estimation). We validate MALI in various
+tasks: on image recognition tasks, to our knowledge, MALI is the first to en-
+able feasible training of a Neural ODE on ImageNet and outperform a well-tuned
+ResNet, while existing methods fail due to either heavy memory burden or in-
+accuracy; for time series modeling, MALI significantly outperforms the adjoint
+method; and for continuous generative models, MALI achieves new state-of-the-
+art performance.We provide a pypi package: https://jzkay12.github.
+io/TorchDiffEqPack
+1 Introduction
+Recent research builds the connection between continuous models and neural networks. The theory
+of dynamical systems has been applied to analyze the properties of neural networks or guide the
+design of networks (Weinan, 2017; Ruthotto & Haber, 2019; Lu et al., 2018). In these works, a
+residual block (He et al., 2016) is typically viewed as a one-step Euler discretization of an ODE;
+instead of directly analyzing the discretized neural network, it might be easier to analyze the ODE.
+Another direction is the neural ordinary differential equation (Neural ODE) (Chen et al., 2018),
+which takes a continuous depth instead of discretized depth. The dynamics of a Neural ODE is
+typically approximated by numerical integration with adaptive ODE solvers. Neural ODEs have
+been applied in irregularly sampled time-series (Rubanova et al., 2019), free-form continuous gen-
+erative models (Grathwohl et al., 2018; Finlay et al., 2020), mean-field games (Ruthotto et al.,
+2020), stochastic differential equations (Li et al., 2020) and physically informed modeling (Sanchez-
+Gonzalez et al., 2019; Zhong et al., 2019).
+Though the Neural ODE has been widely applied in practice, how to train it is not extensively stud-
+ied. The naive method directly backpropagates through an ODE solver, but tracking a continuous
+trajectory requires a huge memory. Chen et al. (2018) proposed to use the adjoint method to deter-
+mine the gradient in continuous cases, which achieves constant memory cost w.r.t integration time;
+however, as pointed out by Zhuang et al. (2020), the adjoint method suffers from numerical errors
+due to the inaccuracy in reverse-time trajectory. Zhuang et al. (2020) proposed the adaptive check-
+point adjoint (ACA) method to achieve accuracy in gradient estimation at a much smaller memory
+cost compared to the naive method, yet the memory consumption of ACA still grows linearly with
+integration time. Due to the non-constant memory cost, neither ACA nor naive method are suitable
+for large scale datasets (e.g. ImageNet) or high-dimensional Neural ODEs (e.g. FFJORD (Grath-
+wohl et al., 2018)).
+1
+Published as a conference paper at ICLR 2021
+In this project, we propose the Memory-efficient Asynchronous Leapfrog Integrator (MALI) to
+achieve advantages of both the adjoint method and ACA: constant memory cost w.r.t integration
+time and accuracy in reverse-time trajectory. MALI is based on the asynchronous leapfrog (ALF)
+integrator (Mutze, 2013). With the ALF integrator, each numerical step forward in time is reversible.
+Therefore, with MALI, we delete the trajectory and only keep the end-time states, hence achieve
+constant memory cost w.r.t integration time; using the reversibility, we can accurately reconstruct
+the trajectory from the end-time value, hence achieve accuracy in gradient. Our contributions are:
+1.	We propose a new method (MALI) to solve Neural ODEs, which achieves constant memory
+cost w.r.t number of solver steps in integration and accuracy in gradient estimation. We provide
+theoretical analysis.
+2.	We validate our method with extensive experiments: (a) for image classification tasks, MALI
+enables a Neural ODE to achieve better accuracy than a well-tuned ResNet with the same number
+of parameters; to our knowledge, MALI is the first method to enable training of Neural ODEs on
+a large-scale dataset such as ImageNet, while existing methods fail due to either heavy memory
+burden or inaccuracy. (b) In time-series modeling, MALI achieves comparable or better results
+than other methods. (c) For generative modeling, a FFJORD model trained with MALI achieves
+new state-of-the-art results on MNIST and Cifar10.
+2 Preliminaries
+Algorithm 1: Numerical Integration
+Input initial state x, start time t0 , end
+time T , error tolerance etol, initial
+stepsize h.
+Initialize z(0) = x, t = t0
+While t < T
+error _est = ∞
+While error_est > etol
+h — h × DecayFactor
+Z, error_est = ψh(t, Z)
+If error_est < etol
+h — h × IncreaseFactor
+t《-t + h, z《-z
+2.1	Numerical Integration Methods
+An ordinary differential equation (ODE) typically takes the form
+dzdtt) = fθ(t,z(t)) St z(to)= X, t ∈ [to,T], Loss = L(Z(T),y)	(1)
+where z (t) is the hidden state evolving with time, T is the end time, t0 is the start time (typi-
+cally 0), x is the initial state. The derivative of z (t) w.r.t t is defined by a function f, and f is
+defined as a sequence of layers parameterized by θ. The loss function is L(z (T), y), where y is
+the target variable. Eq. 1 is called the initial value problem (IVP) because only z (t0) is specified.
+Notations We summarize the notations following
+Zhuang et al. (2020).
+•	Zi(ti)∕z(τ∕: hidden state in forward/reverse time
+trajectory at time ti∕τi.
+•	ψh (ti, zi): the numerical solution at time ti + h,
+starting from (ti, zi) with a stepsize h.
+•	Nf , Nz : Nf is the number of layers in f in Eq. 1,
+Nz is the dimension of z .
+•	Nt ∕Nr : number of discretized points (outer itera-
+tions in Algo. 1) in forward / reverse integration.
+•	m: average number of inner iterations in Algo. 1
+to find an acceptable stepsize.
+Numerical Integration The algorithm for general
+adaptive-stepsize numerical ODE solvers is summa-
+rized in Algo. 1 (Wanner & Hairer, 1996). The solver repeatedly advances in time by a step, which is
+the outer loop in Algo. 1 (blue curve in Fig. 1). For each step, the solver decreases the stepsize until
+the estimate of error is lower than the tolerance, which is the inner loop in Algo. 1 (green curve in
+Fig. 1). For fixed-stepsize solvers, the inner loop is replaced with a single evaluation of ψh(t, z) us-
+ing predefined stepsize h. Different methods typically use different ψ, for example different orders
+of the Runge-Kutta method (Runge, 1895).
+2.2 Analytical form of gradient in continuous case
+We first briefly introduce the analytical form of the gradient in the continuous case, then we compare
+different numerical implementations in the literature to estimate the gradient. The analytical form
+2
+Published as a conference paper at ICLR 2021
+Table 1: Comparison between different methods for gradient estimation in continuous case. MALI achieves
+reverse accuracy, constant memory w.r.t number of solver steps in integration, shallow computation graph and
+low computation cost.
+Computation
+Memory
+Computation graph depth
+Reverse accuracy
+Naive
+NzNf × Nt × m × 2
+NzNf × Nt × m
+Nf × Nt × m
+✓
+Adjoint
+NzNf × (Nt + Nr) × m
+NzNf
+Nf × Nr
+X
+ACA
+NzNf × Nt × (m + 1)
+Nz(Nf + Nt)
+Nf × Nt
+✓
+MALI
+NzNf × Nt × (m + 2)
+Nz(Nf + 1)
+Nf × Nt
+✓
+Search for
+optimal stepsize
+----A
+Step forward with
+optimal stepsize
+Ground-truth
+trajectory
+Figure 2: In backward-pass, the adjoint method
+reconstructs trajectory as a separate IVP. Naive,
+ACA and MALI track the forward-time trajectory,
+hence are accurate. ACA and MALI only back-
+propagate through the accepted step, while naive
+method backpropagates through the search pro-
+cess hence has deeper computation graphs.
+Figure 1: Illustration of numerical solver in
+forward-pass. For adaptive solvers, for each step
+forward-in-time, the stepsize is recursively ad-
+justed until the estimated error is below prede-
+fined tolerance; the search process is represented
+by green curve, and the accepted step (ignore the
+search process) is represented by blue curve.
+of the gradient in the continuous case is
+dL
+dθ
+-Z° a(t)> df(z-dt
+T	∂θ
+(2)
+da(t) l (df(Z⑴,t,θ八丁	∂L
+-1Γ + ( ∂z(t) a a(t) = 0 ∀t ∈ (0，T), a(T) = E	⑶
+where a(t) is the “adjoint state”. Detailed proof is given in (Pontryagin, 1962). In the next section
+we compare different numerical implementations of this analytical form.
+2.3 Numerical implementations in the literature for the analytical form
+We compare different numerical implementations of the analytical form in this section. The forward-
+pass and backward-pass of different methods are demonstrated in Fig. 1 and Fig. 2 respectively.
+Forward-pass is similar for different methods. The comparison of backward-pass among different
+methods are summarized in Table. 1. We explain methods in the literature below.
+Naive method The naive method saves all of the computation graph (including search for optimal
+stepsize, green curve in Fig. 2) in memory, and backpropagates through it. Hence the memory cost is
+NzNf × Nt × m and depth of computation graph are Nf × Nt × m, and the computation is doubled
+considering both forward and backward passes. Besides the large memory and computation, the
+deep computation graph might cause vanishing or exploding gradient (Pascanu et al., 2013).
+Adjoint method Note that we use “adjoint state equation” to refer to the analytical form in Eq. 2
+and 3, while we use “adjoint method” to refer to the numerical implementation by Chen et al. (2018).
+As in Fig. 1 and 2, the adjoint method forgets forward-time trajectory (blue curve) to achieve
+memory cost NzNf which is constant to integration time; it takes the end-time state (derived from
+forward-time integration) as the initial state, and solves a separate IVP (red curve) in reverse-time.
+Theorem 2.1. (Zhuang et al., 2020) For an ODE solver of order p, the error of
+the reconstructed initial value by the adjoint method is PkN=-01 hpk+1 DΦtTk (zk)l(tk, zk) +
+(-hk)p+1DφT(Zk)l(tk,Zk) + O(hp+1), where Φ is the ideal solution, DΦ is the Jacobian of
+Φ, l(t,z) and l(t,z) are the local error in forward-time and reverse-time integration respectively.
+3
+Published as a conference paper at ICLR 2021
+Theorem 2.1 is stated as Theorem 3.2 in Zhuang et al. (2020); please see reference paper for de-
+tailed proof. To summarize, due to inevitable errors with numerical ODE solvers, the reverse-time
+trajectory (red curve, z(τ)) cannot match the forward-time trajectory (blue curve, z(t)) accurately.
+The error in Z propagates to / by Eq. 2, hence affects the accuracy in gradient estimation.
+Adaptive checkpoint adjoint (ACA) To solve the inaccuracy of adjoint method, Zhuang et al.
+(2020) proposed ACA: ACA stores forward-time trajectory in memory for backward-pass, hence
+guarantees accuracy; ACA deletes the search process (green curve in Fig. 2), and only back-
+propagates through the accepted step (blue curve in Fig. 2), hence has a shallower computation graph
+(Nf × Nt for ACA vs Nf × Nt × m for naive method). ACA only stores {z(ti)}iN=t1, and deletes
+the computation graph for {f z(ti), ti }iN=t1, hence the memory cost is Nz(Nf + Nt). Though the
+memory cost is much smaller than the naive method, it grows linearly with Nt , and can not handle
+very high dimensional models. In the following sections, we propose a method to overcome all these
+disadvantages of existing methods.
+3 Methods
+3.1 Asynchronous Leapfrog Integrator
+In this section we give a brief introduction to the asynchronous leapfrog (ALF) method (Mutze,
+2013), and we provide theoretical analysis which is missing in Mutze (2013). For general first-
+order ODEs in the form of Eq. 1, the tuple (z, t) is sufficient for most ODE solvers to take a step
+numerically. For ALF, the required tuple is (z, v, t), where v is the “approximated derivative”. Most
+numerical ODE solvers such as the Runge-Kutta method (Runge, 1895) track state z evolving with
+time, while ALF tracks the “augmented state” (z, v). We explain the details of ALF as below.
+Algorithm 2: Forward of ψ in ALF
+Input (zin , vin , sin , h) where sin is current
+time, zin and vin are correponding values
+at time sin, h is stepsize.
+Forward s1 = sin + h/2
+k1 = zin + vin × h/2
+u1 = f(k1, s1)
+vout = vin + 2(u1 - vin)
+zout = k1 + vout × h/2
+sout = s1 + h/2
+Output	(zout , vout , sout , h)
+Algorithm 3: ψ-1 (Inverse ofψ) in ALF
+Input (zout, vout, sout, h) where sout is
+current time, zout and vout are
+corresponding values at sout, h is stepsize.
+Inverse	s1 = sout - h/2
+k1 = zout - vout × h/2
+u1 = f(k1, s1)
+vin = 2u1 - vout
+zin = k1 - vin × h/2
+sin = s1 - h/2
+Output	(zin, vin, sin, h)
+Procedure of ALF Different ODE solvers have dif-
+ferent ψ in Algo. 1, hence we only summarize ψ for
+ALF in Algo. 2. Note that for a complete algorithm
+of integration for ALF, we need to plug Algo. 2 into
+Algo. 1. The forward-pass is summarized in Algo. 2.
+Given stepsize h, with input (zin, vin, sin), a single
+step of ALF outputs (zout, vout, sout).
+As in Fig. 3, given (z0 , v0, t0), the numerical forward-
+time integration calls Algo. 2 iteratively:
+
+W
+%
+之2
+N3
+%
+to
+tι
+¢3
+Figure 3: With ALF method, given any tuple
+(zj, vj, tj) and discretized time points {ti}iN=t1,
+we can reconstruct the entire trajectory accu-
+rately due to the reversibility of ALF.
+(zi , vi , ti , hi ) = ψ(zi-1 , vi-1 , ti-1 , hi)
+s.t. hi = ti - ti-1, i = 1, 2, ...Nt
+(4)
+Invertibility of ALF An interesting property of ALF is that ψ defines a bijective mapping; therefore,
+we can reconstruct (zin, vin, sin, h) from (zout, vout, sout, h), as demonstrated in Algo. 7. As in
+Fig. 3, we can reconstruct the entire trajectory given the state (zj, vj) at time tj, and the discretized
+time points {t0, ...tNt }. For example, given (zNt , vNt ) and {ti}iN=t0, the trajectory for Eq. 4 is
+reconstructed:
+(zi-1 , vi-1 , ti-1 ,	hi )	= ψ	(zi ,	vi , ti , hi )	s.t. hi = ti	- ti-1 ,	i =	Nt , Nt	- 1, ..., 1	(5)
+4
+Published as a conference paper at ICLR 2021
+In the following sections, we will show the invertibility of ALF is the key to maintain accuracy at a
+constant memory cost to train Neural ODEs. Note that “inverse” refers to reconstructing the input
+from the output without computing the gradient, hence is different from “back-propagation”.
+Initial value For an initial value problem (IVP) such as Eq. 1, typically z0 = z(t0) is given while
+v0 is undetermined. We can construct v0 = f (z(t0), t0), so the initial augmented state is (z0, v0).
+Difference from midpoint integrator The midpoint integrator (Suli & Mayers, 2003) is similar
+to Algo. 2, except that it recomputes vin = f(zin, sin) for every step, while ALF directly uses the
+input vin . Therefore, the midpoint method does not have an explicit form of inverse.
+Local truncation error Theorem 3.1 indicates that the local truncation error of ALF is of order
+O(h3); this implies the global error is O(h2). Detailed proof is in Appendix A.3.
+Theorem 3.1.	Fora single step in ALF with stepsize h, the local truncation error of z is O(h3), and
+the local truncation error of v is O(h2).
+A-Stability The ALF solver has a limited stability region, but this can be solved with damping. The
+damped ALF replaces the update of vout in Algo. 2 with vout = vin + 2η(u1 - vin), where η is the
+“damping coefficient” between 0 and 1. We have the following theorem on its numerical stability.
+Theorem 3.2.	For the damped ALF integrator with stepsize h, where σi is the i-th eigenvalue of the
+Jacobian d∂f, then the solver is A-Stabk i∕^∣1+ η(hσ 一
+1) ± ʌ∕η[2hσi + η(hσi - 1)2] ∣
+< 1, ∀i
+Proof is in Appendix A.4 and A.5. Theorem 3.2 implies the following: when η = 1, the damped
+ALF reduces to ALF, and the stability region is empty; when 0 < η < 1, the stability region is non-
+empty. However, stability describes the behaviour when T goes to infinity; in practice we always
+use a bounded T and ALF performs well. Inverse of damped ALF is in Appendix A.5.
+3.2 Memory-efficient ALF Integrator (MALI) for gradient estimation
+An ideal solver for Neural ODEs should achieve two goals: accuracy in gradient estimation and
+constant memory cost w.r.t integration time. Yet none of the existing methods can achieve both
+goals. We propose a method based on the ALF solver, which to our knowledge is the first method to
+achieve the two goals simultaneously.
+Algorithm 4: MALI to acheive accuracy at a constant memory cost w.r.t integration time
+Input Initial state z°, start time t°, end time T
+Forward
+Apply the numerical integration in Algo. 1, with the ψ function defined by Algo. 2.
+Delete computation graph on the fly, only keep end-time state (zNt , vNt )
+Keep accepted discretized time points {ti}iN=t0 (ignore process to search for optimal stepsize)
+Backward
+Initialize a(T)=❷？L)by Eq. 3, initialize 彩=0
+For i in {Nt, Nt - 1, ..., 2, 1}:
+Reconstruct (zi-1, vi-1) from (zi, vi) by Algo. 7
+Local forward (zi, vi,ti, hi) = ψ(zi-1,vi-1,ti-1, hi)
+Local backward, get d"zi-1：-1*) and "(zi-dθti-1')
+Update a(t) and / by Eq. 2 and Eq. 3 discretized at time points ti-ι and t
+Delete local computation graph
+Output the adjoint state a(t0) (gradient w.r.t input z°) and parameter gradient dL
+Procedure of MALI Details of MALI are summarized in Algo. 4. For the forward-pass, we only
+keep the end-time state (zNt , vNt ) and the accepted discretized time points (blue curves in Fig. 1
+and 2). We ignore the search process for optimal stepsize (green curve in Fig. 1 and 2), and delete
+other variables to save memory. During the backward pass, we can reconstruct the forward-time
+trajectory as in Eq. 5, then calculate the gradient by numerical discretization of Eq. 2 and Eq. 3.
+Constant memory cost w.r.t number of solver steps in integration We delete the computation
+graph and only keep the end-time state to save memory. The memory cost is Nz(Nf + 1), where
+5
+Published as a conference paper at ICLR 2021
+Iua-Pe"U- -lot山
+Amplitude of error in dl/dzo
+1.0
+0.8
+0.6
+0.4
+0.2
+0.0
+---MALI
+■■ ACA
+---Naive
+一Adjoint
+o.o
+MALI
+ACA
+Naive
+Adjoint
+Amplitude of error in dL∕dα
+20	22	24	26	28
+Integration Time
+Memory consumption
+(b) error in #.(C) memory cost.
+20	22	24	26	28
+Integration Time
+3 2 10
+9 9 9 9
+Figure 4: Comparison of error in gradient in Eq. 6. (a) error in ddL.
+>UE3UU<
+>UE3UU<
+
+Figure 5: Results on Cifar10. From left to right: (1) box plot of test accuracy (first 4 columns are Neural
+ODEs, last is ResNet); (2) test accuracy ±std v.s. training epoch for Neural ODE; (3) test accuracy ±std v.s.
+training time of 90 epochs for Neural ODE.
+NzNf is due to evaluating f (z, t) and is irreducible for all methods. Compared with the adjoint
+method, MALI only requires extra Nz memory to record vNt , and also has a constant memory cost
+w.r.t time step Nt. The memory cost is Nz (Nf + 1).
+Accuracy Our method guarantees the accuracy of reverse-time trajectory (e.g. blue curve in Fig. 2
+matches the blue curve in Fig. 1), because ALF is explicitly invertible for free-form f (see Algo. 7).
+Therefore, the gradient estimation in MALI is more accurate compared to the adjoint method.
+Computation cost Recall that on average it takes m steps to find an acceptable stepsize, whose
+error estimate is below tolerance. Therefore, the forward-pass with search process has computation
+burden Nz × Nf × Nt × m. Note that we only reconstruct and backprop through the accepted step
+and ignore the search process, hence it takes another Nz × Nf × Nt × 2 computation. The overall
+computation burden is NzNf × Nt × (m + 2) as in Table 1.
+Shallow computation graph Similar to ACA, MALI only backpropagates through the accepted
+step (blue curve in Fig. 2) and ignores the search process (green curve in Fig. 2), hence the depth of
+computation graph is Nf × Nt . The computation graph of MALI is much shallower than the naive
+method, hence is more robust to vanishing and exploding gradients (Pascanu et al., 2013).
+Summary The adjoint method suffers from inaccuracy in reverse-time trajectory, the naive method
+suffers from exploding or vanishing gradient caused by deep computation graph, and ACA finds a
+balance but the memory grows linearly with integration time. MALI achieves accuracy in reverse-
+time trajectory, constant memory w.r.t integration time, and a shallow computation graph.
+4	Experiments
+4.1	Validation on a toy example
+We compare the performance of different methods on a toy example, defined as
+L(z(T)) = z(T)2 s.t. z(0) = z0, dz(t)/dt = αz (t)	(6)
+The analytical solution is
+z(t) = zoeαt, L = z0e2αT, dL∕dz° = 2zoe2αT, dL/da = 2Tz2e2αT	(7)
+We plot the amplitude of error between numerical solution and analytical solution varying with T
+(integrated under the same error tolerance, rtol = 10-5, atol = 10-6) in Fig 4. ACA and MALI
+have similar errors, both outperforming other methods. We also plot the memory consumption for
+6
+Published as a conference paper at ICLR 2021
+Table 2: Top-1 test accuracy of Neural ODE and ResNet on ImageNet. Neural ODE is trained with MALI,
+and ResNet is trained as the original model; Neural ODE is tested using different solvers without retraining.
+	Fixed-stepsize solvers of various stepsizes						Adaptive-stepsize solver of various tolerances			
+	Stepsize	1	0.5	0.25	0.15	0.1	Tolerance	1.00E+00	1.00E-01	1.00E-02
+	MALI	42.33	66.4	69.59	70.17	69.94	-MALI-	-62.56	69.89	69.87
+Neural	Euler	21.94	61.25	67.38	68.69	70.02	Heun-Euler	68.48	69.87	69.88
+ODE	RK2	42.33	69	69.72	70.14	69.92	RK23	50.77	69.89	69.93
+	RK4	12.6	69.99	69.91	70.21	69.96	Dopri5	52.3	68.58	69.71
+ResNet		70.09										
+Table 3: Top-1 accuracy under FGSM attack. is the perturbation amplitude. For Neural ODE models, row
+names represent the solvers to derive the gradient for attack, and column names represent solvers for inference
+on the perturbed image.
+		e = 1/255				e =2/255			
+		MALI	Heun-Euler	RK23	Dopri5	MALI	Heun-Euler	RK23	Dopri5
+	MALI	14.69	14.72	14.77	15.71	10.38	10.46	10.62	10.62
+Neural	Heun-Euler	14.77	14.75	14.80	15.74	10.63	10.47	10.44	10.49
+ODE	RK23	14.82	14.77	14.79	15.69	10.78	10.53	10.48	10.56
+	Dopri5	14.82	14.78	14.79	15.15	10.76	10.49	10.48	10.51
+ResNet			13.02						957				
+different methods on a Neural ODE with the same input in Fig. 4. As the error tolerance decreases,
+the solver evaluates more steps, hence the naive method and ACA increase memory consumption,
+while MALI and the adjoint method have a constant memory cost. These results validate our analysis
+in Sec. 3.2 and Table 1, and shows MALI achieves accuracy at a constant memory cost.
+4.2	Image recognition with Neural ODE
+We validate MALI on image recognition tasks using Cifar10 and ImageNet datasets. Similar to
+Zhuang et al. (2020), we modify a ResNet18 into its corresponding Neural ODE: the forward func-
+tion is y = x + fθ(x) and y = x + R0T fθ(z)dt for the residual block and Neural ODE respectively,
+where the same fθ is shared. We compare MALI with the naive method, adjoint method and ACA.
+Results on Cifar10 Results of 5 independent runs on Cifar10 are summarized in Fig. 5. MALI
+achieves comparable accuracy to ACA, and both significantly outperform the naive and the adjoint
+method. Furthermore, the training speed of MALI is similar to ACA, and both are almost two times
+faster than the adjoint memthod, and three times faster than the naive method. This validates our
+analysis on accuracy and computation burden in Table 1.
+Accuracy on ImageNet Due to the heavy memory burden
+caused by large images, the naive method and ACA are unable
+to train a Neural ODE on ImageNet with 4 GPUs; only MALI
+and the adjoint method are feasible due to the constant mem-
+ory. We also compare the Neural ODE to a standard ResNet.
+As shown in Fig. 6, the accuracy of the Neural ODE trained
+with MALI closely follows ResNet, and significantly outper-
+forms the adjoint method (top-1 validation: 70% v.s. 63%).
+Invariance to discretization scheme A continuous model
+should be invariant to discretization schemes (e.g. different
+types of ODE solvers) as long as the discretization is suf-
+ficiently accurate. We test the Neural ODE using different
+solvers without re-training; since ResNet is often viewed as
+Figure 6: Top-1 accuracy on Ima-
+geNet validation dataset.
+a one-step Euler discretization of an ODE (Haber & Ruthotto, 2017), we perform similar exper-
+iments. As shown in Table 2, Neural ODE consistently achieves high accuracy (〜70%), while
+ResNet drops to random guessing (〜0.1%) because ReSNet as a one-step Euler discretization fails
+to be a meaningful dynamical system (Queiruga et al., 2020).
+Robustness to adversarial attack Hanshu et al. (2019) demonstrated that Neural ODE is more
+robust to adversarial attack than ResNet on small-scale datasets such as Cifar10. We validate this
+result on the large-scale ImageNet dataset. The top-1 accuracy of Neural ODE and ResNet under
+FGSM attack (Goodfellow et al., 2014) are summarized in Table 3. For Neural ODE, due to its
+invariance to discretization scheme, we derive the gradient for attack using a certain solver (row in
+7
+Published as a conference paper at ICLR 2021
+Table 4: Test MSE (×0.01) on Mujoco dataset (lower is better). Results Table 5: Test ACC on Speech
+marked with superscript numbers correspond to literature in the footnote.							Command Dataset	
+							Method	Accuracy (%)
+Percentage	RNN1	RNN-GRU1		Latent-ODE			Adjoint3	92.8 ± 0.4-
+of training data			AdjointI	Naive2	ACA2	MALI	SemiNorm3	92.9 ± 0.4
+10%	2.451	1972	0.471-	0.362	0.312	0.35	Naive	93.2 ± 0.2
+20%	1.711	1.421	0.441	0.302	0.272	0.27	ACA	93.2 ± 0.2
+50%	0.791	0.751	0.401	0.292	0.262	0.26	MALI	93.7 ± 0.3
+Table 3), and inference on the perturbed images using various solvers. For different combinations
+of solvers and perturbation amplitudes, Neural ODE consistently outperforms ResNet.
+Summary In image recognition tasks, we demonstrate Neural ODE is accurate, invariant to dis-
+cretization scheme, and more robust to adversarial attack than ResNet. Note that detailed explana-
+tion on the robustness of Neural ODE is out of the scope for this paper, but to our knowledge, MALI
+is the first method to enable training of Neural ODE on large datasets due to constant memory cost.
+4.3	Time-series modeling
+We apply MALI to latent-ODE (Rubanova et al., 2019) and Neural Controlled Differential Equation
+(Neural CDE) (Kidger et al., 2020a;b). Our experiment is based on the official implementation from
+the literature. We report the mean squared error (MSE) on the Mujoco test set in Table 4, which
+is generated from the “Hopper” model using DeepMind control suite (Tassa et al., 2018); for all
+experiments with different ratios of training data, MALI achieves similar MSE to ACA, and both
+outperform the adjoint and naive method. We report the test accuracy on the Speech Command
+dataset for Neural CDE in Table 5; MALI achieves a higher accuracy than competing methods.
+4.4	Continuous generative models
+We apply MALI on FFJORD (Grathwohl et al., 2018), a free-from continuous generative model,
+and compare with several variants in the literature (Finlay et al., 2020; Kidger et al., 2020a). Our
+experiment is based on the official implementaion of Finlay et al. (2020); for a fair comparison, we
+train with MALI, and test with the same solver as in the literature (Grathwohl et al., 2018; Finlay
+et al., 2020), the Dopri5 solver with rtol = atol = 10-5 from the torchdiffeq package (Chen et al.,
+2018). Bits per dim (BPD, lower is better) on validation set for various datasets are reported in
+Table 6. For continuous models, MALI consistently generates the lowest BPD, and outperforms the
+Vanilla FFJORD (trained with adjoint), RNODE (regularized FFJORD) and the SemiNorm Adjoint
+(Kidger et al., 2020a). Furthermore, FFJORD trained with MALI achieves comparable BPD to state-
+of-the-art discrete-layer flow models in the literature. Please see Sec. B.3 for generated samples.
+5	Related works
+Besides ALF, the symplectic integrator (Verlet, 1967; Yoshida, 1990) is also able to reconstruct tra-
+jectory accurately, yet it’s typically restricted to second order Hamiltonian systems (De Almeida,
+1990), and are unsuitable for general ODEs. Besides aforementioned methods, there are other meth-
+ods for gradient estimation such as interpolated adjoint (Daulbaev et al., 2020) and spectral method
+(Quaglino et al., 2019), yet the implementations are involved and not publicly available. Other works
+focus on the theoretical properties of Neural ODEs (Dupont et al., 2019; Tabuada & Gharesifard,
+2020; Massaroli et al., 2020). Neural ODE is recently applied to stochastic differential equation (Li
+et al., 2020), jump differential equation (Jia & Benson, 2019) and auto-regressive models (Wehenkel
+& Louppe, 2019).
+6	Conclusion
+Based on the asynchronous leapfrog integrator, we propose MALI to estimate the gradient for Neural
+ODEs. To our knowledge, our method is the first to achieve accuracy, fast speed and a constant
+memory cost. We provide comprehensive theoretical analysis on its properties. We validate MALI
+01. RubanovaetaL (2019); 2. Zhuang etal.(2020); 3. Kidger etal.(2020a); 4. Chen et al. (2018); 5. Finlay
+et al. (2020); 6. Dinh et al. (2016); 7. Behrmann et al. (2019); 8. Kingma & Dhariwal (2018); 9. Ho et al.
+(2019); 10. Chen et al. (2019)
+8
+Published as a conference paper at ICLR 2021
+Table 6: Bits per dim (BPD) of generative models, lower is better. Results marked with superscript numbers
+correspond to literature in the footnote.
+Dataset	Continuous Flow (FFJORD)				Discrete Flow				
+	Vanilla4	RNODE5	SemiNorm3	MALI	RealNVP6	i-ResNet7	Glow8	Flow++9	Residual Flow10
+MNIST	0.994	0.975	0.963	0.87	-1066-	1.057	1.058	-	0.9710
+CIFAR10	3.404	3.385	3.353	3.27	3.496	3.457	3.358	3.289	3.2810
+ImageNet64	-	3.835	-	3.71	3.986	-	3.818	-	3.7610
+with extensive experiments, and achieved new state-of-the-art results in various tasks, including
+image recognition, continuous generative modeling, and time-series modeling.
+7	Acknowledgement
+This research was funded by the National Institutes of Health (NINDS-R01NS035193)
+References
+Jens Behrmann, Will GrathWohL Ricky TQ Chen, David Duvenaud, and Jorn-Henrik Jacobsen.
+Invertible residual networks. In International Conference on Machine Learning, pp. 573-582,
+2019.
+Ricky TQ Chen, Yulia Rubanova, Jesse Bettencourt, and David K Duvenaud. Neural ordinary
+differential equations. In Advances in Neural Information Processing Systems, pp. 6571-6583,
+2018.
+Ricky TQ Chen, Jens Behrmann, David K Duvenaud, and Jorn-Henrik Jacobsen. Residual flows
+for invertible generative modeling. In Advances in Neural Information Processing Systems, pp.
+9916-9926, 2019.
+Talgat Daulbaev, Alexandr Katrutsa, Larisa Markeeva, Julia Gusak, Andrzej Cichocki, and Ivan
+Oseledets. Interpolated adjoint method for neural odes. arXiv preprint arXiv:2003.05271, 2020.
+Alfredo M Ozorio De Almeida. Hamiltonian systems: chaos and quantization. Cambridge Univer-
+sity Press, 1990.
+Laurent Dinh, Jascha Sohl-Dickstein, and Samy Bengio. Density estimation using real nvp. arXiv
+preprint arXiv:1605.08803, 2016.
+Emilien Dupont, Arnaud Doucet, and Yee Whye Teh. Augmented neural odes. In Advances in
+Neural Information Processing Systems, pp. 3140-3150, 2019.
+Chris Finlay, Jorn-Henrik Jacobsen, Levon Nurbekyan, and Adam M Oberman. How to train your
+neural ode: the world of jacobian and kinetic regularization. In International Conference on
+Machine Learning, 2020.
+Ian J Goodfellow, Jonathon Shlens, and Christian Szegedy. Explaining and harnessing adversarial
+examples. arXiv preprint arXiv:1412.6572, 2014.
+Will Grathwohl, Ricky TQ Chen, Jesse Bettencourt, Ilya Sutskever, and David Duvenaud. Ffjord:
+Free-form continuous dynamics for scalable reversible generative models. arXiv preprint
+arXiv:1810.01367, 2018.
+Eldad Haber and Lars Ruthotto. Stable architectures for deep neural networks. Inverse Problems,
+34(1):014004, 2017.
+YAN Hanshu, DU Jiawei, TAN Vincent, and FENG Jiashi. On robustness of neural ordinary differ-
+ential equations. In International Conference on Learning Representations, 2019.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recog-
+nition. In Proceedings of the IEEE conference on computer vision and pattern recognition, pp.
+770-778, 2016.
+9
+Published as a conference paper at ICLR 2021
+Jonathan Ho, Xi Chen, Aravind Srinivas, Yan Duan, and Pieter Abbeel. Flow++: Improving flow-
+based generative models with variational dequantization and architecture design. arXiv preprint
+arXiv:1902.00275, 2019.
+Junteng Jia and Austin R Benson. Neural jump stochastic differential equations. In Advances in
+Neural Information Processing Systems,pp. 9847-9858, 2019.
+Patrick Kidger, Ricky T. Q. Chen, and Terry Lyons. “Hey, that’s not an ODE”: Faster ODE Adjoints
+with 12 Lines of Code. arXiv:2009.09457, 2020a.
+Patrick Kidger, James Morrill, James Foster, and Terry Lyons. Neural controlled differential equa-
+tions for irregular time series. arXiv preprint arXiv:2005.08926, 2020b.
+Durk P Kingma and Prafulla Dhariwal. Glow: Generative flow with invertible 1x1 convolutions. In
+Advances in Neural Information Processing Systems, pp. 10215-10224, 2018.
+Xuechen Li, Ting-Kam Leonard Wong, Ricky TQ Chen, and David Duvenaud. Scalable gradients
+for stochastic differential equations. arXiv preprint arXiv:2001.01328, 2020.
+Kuang Liu. Train cifar10 with pytorch. 2017. URL https://github.com/kuangliu/
+pytorch-cifar.
+Yiping Lu, Aoxiao Zhong, Quanzheng Li, and Bin Dong. Beyond finite layer neural networks:
+Bridging deep architectures and numerical differential equations. In International Conference on
+Machine Learning, pp. 3276-3285. PMLR, 2018.
+Stefano Massaroli, Michael Poli, Jinkyoo Park, Atsushi Yamashita, and Hajime Asama. Dissecting
+neural odes. arXiv preprint arXiv:2002.08071, 2020.
+Ulrich Mutze. An asynchronous leapfrog method ii. arXiv preprint arXiv:1311.6602, 2013.
+Razvan Pascanu, Tomas Mikolov, and Yoshua Bengio. On the difficulty of training recurrent neural
+networks. In International conference on machine learning, pp. 1310-1318, 2013.
+Lev Semenovich Pontryagin. Mathematical theory of optimal processes. Routledge, 1962.
+Alessio QUaglino, Marco Gallieri, Jonathan Masci, and Jan Koutnlk. Snode: Spectral discretization
+of neural odes for system identification. arXiv preprint arXiv:1906.07038, 2019.
+Alejandro F Queiruga, N Benjamin Erichson, Dane Taylor, and Michael W Mahoney. Continuous-
+in-depth neural networks. arXiv preprint arXiv:2008.02389, 2020.
+Yulia Rubanova, Ricky TQ Chen, and David K Duvenaud. Latent ordinary differential equations
+for irregularly-sampled time series. In Advances in Neural Information Processing Systems, pp.
+5320-5330, 2019.
+Carl Runge. Uber die numeriSChe auflosung von differentialgleiChUngen. MathematiSche Annalen,
+46(2):167-178, 1895.
+Lars Ruthotto and Eldad Haber. Deep neural networks motivated by partial differential equations.
+Journal of Mathematical Imaging and Vision, pp. 1-13, 2019.
+Lars Ruthotto, Stanley J Osher, Wuchen Li, Levon Nurbekyan, and Samy Wu Fung. A machine
+learning framework for solving high-dimensional mean field game and mean field control prob-
+lems. Proceedings of the National Academy of Sciences, 117(17):9183-9193, 2020.
+Alvaro Sanchez-Gonzalez, Victor Bapst, Kyle Cranmer, and Peter Battaglia. Hamiltonian graph
+networks with ode integrators. arXiv preprint arXiv:1909.12790, 2019.
+John R Silvester. Determinants of block matrices. The Mathematical Gazette, 84(501):460-467,
+2000.
+Endre SUli and David F Mayers. An introduction to numerical analysis. Cambridge university press,
+2003.
+10
+Published as a conference paper at ICLR 2021
+Paulo Tabuada and Bahman Gharesifard. Universal approximation power of deep neural networks
+via nonlinear control theory. arXiv preprint arXiv:2007.06007, 2020.
+Yuval Tassa, Yotam Doron, Alistair Muldal, Tom Erez, Yazhe Li, Diego de Las Casas, David Bud-
+den, Abbas Abdolmaleki, Josh Merel, Andrew Lefrancq, et al. Deepmind control suite. arXiv
+preprint arXiv:1801.00690, 2018.
+Loup Verlet. Computer” experiments” on classical fluids. i. Thermodynamical properties of
+Lennard-Jones molecules. Physical review, 159(1):98, 1967.
+Gerhard Wanner and Ernst Hairer. Solving ordinary differential equations II. Springer Berlin Hei-
+delberg, 1996.
+Antoine Wehenkel and Gilles Louppe. Unconstrained monotonic neural networks. In Advances in
+Neural Information Processing Systems, pp. 1545-1555, 2019.
+E Weinan. A proposal on machine learning via dynamical systems. Communications in Mathematics
+and Statistics, 5(1):1-11, 2017.
+Haruo Yoshida. Construction of higher order symplectic integrators. Physics letters A, 150(5-7):
+262-268, 1990.
+Yaofeng Desmond Zhong, Biswadip Dey, and Amit Chakraborty. Symplectic ode-net: Learning
+hamiltonian dynamics with control. arXiv preprint arXiv:1909.12077, 2019.
+Juntang Zhuang, Nicha Dvornek, Xiaoxiao Li, Sekhar Tatikonda, Xenophon Papademetris, and
+James Duncan. Adaptive checkpoint adjoint method for gradient estimation in neural ode. Inter-
+national Conference on Machine Learning, 2020.
+11
+Published as a conference paper at ICLR 2021
+Contents (Appendix)
+A Theoretical properties of ALF integrator	13
+A.1 Algorithm of ALF ........................................................... 13
+A.2 Preliminaries .............................................................. 13
+A.3 Local truncation error of ALF .............................................. 13
+A.4	Stability analysis ........................................................ 15
+A.5	Damped ALF ................................................................ 16
+B	Experimental Details	18
+B.1	Image Recognition ......................................................... 18
+B.1.1	Experiment on Cifar10 .............................................. 18
+B.1.2	Experiments on ImageNet ............................................ 18
+B.2	Time series modeling ...................................................... 19
+B.3	Continuous generative models .............................................. 20
+B.3.1	Training details ................................................... 20
+B.3.2	Addtional results .................................................. 20
+B.4	Error in gradient estimation for toy examples when t < 1 .................. 20
+B.5	Results of damped MALI .................................................... 20
+12
+Published as a conference paper at ICLR 2021
+A Theoretical properties of ALF integrator
+A.1 Algorithm of ALF
+For the ease of reading, we write the algorithm for ψ in ALF below, which is the same as Algo. 2 in
+the main paper, but uses slightly different notations for the ease of analysis.
+Algorithm 1: Forward of ψ in ALF
+Input (zcin, vcin, sin, h) = (zb0, vb0, s0, h) where s0 is current time, zb0 and vb0 are correponding
+values at time s0 ; stepsize h.
+Forward
+Output
+s1	= s0 + h/2	(1)
+zb1	= zb0 +vb0 × h/2	(2)
+vb1	= f(zb1, s1)	(3)
+vb2	=vb1 + (vb1 —vb0)	(4)
+zb2	= zb1 +vb2 × h/2	(5)
+s2	= s1 + h/2	(6)
+vdout,	sout,h) = (⅞2,v⅞,s2,h)	
+For simplicity, we can re-write the forward of ALF as
+Z2	Z0 + hf(Z0 + 2V0, S0 + 2)
+v2-	_2f (zb + 2 vb0, so + 2)-企).
+Similarly, the inverse of ALF can be written as
+W-	zb - hf(z2 - 2v2, s2 - 2)
+00-	_2f (z2 — 2V, s2 — 2) - v2_
+A.2 Preliminaries
+For an ODE of the form
+* = f(z(t),t)
+We have:
+d2z(t) - d " W 八一∂f(z(t'),t') df(z(t),t)dz(t)
+~d^= = dtf (z(t),t) = ―∂t- + -∂z	dT
+For the ease of notation, we re-write Eq. 10 as
+d2z≡ = ft + fz f
+dt2
+(7)
+(8)
+(9)
+(10)
+(11)
+where ft and fz represents the partial derivative of f w.r.t t and z respectively.
+A.3 Local truncation error of ALF
+Theorem A.1 (Theorem 3.1 in the main paper). For a single step in ALF with stepsize h, the local
+truncation error of z is O(h3), and the local truncation errof ofv is O(h2).
+Proof. Under the same notation as Algo. 1, denote the ground-truth state of z andv starting from
+(zb0, s0) as ze andve respectively. Then the local truncation error is
+Lz = ze(s0 + h) — zb2, Lv = ve(s0 + h) —vb2	(12)
+13
+Published as a conference paper at ICLR 2021
+We estimate Lz and Lv in terms of polynomial of h.
+Under mild assumptions that f is smooth up to 2nd order almost everywhere (this is typically satis-
+fied with neural networks with bounded weights), hence Taylor expansion is meaningful for f . By
+Eq. 11, the Taylor expansion of ze around point (zb0, vb0, s0) is
+e(SO + h) = zb) + h— +	2j+ + O(h3)	(I 3)
+dt 2 dt2
+=zb0 + hf (z0, SO) + -2 (ft(Zb0, SO) + fz(zb0, SO)f(Z0, SO)) + O(h3)	(14)
+Next, we analyze accuracy of the numerical approximation. For simplicity, we directly analyze Eq. 7
+by performing Taylor Expansion on f .
+f(ZO + 2vO, so + 2) = f(zbO, SO) + 2ft(zbO, SO) +—20 fz(zO, SO) + O(h2)	(15)
+hh z2 = ZO + hf(zO + 2v0, sO + 2) Plug Eq. 14, Eq. 15 and E.q. 16 into the definition of Lz, we get	(16)
+Lz = ze(SO + h) - zb2
+=hzbO + hf (ζb0, So) + ^2 (ft(zbO, SO) + fz (zb0, So)f (ζb0, So))i
+-hzbO + h(f(ζb0, SO) + 2ft(zb0, SO) +------20fz(zb0, S0))i + O(h3)
+=^2fz(zb0, SO) (f(zb0, SO)- vbθ) + O(h3)
+(17)
+(18)
+(19)
+Therefore, if f(zbO, SO) -vbO is of order O(1), Lz is of order O(h2); if f(zbO, SO) -vbO is of order
+O(h) or smaller, then Lz is of order O(h3). Specifically, at the start time of integration, we have
+f(zbO, SO) -vbO = 0, by induction, Lz at end time is O(h3).
+Next we analyze the local truncation error inv, denoted as Lv. Denote the ground truth as ve(tO + h),
+we have
+e(S0 + h) = f(e(S0 + h), SO + h)	(20)
+=f(zb0, SO) + hft(zO, SO) + (Z(SO + h) - zbθ)fz(zb0, SO) + O(h2) QI)
+Next we analyze the error in the numerical approximation. Plug Eq. 15 into Eq. 7,
+Gb = 2f(ZO + 2vbO, so + 2) - vo	(22)
+=f(Z0, so) + (f(茄, so)-a)+ hft(Z0, so) + hVofz(Zo, so) + O(h2)	(23)
+From Eq. 14, Eq. 21 and Eq. 23, we have
+Lv = ve(SO + h) -vb2	(24)
+=(f(z), so)-而)+ (e(so + h) - (z0 + hGo))fz(茄, so) + O(h2)	(25)
+= (f(ZbO,SO) -vbO) +h(f(ZbO,SO) - vbO)fz(ZbO, SO) + O(h2)	(26)
+The last equation is derived by plugging in Eq. 14. Note that Eq. 26 holds for every single step
+forward in time, and at the start time of integration, we have f(ZbO, SO) -vbO = 0 due to our
+initialization as in Sec. 3.1 of the main paper. Therefore, by induction, Lv is of order O(h2 ) for
+consecutive steps.	□
+14
+Published as a conference paper at ICLR 2021
+A.4 Stability analysis
+Lemma A.1.1. For a matrix of the form
+shape, and CD = DC, then we have det
+A
+C
+A
+C
+B
+D
+B
+D
+, if A, B, C, D are square matrices of the same
+det(AD - BC)
+Proof. See (Silvester, 2000) for a detailed proof.	口
+Theorem A.2. For ALF integrator with stepsize h, if hσi is 0 or is imaginary with norm no larger
+than 1, where σ% is the i-th eigenvalue ofthe Jacobian df, then the SolVer is on the critical boundary
+of A-stability; otherwise, the solver is not A-stable.
+Proof. A solver is A-stable is equivalent to the eigenvalue of the numerical forward has a norm
+below 1. We calculate the eigenvalue of ψ below.
+For the function defined by Eq. 7, the Jacobian is
+「药	∂z⅛-∣	「I	卜 ∂f	h2 ∂f	-I
+∂zo	∂V0	I +	h∂Z	^2 ∂Z
+J=	=
+[鬻舞」12×∂∂z h翡-∣J
+We determine the eigenvalue of J by solving the equation
+h f + (I - λ)1
+det(J - λI) =
+2 X f
+∂z
+h2 f	]
+2 ∂z
+=0
+h∂f - (1 + λ)1,
+It’s trivial to check J satisfies conditions for Lemma A.1.1.Therefore, we have
+det(J - λi )=deth(hdZ+(1- λ)1 )(h∂Z- (ι+λ)1)- (hτdf )(2 ×
+det
+—2λh∂Z+(λ2—I)I i
+(27)
+(28)
+(29)
+(30)
+Suppose the eigen-decompostion of df can be written as
+σ1
+f =Λ	σ2
+∂z
+Λ-1
+σN
+Note that I = ΛIλ-1, hence we have
+σ1
+det(J — λI)
+det Λ
+— 2λh
+σ2
+σN
++ (λ2 — 1)I Λ-1
+N
+Y(λ2 — 2hσiλ —
+i=1
+1)
+(31)
+(32)
+(33)
+Hence the eigenvalues are
+λi± = hσi 土 Jh2 σ2 + 1	(34)
+A-Stability requires ∣λi± | ‹ 1, ∀i, and has no solution.
+The critical boundary is ∣λi± | = 1, the solution is: hσ% is 0 or on the imaginary line with norm no
+largerthan 1.	口
+15
+Published as a conference paper at ICLR 2021
+A.5 DAMPED ALF
+Algorithm 2: Forward of ψ in Damped ALF (η ∈ (0, 1] )
+Input (zcin, vcin, sin, h) = (zb0, vb0, s0, h) where s0 is current time, zb0 and vb0 are correponding
+values at time s0 ; stepsize h.
+Forward
+s-	s0 + h/2	(35)
+zb-	zb0 + vb0 × h/2	(36)
+vb-	f (zb- , s-)	(37)
+vb2	vb0 + 2η(vb- - vb0)	(38)
+zb2	zb- + vb2 × h/2	(39)
+s2	s- + h/2	(40)
+Output
+(zdout , vdout , sout , h) = (zb2 , vb2 , s2 , h)
+Algorithm 3: ψ-1 (Inverse of ψ) in Damped ALF (η ∈ (0, 1] )
+Input (zdout , vdout , sout , h) where sout is current time, zdout and vdout are corresponding values at
+sout, h is stepsize.
+Inverse
+	(zb2, vb2, s2, h) = (zdout, vdout, sout, h)	(41)
+	s- = s2 - h/2	(42)
+	zb- =z2 - vb2 × h/2	(43)
+	vb- = f (zb- , s- )	(44)
+	vb0 = (vb2 - 2ηvb- )/(1 - 2η)	(45)
+	zb0 =zb- - vb0 × h/2	(46)
+	s0 = s- - h/2	(47)
+Output	(zcin, vcin, sin, h) = (zb0, vb0, s0, h)	
+The main difference between ALF and Damped ALF is marked in blue in Algo. 2. In ALF, the
+update of vb2 is vb2 = (vb1 - vb0) + vb1 = 2(vb1 - vb0) + vb0 ; while in Damped ALF, the update is scaled
+by a factor η between 0 and 1, so the update is vb2 = 2η(vb1 - vb0) + vb0. When η = 1, Damped ALF
+reduces to ALF.
+Similar to Sec. A.1, we can write the forward as For simplicity, we can re-write the forward of ALF
+as
+~21	坊 + ηhf (坛 + 2V0, S0 + 2) + (1 - η)hv0
+-	v2-	_ 2ηf (Zb) + 2v0, so + 2) +(I - 2η)v0 _
+Similarly, the inverse of ALF can be written as
+-	Z)-	西-h-1--2ηv2 + hι⅛ηf(z - 2v2, s2- 2)
+-	v0-	-	-⅛ v2-1¾f ⑶-2 v2, s2- 2)	.
+(48)
+(49)
+Theorem A.3. For a single step in Damped ALF with stepsize h, the local truncation error ofz is
+O(h2), and the local truncation errof of v is O(h).
+16
+Published as a conference paper at ICLR 2021
+Proof. The proof is similar to Thm. A.3. By similar calculations using the Taylor Expansion in
+Eq. 15 and Eq. 14, we have
+Zb2 - z(so + h)
+=(I - η)hv0 + hηff (so, SO) + 2ft(S0, SO) +—2-fz(zb, SO)]
+-h[f (s0, SO) + 2ftzo, so + 2fz(sb, so)f(s0, SO)] + O(h2)
+=(1 - η)h(vO - f (SO, So)) + η--h2ft(茄, so)
++ ~2(ηvb) - f(zO, So))fz(zO, So) + O(h2)
+(50)
+(51)
+Using Eq. 21, Eq. 15 and Eq. 14, we have
+V - V = (1 - 2η)vbo + (2η - i)f (SO, so) + (1 - n)hft(zo, so)
++(S(SO + h)-坛-ηhvo)fz(坊, So) + O(h2)	(52)
+= (2η - 1)f(zbo, So) - zbo + (1 - η)hft(zbo, So)
++ ηhhf (zbo, So) - hvboifz(zbo, So) + O(h2)	(53)
+Note that when η = 1, Eq. 51 reduces to Eq. 19, and Eq. 53 reduces to Eq. 26. By initialization,
+we have |f(zbo, So) - vbo | = 0 at initial time, hence by induction, the local truncation error for z is
+O(h2); the local truncation error for V is O(h) when η < 1, and is O(h2) when η = 1.	□
+Theorem A.4 (Theorem 3.2 in the main paper). For Dampled ALF integrator with stepsize h,
+where σi is the i-th eigenvalue of the Jacobian d∂f, then the SolVer is A-Stable if ∣1 + η(hσ —
+1) ± Jη[2hσi + η(hσi - 1)2] ∣ < 1, ∀i.
+Proof. The Jacobian of the forward-pass ofa single step damped ALF is
+'I + ηh∂f (1 - η)hi + ηh∂f-
+J =	(54)
+L 2η∂f	ηh∂f + (1 - 2η)iJ
+when η = 1, J reduces to Eq. 27. We can determine the eigenvalue of J using similar techniques.
+Assume the eigenvalues for df are {σi}, then We have
+'(1 - λ)i + ηhf (1 - η)hi + ηh患-
+det(J - λI) = det	(55)
+一	2η ∂	ηh ∂ +(1 - 2η - λ)I.
+=det[((1 - λ)I + ηhd∂S)(ηh∣f^ + (1 - 2η - λ)I)
+-((1-n)hI+ηh21 )(2ηd∂s )i	(56)
+N	____________________
+= Y [1 + η(hσi - 1) ± Jη[2hσi + η(hσ, - 1)2] ]	(57)
+i=1
+when η < 1, it's easy to check that 11 + η(hσi -1) ± Jη[2hσi + η(hσi 一 1)2] ∣ < 1 has non-empty
+solutions for hσ.	□
+For a quick validation, we plot the region of A-stability on the imaginary plane for a single eigen-
+value in Fig. 1. As η increases, the area of stability decreases. When η = 1, the system is no-where
+A-stable, and the boundary for A-stability is on the imaginary axis [-i, i] where i is the imaginary
+unit.
+17
+Published as a conference paper at ICLR 2021
+Figure 1: Region of A-stability for eigenvalue on the imaginary plane for damped ALF. From left
+to right, the region of stability for η = 0.25, η = 0.7,η = 0.8 respectively. As η increases to 1, the
+area of stability region decreases.
+B Experimental Details
+B.1	Image Recognition
+B.1.1	Experiment on Cifar10
+We directly modify a ResNet18 into a Neural ODE, where the forward of a residual block (y =
+x + f (x)) and the forward of an ODE block (y = x + R0T f(z, t)dt where T = 1) share the same
+parameterization f , hence they have the same number of parameters. Our experiment is based on
+the official implementation by Zhuang et al. (2020) and an open-source repository (Liu, 2017).
+All models are trained with SGD optimizer for 90 epochs, with an initial learning rate of 0.01, and
+decayed by a factor of 10 at 30th epoch and 60th epoch respectively. Training scheme is the same
+for all models (ResNet, Neural ODE trained with adjoint, naive, ACA and MALI). For ACA, we
+follow the settings in (Zhuang et al., 2020) and use the official implementation torch工CA 1, and use
+a Heun-Euler solver with rtol = 10-1, atol = 10-2 during training. For MALI, we use an adaptive
+version and set rtol = 10-1 , atol = 10-2. For the naive and adjoint method, we use the default
+Dopri5 solver from the torchdiffeq1 2 package with rtol = atol = 10-5 . We train all models for 5
+independent runs, and report the mean and standard deviation across runs.
+B.1.2	Experiments on ImageNet
+Training scheme We conduct experiments on ImageNet with ResNet18 and Neural-ODE18. All
+models are trained on 4 GTX-1080Ti GPUs with a batchsize of 256. All models are trained for
+80 epochs, with an initial learning rate of 0.1, and decayed by a factor of 10 at 30th and 60th
+epoch. Note that due to the large size input 256 × 256, the naive method and ACA requires a huge
+memory, and is infeasible to train. MALI and the adjoint method requires a constant memory hence
+is suitable for large-scale experiments. For both MALI and the adjoint menthod, we use a fixed
+stepsize of 0.25, and integrates from 0 to T = 1. As shown in Table. 2 in the main paper, a stepsize
+of 0.25 is sufficiently small to train a meaningful continuous model that is robust to discretization
+scheme.
+Invariance to discretization scheme To test the influence of discretization scheme, we test our
+Neural ODE with different solvers without re-training. For fixed-stepsize solvers, we tested various
+step sizes including {0.1, 0.15, 0.25, 0.5, 1.0}; for adaptive solvers, we set rtol=0.1, atol=0.01 for
+MALI and Heun-Euler method, and set rtol = 10-2, atol = 10-3 for RK23 solver, and set rtol =
+10-4, atol = 10-5 for Dopri5 solver. As shown in Table. 2, Neural ODE trained with MALI is
+robust to discretization scheme, and MALI significantly outperforms the adjoint method in terms
+of accuracy (70% v.s. 63% top-1 accuracy on the validation dataset). An interesting finding is that
+when trained with MALI which is a second-order solver, and tested with higher-order solver (e.g.
+1https://github.com/juntang-zhuang/torch_ACA
+2https://github.com/rtqichen/torchdiffeq
+18
+Published as a conference paper at ICLR 2021
+Training ACC on ImageNet
+>UE⊃UU<
+ResNet
+----Neural ODE (MALI)
+Neural ODE (adjoint)
+20
+40
+Epoch
+(a)	Training curve on ImageNet.
+Test ACC on ImageNet
+Ooooo
+7 6 5 4 3
+0
+20
+40	60	80
+Epoch
+(b)	Validation curve on ImageNet.
+Figure 2:	Results on ImageNet.
+RK4), our Neural ODE achieves 70.21% top-1 accuracy, which is higher than both the same solver
+during training (MALI, 69.59% accuracy) and the ResNet18 (70.09% accuracy).
+Furthermore, many papers claim ResNet to be an approximation for an ODE (Lu et al., 2018).
+However, Queiruga et al. (2020) argues that many numerical discretizations fail to be meaningful
+dynamical systems, while our experiments demonstrate that our model is continuous hence invariant
+to discretization schemes.
+Adversarial robustness Besides the high accuracy and robustness to discretization scheme, an-
+other advantage of Neural ODE is the robustness to adversarial attack. The adversary robustness of
+Neural ODE is extensively studied in (Hanshu et al., 2019), but not only validated on small-scale
+datasets such as Cifar10. To our knowledge, our method is the first to enable effectuve training
+of Neural ODE on large-scale datasets such as ImageNet and achieve a high accuracy, and we are
+the first to validate the robustness of Neural ODE on ImageNet. We use the advertorch 3 toolbox
+to perform adversarial attack. We test the performance of ResNet and Neural ODE under FGSM
+attack. To be more convincing, we conduct experiment on the pretrained ResNet18 provided by the
+official PyTorch website 4. Since Neural ODE is invariant to discretization scheme, it’s possible to
+derive the gradient for attack using one ODE solver, and inference on the perturbed image using
+another solver. As summarized in Table. 3, Neural ODE consistently achieves a higher accuracy
+than ResNet under the same attack.
+B.2 Time series modeling
+We conduct experiments on Latent-ODE models (Rubanova et al., 2019) and Neural CDE (con-
+trolled differential equation) (Kidger et al., 2020a). For all experiments, we use the official imple-
+mentation, and only replace the solver with MALI. The latent-ODE model is trained on the Mujoco
+dataset processed with code provided by the official implementation, and we experiment with dif-
+ferent ratios (10%,20%,50%) of training data as described in (Rubanova et al., 2019). All models
+are trained for 300 epochs with Adamax optimizer, with an initial learning rate of 0.01 and scaled
+by 0.999 for each epoch. For the Neural CDE model, for the naive method, ACA and MALI, we
+perform 5 independent runs and report the mean value and standard deviation; results for the adjoint
+and seminorm adjoint are from (Kidger et al., 2020a). For Neural CDE, we use MALI with ALF
+solver with a fixed stepsize of 0.25, and train the model for 100 epochs with an initial learning rate
+of 0.004.
+3https://github.com/BorealisAI/advertorch
+4https://pytorch.org/docs/stable/torchvision/models.html
+19
+Published as a conference paper at ICLR 2021
+2 尸/ 535，7
+75'。Sq 2 9 I
+寸？7。。F⅛7{
+?2白^\IH /¾
+5bvJ9oqc;
+g"ΓJ73∕2/
+=?5 5 Sos 口 —
+？。⅛⅛ / 夕夕 4 a
+(a) Real samples from MNIST dataset.	(b) Generated samples from FFJORD.
+Figure 3:	Results on MNIST dataset.
+B.3 Continuous generative models
+B.3. 1 Training details
+Our experiment is based on the official implementation of (Finlay et al., 2020), with the only differ-
+ence in ODE solver. For a fair comparison, we only use MALI for training, and use Dopri5 solver
+from torchdiffeq package (Chen et al., 2018) with rtol = atol = 10-5. For MALI, we use adaptive
+ALF solver with rtol = 10-2, atol = 10-3, and use an initial stepsize of 0.25. Integration time is
+from 0 to 1.
+On MNIST and CIFAR dataset, we set the regularization coefficients for kinetic energy and Frobe-
+nius norm of the derivative function as 0.05. We train the model for 50 epochs with an initial learning
+rate of 0.001.
+B.3.2 Addtional results
+We show generated examples on MNIST dataset in Fig. 3, results for Cifar10 dataset in Fig. 4, and
+results for ImageNet64 in Fig. 5.
+B.4	ERROR IN GRADIENT ESTIMATION FOR TOY EXAMPLES WHEN t < 1
+We plot the error in gradient estimation for the toy example defined by Eq.6 in the main paper in
+Fig. 6. Note that the integration time T is set as smaller than 1, while the main paper is larger than
+20. We observe the same results, MALI and ACA generate smaller error than the adjoint and the
+naive method.
+B.5	Results of damped MALI
+For all experiments in the main paper, we set η = 1 and did not use damping. For completeness, we
+experimented with damped MALI using different values of η . As shown in Table. 7, MALI is robust
+to different η values.
+20
+Published as a conference paper at ICLR 2021
+(a) Real samples from CIFAR10 dataset.
+(b) Generated samples from FFJORD.
+Figure 4: Results on Cifar10 dataset.
+(a) Real samples from ImageNet64 dataset.
+(b) Generated samples from FFJORD.
+Figure 5: Results on ImageNet64 dataset.
+Table 7: Results of damped MALI with different η values. We report the test accuracy of Neural
+CDE on Speech Command dataset, and the test MSE of latent-ODE on Mujoco data.
+η		1.0	0.95	0.9	0.85
+Test Accuracy on Speech Commands (Higher is better)		93.7 ± 0.3	93.7 ± 0.1	93.5 ± 0.2	93.7 ± 0.3
+Test MSE of latent ODE	10% training data	0.35	0.36	0.33	0.33
+on Mujoco (Lower is better)	20% training data	0.27	0.25	0.26	0.27
+21
+Published as a conference paper at ICLR 2021
+Amplitude of error in dL/dzo
+4 2
+00
+C-山
+-°-8-6
+L00
+0.0
+0.2	0.4	0.6	0.8
+Integration Time
+(a) Error in the estimation of gradient w.r.t initial condi-
+tion.	(b) Error in the estimation of gradient w.r.t parameter α.
+Figure 6: Comparison of error in gradient estimation for the toy example by Eq.6 of the main paper,
+when t < 1.
+22

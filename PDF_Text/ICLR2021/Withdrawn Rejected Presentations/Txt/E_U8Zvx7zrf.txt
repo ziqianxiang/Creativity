@@ -1,0 +1,1799 @@
+Under review as a conference paper at ICLR 2021
+Delay-Tolerant Local SGD for Efficient Dis-
+tributed Training
+Anonymous authors
+Paper under double-blind review
+Ab stract
+The heavy communication for model synchronization is a major bottleneck for
+scaling up the distributed deep neural network training to many workers. More-
+over, model synchronization can suffer from long delays in scenarios such as fed-
+erated learning and geo-distributed training. Thus, it is crucial that the distributed
+training methods are both delay-tolerant AND communication-efficient. However,
+existing works cannot simultaneously address the communication delay and band-
+width constraint. To address this important and challenging problem, we propose
+a novel training framework OLCO3 to achieve delay tolerance with a low com-
+munication budget by using stale information. OLCO3 introduces novel staleness
+compensation and compression compensation to combat the influence of stale-
+ness and compression error. Theoretical analysis shows that OLCO3 achieves the
+same sub-linear convergence rate as the vanilla synchronous stochastic gradient
+descent (SGD) method. Extensive experiments on deep learning tasks verify the
+effectiveness of OLCO3 and its advantages over existing works.
+1	Introduction
+Data-parallel synchronous SGD is currently the workhorse algorithm for large-scale distributed deep
+learning tasks with many workers (e.g. GPUs), where each worker calculates the stochastic gradient
+on local data and synchronizes with the other workers in one training iteration (Goyal et al., 2017;
+You et al., 2017; Huo et al., 2020). However, high communication overheads make it inefficient
+to train large deep neural networks (DNNs) with a large number of workers. Generally speaking,
+the communication overheads come in two forms: 1) high communication delay due to the unstable
+network or a large number of communication hops, and 2) large communication budget caused
+by the large size of the DNN models with limited network bandwidth. Although communication
+delay is not a prominent problem for the data center environment, it can severely degrade training
+efficiency in practical scenarios, e.g. when the workers are geo-distributed or placed under different
+networks (Ethernet, cellular networks, Wi-Fi, etc.) in federated learning (Konecny et al., 2016).
+Existing works to address the communication inefficiency of synchronous SGD can be roughly clas-
+sified into three categories: 1) pipelining (Pipe-SGD (Li et al., 2018)); 2) gradient compression (Aji
+& Heafield, 2017; Stich et al., 2018; Alistarh et al., 2018; Yu et al., 2018; Vogels et al., 2019); and
+3) periodic averaging (also known as Local SGD) (Stich, 2019; Lin et al., 2018a). In pipelining, the
+model update uses stale information such that the next iteration does not wait for the synchroniza-
+tion of information in the current iteration to update the model. As the synchronization barrier is re-
+moved, pipelining can overlap computation with communication to achieve delay tolerance. Gradi-
+ent compression reduces the amount of data transferred in each iteration by condensing the gradient
+with a compressor C(∙). Representative methods include scalar quantization (Alistarh et al., 2017;
+Wen et al., 2017; Bernstein et al., 2018), gradient sparsification (Aji & Heafield, 2017; Stich et al.,
+2018; Alistarh et al., 2018), and vector quantization (Yu et al., 2018; Vogels et al., 2019). Periodic
+averaging reduces the frequency of communication by synchronizing the workers every p (larger
+than 1) iterations. Periodic averaging is also shown to be effective for federated learning (McMahan
+et al., 2017). In summary, exiting works handle the high communication delay with pipelining and
+use gradient compression and periodic averaging to reduce the communication budget. However,
+all existing methods fail to address both. It is also unclear how the three communication-efficient
+techniques introduced above can be used jointly without hurting the convergence of SGD.
+1
+Under review as a conference paper at ICLR 2021
+Table 1: Comparison of communication-efficient methods for distributed DNN training. The period
+p ∈ N+ is the communication interval for periodic averaging. The staleness s ∈ N is the number of
+communication rounds that the information used in the model update has been outdated for. For all
+methods in this table, delay tolerance T = sp.
+Methods	Overlap Comput. with Comm.	Comm. Compression	p Iterations per Comm. Round	Staleness s Supported
+Gradient Compression	× 一	√	=1	=0
+Periodic Averaging (Local SGD)	×	×	≥1	=0
+Pipelining (Pipe-SGD)	√	×	=1	≥1
+CoCoD-SGD	√	×	≥1	=1
+OverlapLocalSGD	√	×	≥1	=1
+OLCO3 (Ours)	√	√	≥1	≥1
+In this paper, We propose a novel framework Overlap Local Computation with Compressed
+Communication (i.e., OLCO3) to make distributed training both delay-tolerant AND Communi-
+cation efficient by enabling and improving the combination of the above three communication-
+efficient techniques. In Table 1, we compare OLCO3 with the aforementioned works and two
+succeeding state-of-the-art delay-tolerant methods CoCoD-SGD (Shen et al., 2019) and OverlapLo-
+calSGD (Wang et al., 2020). Under the periodic averaging framework, we usep to denote the num-
+ber of local SGD iterations per communication round, and s to denote the number of communication
+rounds that the information used in the model update has been outdated for. Let the computation
+time of one SGD iteration be Tcomput, then we can pipeline the communication and the computation
+when the communication delay time is less than Sp ∙ TcompUt. For simplicity, we define the delay
+tolerance of a method as T = sp. Local SGD has to use up-to-date information for the model update
+(s = 0,p ≥ 1, T = sp = 0). CoCoD-SGD and OverlapLocalSGD combine pipelining and periodic
+averaging by using stale results from last communication round (s = 1, p ≥ 1, T = sp = p), while
+our OLCO3 supports various staleness (s ≥ 1,p ≥ 1, T = sp) and all other features in Table 1. The
+main contributions of this paper are summarized as follows:
+•	We propose the novel OLCO3 method, which achieves extreme communication efficiency by
+addressing both the high communication delay and large communication budget issues.
+•	OLCO3 introduces novel staleness compensation and compression compensation techniques.
+Convergence analysis shows that OLCO3 achieves the same convergence rate as SGD.
+•	Extensive experiments on deep learning tasks show that OLCO3 significantly outperforms ex-
+isting delay-tolerant methods in both the communication efficiency and model accuracy.
+2	Backgrounds & Related Works
+SGD and Pipelining. In distributed training, we minimize the global loss function f (∙) =
+-K PK=I fk(∙), where f (∙) is the local loss function at worker k ∈ [K]. At iteration t,
+vanilla synchronous SGD updates the model xt ∈ Rd with learning rate ηt via xt+1 = xt -
+Kt PK=I VF1k(xt； ξ(k)), where ξ(k) is the stochastic sampling variable and XFk(xt； ξ(k)) is the
+corresponding stochastic gradient at worker k. Throughout this paper, we assume that the stochastic
+gradient is an unbiased estimator by default, i.e., Eξ(k) VFk(xt； ξt(k)) = Vfk (xt).
+Pipe-SGD (Li et al., 2018) parallelizes the communication and computation of SGD via pipelin-
+ing. At iteration t, worker k computes stochastic gradient VFk (xt； ξt(k)) at current model xt and
+communicates to get the averaged stochastic gradient -t PK=I VFk(xt； ξ(k)). Instead of waiting
+the communication to finish, Pipe-SGD concurrently updates the current model with stale averaged
+stochastic gradient via xt+1 = Xt — tt PK=I VFk(xt-s； ξ(-S). Note that Pipe-SGD is different
+from asynchronous SGD (Ho et al., 2013; Lian et al., 2015) which computes stochastic gradient us-
+ing stale model and does not parallelize the computation and communication ofa worker. A problem
+of Pipe-SGD is that its performance deteriorates severely under high communication delay (large s).
+2
+Under review as a conference paper at ICLR 2021
+Pipelining with Periodic Averaging. CoCoD-SGD (Shen et al., 2019) utilizes periodic averaging
+to reduce the number of communication rounds and parallelizes the local model update and global
+model averaging by concurrently conducting
+K	t+p-1
+Xt = κXχ(k) and χ(+)p = χ(k)- X ητVFk(XTk);ξTk)).	⑴
+k=1	τ=t
+in which χ(tk) denotes the local model at worker k as the local models on different workers are no
+longer consistent in non-communicating iterations. When the operations in Eq. (1) finishes, the local
+model is updated via x(+P J Xt + x(+P — Xtk) and t J t + p. CoCoD-SGD can tolerate delay UP to
+p SGD iterations (i.e., one communication round in periodic averaging). OverlapLocalSGD (Wang
+(k)
+et al., 2020) improves CoCoD-SGD by heuristically pulling Xt+p back to the Xt after the operations
+in Eq. (1) via Xt(+k)p J (1 - α)X(tk+)p + αXt where 0 ≤ α < 1. The motivation is to reduce the
+inconsistency in the local models across workers. OverlapLocalSGD also develops a momentum
+variant, which maintains a slow momentum buffer for Xt following SlowMo (Wang et al., 2019). As
+both CoCoD-SGD and OverlapLocalSGD communicates the non-compressed local model update,
+they suffer from a large communication budget in each communication round.
+Gradient Compression. The gradient vector v ∈ Rd can be sent with a much smaller communica-
+tion budget by applying a compressor C(∙). Specifically, Scalar quantization rounds 32-bit floating-
+point gradient components to low-precision values of only several bits. One important such algo-
+rithm is scaled SignSGD (called SignSGD in this paper) (Bernstein et al., 2018; Karimireddy et al.,
+2019) which uses C(V) = kvk1 Sign(V) to compress V to 1 bit. Gradient SParSifiCation only commu-
+nicates large gradient components. Vector quantization uses a codebook where each code is a vector
+and quantizes the gradient vector as a linear combination of the vector codes. With the local error
+feedback technique (Seide et al., 2014; Lin et al., 2018b; Wu et al., 2018; Karimireddy et al., 2019;
+Zheng et al., 2019), which adds the previous compression error (i.e., V - C(V)) to current gradient
+before compression, gradient compression can achieve comparable performance as full-precision
+training. Local error feedback also works for both one-way compression (compress the communi-
+cation from worker to sever) (Karimireddy et al., 2019) and two-way compression (compress the
+communication between worker and server) (Zheng et al., 2019).
+Challenges. Simultaneously achieving communication compression with pipelining and periodic
+averaging requires careful algorithm design because 1) pipelining introduces staleness, and 2) state-
+of-the-art vector quantization methods usually require an additional round of communication to
+solve the compressor C(∙), which is unfavorable in high communication delay scenarios.
+3	The Proposed Framework: OLCO3
+In this section, we will introduce our new delay-tolerant and communication-efficient training frame-
+work OLCO3. We discuss two variants of OLCO3: OLCO3-TC for two-way compression in master-
+slave communication mode, and OLCO3-VQ adopting commutative vector quantization for both the
+master-slave and ring all-reduce communication modes. Note that one-way compression in just a
+special case of OLCO3-TC and we omit it for conciseness. We use “line x” to refer to the x-th line
+of Algorithm 1. The key differences between OLCO3 -TC and OLCO3-VQ are marked in red color.
+3.1	OLCO3 -TC for Two-Way Compression
+MotiVation. OLCO3-TC is presented in the green part of Algorithm 1 for efficient master-slave
+distributed training. Naively pipelining local computation with compressed communication will
+break the update rule of momentum SGD for the averaged model Xt = PK=I x(k),leading to non-
+convergence. Therefore, We consider an auxiliary variable Xt := -K PK=I Xtk) - -K PK=I e(k) 一 et,
+where et(k) is the local compression error at worker k and et is the compression error at the server.
+If Xt can follow the update rule of momentum SGD, then the real trained model Xt will gradually
+approach Xt as the training converges because the gradient and errors e(k), et → 0.
+Pipelining. For non-communicating iterations, we perform the local update following Local SGD
+(line 4). A communicating iteration takes place every p iterations. To pipeline the communication
+3
+Under review as a conference paper at ICLR 2021
+Algorithm 1 Overlap Local Computation with Compressed Communication (OLCO3) on worker k ∈ [K]. Green part: OLCO3-TC; Yellow part: OLCO3-VQ. Best view in color.	
+1: 2:	Input: period P ≥ 1, staleness S ≥ 0, number of iterations T, number of workers K, learning rate {ηt}T=01, and compression scheme C(∙). Initialize: Local model X(0k) = X0, local error e(0k) = 0, server error e0 = 0, local momentum
+3: 4: 5: 6:	(k) buffer m0 ' = 0, and momentum constant 0 < μ < 1. Variables with negative subscripts are 0. fort = 0,1,∙∙∙ ,T — 1 do m(+)ι = μm(k) + NFk(x(k); ξ(k)), x(+)1 = x(k) — ntm，+、	//Momentum Local SGD. if (t + 1) mod p = 0 then Maintain or reset the momentum buffer.
+7: 8: 9:	△t+)i = Xtk)I-P — x(+\ + e(k)	// Compression compensation. e(+)ι = e(+)2 =…=e(+p = △(+)! 一 C(△(+)!)	//(Jonpressicm. Invoke the communication thread in parallel which does:
+10: 11:	(1)	Send C(∆(+)1) to and receive C(∆t+ι) from the server node. (2)	Server： △t+i = K1 P，1 C(△(+1) + et； et+1 = et+2 = … =et+p = △t+l 一 C(∆t+1). Block until C(^t+ι-sp) is ready. xt+1 = xt+1-p 一 C(△t+l-sp) xt+)i J xt+i — Ps-I C(^(+)i-ip)	//Staleness compensation.
+12: 13: 14:	
+15: 16:	△(+)i = Xtk)I-P — x(+)ι + e(-)sp	// Compression compensation. Invoke the communication thread in parallel which does:
+17: 18: 19: 20: 21:	(1)	et+)ι = e(+)2 =…=e(+)p = △(+) -C(△(+1)	//Compression. (2)	Average 去 PK=I CA+') by ring all-reduce or master-slave communication. Block until -K Pf=I C(N+)i-sp) and e(+)ι-sp is ready. xt+i = xt+1-p 一 K Pk=i C(NN-Sp) x(+)i — xt+i — Ps-I △((+i-ip	//Staleness compensation.
+22: 23: 24:	end if end for Output: averaged model XT = K PK=I XTk)
+and computation, we compress the local update ∆(tk+)1 (line 7) for efficient communication, and at
+the same time, try to update the model with a stale compressed global update C(∆t+1-sp) (line 13)
+that has been outdated for s communication rounds (i.e., the staleness is s). The momentum buffer
+can be maintained or reset to zero every p iteration (line 6). If the delay tolerance T = sp is larger
+than the actual communication delay, the blocking in line 12 becomes a no-op and there will be no
+synchronization barrier. The server compresses the sum of the compressed local updates from all
+workers (line 11) and sends it back, making OLCO3-TC an efficient two-way compression method.
+Compensation. To make the update of the auxiliary variable Xt follow momentum SGD, We propose
+to 1) compensate staleness with all compressed local updates with staleness ∈ [0, s - 1] (line 14),
+which requires no communication and allows less stale local update to affect the local model, and
+2) maintain a local error (line 8) and add it to the next local update before compression (line 7) to
+compensate the compression error. With the two compensation techniques in OLCO3-TC, Lemma 1
+shows that the update rule of Xt follows momentum SGD with averaged momentum K PK=I m(k).
+Lemma 1. For OLCO3-TC, let xt :=去 PK=I X(k) — ^k PK=I e(k) 一 et-sp, then we have Xt =
+xt-ι 一 ηK-1 PK=Immkk∙
+Note that there is a “gradient mismatch” problem as the local momentum mt(k) is computed at the
+(k)
+local model Xt)but used in the update rule of the auxiliary variable Xt (Kanmlreddy et al.,2019; XU
+et al., 2020). However, our analysis shows that it does not affect the convergence rate. We have also
+considered OLCO3 for one-way compression (i.e., OLCO3-OC) as a special case of OLCO3-TC. In
+4
+Under review as a conference paper at ICLR 2021
+OLCO3-OC, the compressor at the server side is identity function and the server error et is 0. For
+OLCO3-OC, the auxiliary variable Xt also follows momentum SGD as stated in Lemma 2.
+Lemma 2. For OLCO3-OC, let xt :=六 PK=I X(k) -六 PK=I e(k), then we have Xt = xt-ι -
+ηt-1 PK=1 m (k).
+We can see that the delay tolerance of both OLCO3-TC and OLCO3-OC are T = sp(s ≥ 1, p ≥ 1).
+They have a memory overhead of O(sd) for storing information with staleness ∈ [0, s - 1]. For
+most compression schemes such as SignSGD, the computation complexity of C(∙) is O(d).
+3.2 OLCO3 -VQ for Commutative Vector Quantization
+OLCO3-TC and OLCO3-OC work for compressed communication in the master-slave communi-
+cation paradigm. In contrast, OLCO3-VQ (the yellow part of Algorithm 1) works for both the
+master-slave and ring all-reduce communication paradigms. Ring all-reduce minimizes communi-
+cation congestion by shifting from centralized aggregation in master-slave communication (Yu et al.,
+2018). OLCO3 -VQ relies on a state-of-the-art vector quantization scheme, PowerSGD (Vogels et al.,
+2019), which satisfies commutability for compression, i.e., C(v1) + C(v2) = C(v1 + v2). However,
+directly using POWerSGD breaks the delay tolerance of OLCO3 as its compressor C(∙) needs commu-
+nication and introduces synchronization barriers. Specifically, PowerSGD invokes communication
+across all workers to compute a transformation matrix, which is used to project the local updates to
+the compressed form.
+Pipelining with Communication-Dependent Compressor. To make OLCO3-VQ delay-tolerant,
+we further propose a novel compression compensation technique with the stale local error (line
+15). This is in contrast to OLCO3-TC and OLCO3-OC, which use immediate compressed results
+to calculate the up-to-date local error. As this technique removes the dependency on immediate
+compressed results, we can move the whole compression and averaging process to the communica-
+tion thread (lines 17 and 18). For staleness compensation, OLCO3-VQ uses all uncompressed local
+updates with staleness ∈ [0, s - 1] instead of compressed local updates in OLCO3-TC. With the two
+compensation techniques, Lemma 3 shows that for OLCO3-VQ, the auxiliary variable Xt associated
+with the stale local error also follows the momentum SGD update rule.
+Lemma 3. ForOLCO3-VQ, let Xt := KK Pk=I xtk) - KK Pk=I e(??, then we have Xt = X 1—
+ηt-1 PK=1 m (k).
+4 Theoretical Results
+In this section, we provide the convergence results of the OLCO3 variants for both SGD and momen-
+tum SGD maintaining momentum (line 6 of Algorithm 1) with common assumptions. As OLCO3-
+OC is a special case of OLCO3-TC, we only analyze OLCO3-TC and OLCO3-VQ. The detailed
+proofs of Theorems 1, 2, 3, and 4 can be found in Appendix D, E, F, and G respectively. The de-
+tailed proofs of Lemma 1, 2, and 3 can be found in Appendix C. We use f to denote the optimal
+loss.
+Assumption 1. (L-Lipschitz Smoothness) Both the local (fk(∙))andglobal (f (∙) = -K Pk=I fk(∙))
+loss functions are L-smooth, i.e.,
+l∣Vf(X) - Vf(y)k2 ≤ LkX -y∣∣2,∀X,y ∈ Rd,	(2)
+kVfk (X X)-Vfk Cy )∣2 ≤ Lk X - y k2, ∀ ∈ [κ ], ∀X, y ∈ Rd.	(3)
+Assumption 2. (Local Bounded Variance) The local stochastic gradient VFk (X; ξ) has a bounded
+variance, i.e., Eξ〜Dk ∣∣VFk(X; ξ) - Vfk(X)∣2 ≤ σ2,∀k ∈ [K], ∀x ∈ Rd. Note that
+Eξ〜DkPFk(X； ξ) = Vfk(x).
+Assumption 3. (Bounded Variance across Workers) The L2 norm of the difference of the local and
+global full gradient is bounded, i.e., kVfk (X) - Vf (X)k22 ≤ κ2, ∀k ∈ [K], ∀X ∈ Rd. κ = 0 leads to
+i.i.d. data distributions across workers.
+Assumption 4. (Bounded Full Gradient) The second moment of the global full gradient is bounded,
+i.e., kVf(X)k22 ≤ G2,∀X ∈ Rd.
+Assumption 5. (Karimireddy et al., 2019) The compression function C(∙) : Rd → R is a δ-
+approximate compressor for 0 < δ ≤ 1 if for all v ∈ Rd, kC(v) - vk22 ≤ (1 - δ)kvk22.
+5
+Under review as a conference paper at ICLR 2021
+4.1 SGD
+Theorem 1.	For OLCO3-VQ with vanilla SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ min{ 6L(§+i)p, 9l}, then
+1 X EkVf (ɪ XX(k))k2 ≤ 6(f(x。； f*) + 9ηLσ2 + 12η2L2(s + 1)pσ2[1+	(4)
+T	K	ηT	K
+t=0	k=1	η
+14¾-^(s + 1)p]+ 36η2L2(s + 1)2p2κ2(1 + 5⅛^) + 168(IJ °)η2L2(s + 1)2p2G2 .
+δ2	δ2	δ2
+If We set the learning rate η = O(K2T- 1) and the communication interval P = O(K-3T 1 (s +
+1)-1), the convergence rate will be O(K- 1 T- 1). The O(K-2T-2) rate is the same as Syn-
+chronous SGD and Local SGD, and achieves linear speedup regarding the number of Workers K .
+Theorem 2.	For OLCO3-TC with vanilla SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+Iearning rate η ≤ min{ 6L(§+i)p, 9l} and let h(δ) = 1-δ (1 + 4(2-δ)), then
+TXEkVf(K Xx(k))k2 ≤ 6(f(X0T-f + 9ηKσ2	⑸
+t=0	k=1	η	(5)
++ 12η2pσ2(s + 1 + 80h(δ)p) + 12η2p2 κ2 (3(s + 1)2 + 80h(δ)) + 960η2p2 G2 h(δ) .
+If we set the learning rate η = O(K 1 T- 1) and the communication interval P = O(K-3T 1 (s +
+1)-1), the convergence rate will be O(K- 1 T-2). When the data distributions across workers are
+i.i.d. (i.e., K = 0), if we choose the learning rate η = O(K 1 T-2) and the communication interval
+p = min{O(K-3T 1 (s + 1)-1), O(K-3T4)} (p = O(K-4T4) for a enough large T) instead,
+the convergence rate will still be O(K-2T- 1).
+31
+Therefore, OLCO3-TC can tackle a larger communication interval P (O(K- 4 T4)) than OLCO3-
+VQ (O(K-3T 1 (s + 1)-1)) in the i.i.d. setting. But they are the same in the non-i.i.d. setting.
+4.2 Momentum SGD
+Theorem 3.	For OLCO3-VQ with Momentum SGD and under Assumptions 1, 2, 3, 4, 5, if the
+learning rate η ≤ min{ √72L-S+i)p，1-7} and 3 g(μ, δ, s,p) = (二产 + 60(1-%+""，then
+T-1	K
+T X EkVf(KK XX(k))k2 ≤
+t=0	k=1
+6(1 - μ)(f(x0) - f*)	9Lησ2
+ηT	+ (1 - μ)K
+(6)
++
+4η2 L2	2
+(1 - μ)2 [(4(s + 1)P + g(μ, δ, s,P))σ2
++ (12(s + 1)2P2 +g(μ,δ, s, P))κ2 + g(μ, δ, s,P)G2] .
+Theorem 4.	For OLCO3-TC with Momentum SGD and under Assumptions 1, 2, 3, 4, 5, if the
+learning rate η ≤ min{ √72L-S+1)p，⅛μ} and h(δ) = ⅛δ (1 + 4(2δ-δ)), then
+T-1	K
+T X EkVf (K X X tk))k2
+t=0	k=1
+≤
+6(1- μ)(f (X0)-储 +
+ηT	+
+9Lησ2	∣
+(1 - μ)K +
+(1η⅛ [σ2(o⅛ + 2(S + 1)P+168h(°)P2)
+99
++ κ2((1 - μ)2 + 6(s + 1)2P2 + 168h(δ)P2) + G2(^ - 从广 + 168h(δ)P2)] .	(7)
+The same convergence rate and communication interval P are achieved as in Section 4.1.
+6
+Under review as a conference paper at ICLR 2021
+Epoch
+ReSNet-IIO, ClFARTO
+Communication Budget (GB)
+Figure 1: Training curves using T = 56 and s = 1 for the delay-tolerant methods, and T = 0 and
+p = 56 for Local SGD. Test accuracy can be found in Appendix A.3. Best viewed in color.
+Communication Budget (GB)
+Delay Tolerance T
+94.0
+*∙5
+>93.0
+「2.5 +
+¥ 92.0
+g91.5
+8 91.0
+l- 90.5
+90.0」
+0
+ResNebJAO, QFARTO
++ Local SGD
+OLCO3-OC
+12345678
+Staleness s
+Figure 2: Left: Vary delay tolerance T = sp with staleness fixed at s = 1. Local SGD uses the
+same p as the delay-tolerant methods but has T = 0. Right: Vary staleness s with delay tolerance
+fixed at T = 56. Results for more configurations of s and p can be found in Appendix A.4.
+5	Experiments
+We compare the following methods: 1) Local SGD (baseline, NO delay tolerance with T = 0);
+2) Pipe-SGD; 3) CoCoD-SGD; 4) OverlapLocalSGD with hyperparameters following Wang et al.
+(2020); 5) OLCO3-OC with SignSGD compression; 6) OLCO3-VQ with PowerSGD compressoin;
+7) OLCO3-TC with SignSGD compression. The momentum buffer is maintained (line 6 of Algo-
+rithm 1) by default. We do not report the results of Pipe-SGD as it does not converge for the large
+delay tolerance T we experimented. We train ResNet-110 (He et al., 2016) with 8 workers for the
+CIFAR-10 (Krizhevsky et al., 2009) image classification task, and report the mean and standard
+deviation of the test accuracy over 3 runs in both the i.i.d. and non-i.i.d. setting. We also train
+ResNet-50 with 16 workers for the ImageNet (Russakovsky et al., 2015) image classification task.
+More detailed descriptions of the experiment configurations can be found in Appendix A.1.
+7
+Under review as a conference paper at ICLR 2021
+Table 2: Non-i.i.d. test accuracy (%) of ResNet-110 on CIFAR-10. T			= 56 for the delay-tolerant
+methods, and T = 0 and p =	56 for Local SGD. Training curves can be found in APPendix A.2.		
+Method	Delay Tolerance T	ComPression Ratio	ResNet110
+Local SGD	0	1	89.93 ± 0.08
+Pipe-SGD	56	1	Diverges
+CoCoD-SGD	56	1	87.73 ± 0.25
+OverlaPLoCalSGD	56		1	88.97 ± 0.19
+OLCO3-OC	56	1/2 + 1/32	89.75 ± 0.21
+OLCO3-VQ	56	0.0973	89.31 ± 0.08
+OLCO3-TC	56	1/32	89.73 ± 0.25
+Delay Tolerance with Lower Communication Budget. The training curves of ResNet-110 on
+CIFAR-10 and ResNet-50 on ImageNet are shown in Figure 1. We use s = 1 because CoCoD-SGD
+and OverlapLocalSGD do not support s ≥ 2. Compared with other delay-tolerant methods, the
+communication budget of the OLCO3 variants is significantly smaller due to compressed commu-
+nication. OLCO3 is also robust to communication delay with a large T = sp. Therefore, OLCO3
+features extreme communication efficiency with compressed communication, delay tolerance, and
+low communication frequency due to periodic averaging.
+Better Model Performance. The two plots in the first row of Figure 1 show that OLCO3-OC and
+OLCO3-TC outperforms other delay-tolerant methods and are comparable to Local SGD regarding
+the model accuracy. The performance of OLCO3 -VQ is similar to CoCoD-SGD but inferior to Over-
+lapLocalSGD. However, in the non-i.i.d. results reported in Table 2, all OLCO3 variants outperform
+existing delay-tolerant methods in accuracy. This is in line with the theoretical results in Theorems
+1, 2, 3, and 4, which show that OLCO3-TC can tackle a larger p than OLCO3-VQ in the i.i.d. setting
+but the two methods are similar in the non-i.i.d. setting. In the non-i.i.d. setting, all OLCO3 variants
+perform very close to Local SGD. On average, OLCO3-OC and OLCO3-TC improve the test accu-
+racy of CoCoD-SGD and OverlapLocalSGD by 2.0% and 0.8%, respectively. OLCO3-VQ improves
+CoCoD-SGD and OverlapLocalSGD by 1.6% and 0.4%. These results empirically confirm that the
+staleness compensation and compression compensation techniques in OLCO3 are effective.
+Varying Delay Tolerance. We vary the delay tolerance T with staleness fixed at s = 1 in the
+left plot of Figure 2. The goal is to check the robustness of OLCO3 to the different period p. The
+results show that OLCO3-OC and OLCO3-TC always outperform other delay-tolerant methods, and
+have more comparable performance to Local SGD. Note that both the OLCO3-OC and OLCO3-
+TC provide a significantly smaller communication budget according to Figure 1. OLCO3-VQ also
+outperforms CoCoD-SGD with a much smaller communication budget.
+Varying Staleness. We vary the staleness s of OLCO3 in the right plot of Figure 2 under fixed delay
+tolerance T. Local SGD only supports s = 0 with no delay tolerance, and CoCoD-SGD and Over-
+lapLocalSGD only support s = 1, so there is only one result for them in the figure. When increasing
+the staleness beyond 2 for OLCO3, the deterioration of the model performance is very small, es-
+pecially for OLCO3-VQ. This suggests that the staleness compensation techniques in OLCO3 are
+effective. The performance peaks at s = 2 because an appropriate staleness may introduce some
+noise that helps generalization. In comparison, we cannot tune staleness s for better performance in
+CoCoD-SGD and OverlapLocalSGD.
+6	Conclusion
+In this work, we proposed a new OLCO3 framework to achieve extreme communication efficiency
+with high delay tolerance and a low communication budget in distributed training. OLCO3 uses
+novel staleness compensation and compression compensation techniques, and the theoretical results
+show that it converges as fast as vanilla synchronous SGD. Experimental results show that OLCO3
+significantly outperforms existing delay-tolerant methods in terms of the communication budget and
+model performance.
+8
+Under review as a conference paper at ICLR 2021
+References
+Alham Fikri Aji and Kenneth Heafield. Sparse communication for distributed gradient descent.
+arXiv preprint arXiv:1704.05021, 2017.
+Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan Vojnovic. Qsgd:
+Communication-efficient sgd via gradient quantization and encoding. In Advances in Neural
+Information Processing Systems,pp. 1709-1720, 2017.
+Dan Alistarh, Torsten Hoefler, Mikael Johansson, Nikola Konstantinov, Sarit Khirirat, and Cedric
+Renggli. The convergence of sparsified gradient methods. In Advances in Neural Information
+Processing Systems, pp. 5973-5983, 2018.
+Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Animashree Anandkumar.
+signSGD: Compressed optimisation for non-convex problems. In Jennifer Dy and Andreas
+Krause (eds.), Proceedings of the 35th International Conference on Machine Learning, vol-
+Ume 80 of Proceedings of Machine Learning Research, pp. 560-569, Stockholmsmassan, Stock-
+holm Sweden, 10-15 Jul 2018. PMLR. URL http://proceedings.mlr.press/v80/
+bernstein18a.html.
+Priya Goyal, Piotr Dollar, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo Kyrola, An-
+drew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet
+in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recog-
+nition. In Proceedings of the IEEE conference on computer vision and pattern recognition, pp.
+770-778, 2016.
+Qirong Ho, James Cipar, Henggang Cui, Seunghak Lee, Jin Kyu Kim, Phillip B Gibbons, Garth A
+Gibson, Greg Ganger, and Eric P Xing. More effective distributed ml via a stale synchronous
+parallel parameter server. In Advances in neural information processing systems, pp. 1223-1231,
+2013.
+Zhouyuan Huo, Bin Gu, and Heng Huang. Large batch training does not need warmup. arXiv
+preprint arXiv:2002.01576, 2020.
+Sai Praneeth Karimireddy, Quentin Rebjock, Sebastian Stich, and Martin Jaggi. Error feedback
+fixes signsgd and other gradient compression schemes. In International Conference on Machine
+Learning, pp. 3252-3261, 2019.
+Jakub Konecny, H Brendan McMahan, Felix X Yu, Peter Richtarik, Ananda Theertha Suresh, and
+Dave Bacon. Federated learning: Strategies for improving communication efficiency. arXiv
+preprint arXiv:1610.05492, 2016.
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images.
+2009.
+Youjie Li, Mingchao Yu, Songze Li, Salman Avestimehr, Nam Sung Kim, and Alexander Schwing.
+Pipe-sgd: A decentralized pipelined sgd framework for distributed deep net training. In Advances
+in Neural Information Processing Systems, pp. 8045-8056, 2018.
+Xiangru Lian, Yijun Huang, Yuncheng Li, and Ji Liu. Asynchronous parallel stochastic gradient for
+nonconvex optimization. In Advances in Neural Information Processing Systems, pp. 2737-2745,
+2015.
+Tao Lin, Sebastian U Stich, Kumar Kshitij Patel, and Martin Jaggi. Don’t use large mini-batches,
+use local sgd. arXiv preprint arXiv:1808.07217, 2018a.
+Yujun Lin, Song Han, Huizi Mao, Yu Wang, and Bill Dally. Deep gradient compression: Reducing
+the communication bandwidth for distributed training. In International Conference on Learning
+Representations, 2018b. URL https://openreview.net/forum?id=SkhQHMW0W.
+Ilya Loshchilov and Frank Hutter. Sgdr: Stochastic gradient descent with warm restarts. arXiv
+preprint arXiv:1608.03983, 2016.
+9
+Under review as a conference paper at ICLR 2021
+Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Arcas.
+Communication-efficient learning of deep networks from decentralized data. In Artificial Intelli-
+gence and Statistics ,pp.1273-1282. PMLR, 2017.
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+performance deep learning library. In Advances in Neural Information Processing Systems, pp.
+8024-8035, 2019.
+Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng
+Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein, Alexander C. Berg, and Li Fei-Fei.
+ImageNet Large Scale Visual Recognition Challenge. International Journal of Computer Vision
+(IJCV), 115(3):211-252, 2015. doi: 10.1007/s11263-015-0816-y.
+Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its
+application to data-parallel distributed training of speech dnns. In Fifteenth Annual Conference of
+the International Speech Communication Association, 2014.
+Shuheng Shen, Linli Xu, Jingchang Liu, Xianfeng Liang, and Yifei Cheng. Faster distributed
+deep net training: Computation and communication decoupled stochastic gradient descent. arXiv
+preprint arXiv:1906.12043, 2019.
+Sebastian U. Stich. Local SGD converges fast and communicates little. In International Confer-
+ence on Learning Representations, 2019. URL https://openreview.net/forum?id=
+S1g2JnRcFX.
+Sebastian U Stich, Jean-Baptiste Cordonnier, and Martin Jaggi. Sparsified sgd with memory. In
+Advances in Neural Information Processing Systems, pp. 4447-4458, 2018.
+Thijs Vogels, Sai Praneeth Karimireddy, and Martin Jaggi. Powersgd: Practical low-rank gradient
+compression for distributed optimization. In Advances in Neural Information Processing Systems,
+pp. 14259-14268, 2019.
+Jianyu Wang, Vinayak Tantia, Nicolas Ballas, and Michael Rabbat. Slowmo: Improving
+communication-efficient distributed sgd with slow momentum. arXiv preprint arXiv:1910.00643,
+2019.
+Jianyu Wang, Hao Liang, and Gauri Joshi. Overlap local-sgd: An algorithmic approach to hide
+communication delays in distributed sgd. In ICASSP 2020-2020 IEEE International Conference
+on Acoustics, Speech and Signal Processing (ICASSP), pp. 8871-8875. IEEE, 2020.
+Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai Li. Terngrad:
+Ternary gradients to reduce communication in distributed deep learning. In Advances in neural
+information processing systems, pp. 1509-1519, 2017.
+Jiaxiang Wu, Weidong Huang, Junzhou Huang, and Tong Zhang. Error compensated quantized
+sgd and its applications to large-scale distributed optimization. arXiv preprint arXiv:1806.08054,
+2018.
+An Xu, Zhouyuan Huo, and Heng Huang. Training faster with compressed gradient. arXiv preprint
+arXiv:2008.05823, 2020.
+Yang You, Igor Gitman, and Boris Ginsburg. Scaling sgd batch size to 32k for imagenet training.
+arXiv preprint arXiv:1708.03888, 6, 2017.
+Mingchao Yu, Zhifeng Lin, Krishna Narra, Songze Li, Youjie Li, Nam Sung Kim, Alexan-
+der Schwing, Murali Annavaram, and Salman Avestimehr. Gradiveq: Vector quantization for
+bandwidth-efficient gradient aggregation in distributed cnn training. In Advances in Neural Infor-
+mation Processing Systems, pp. 5123-5133, 2018.
+Shuai Zheng, Ziyue Huang, and James Kwok. Communication-efficient distributed blockwise mo-
+mentum sgd with error-feedback. In Advances in Neural Information Processing Systems, pp.
+11446-11456, 2019.
+10
+Under review as a conference paper at ICLR 2021
+A Additional Experimental Results
+A.1 Experimental Setting
+All experiments are implemented with PyTorch (Paszke et al., 2019) and run on a cluster of Nvidia
+Tesla P40 GPUs. Each node is connected by 40Gbps Ethernet and equipped with 4 GPUs.
+CIFAR. We train the ResNet-110 (He et al., 2016) model with 8 workers on CIFAR-10 (Krizhevsky
+et al., 2009) image classification task. We report the mean and standard deviation metrics over 3
+runs. The base learning rate is 0.4 and the total batch size is 512. The momentum constant is 0.9
+and the weight decay is 1 × 10-4. The model is trained for 200 epochs with a learning rate decay of
+0.1 at epoch 100 and 150. We linearly warm up the learning rate from 0.05 to 0.4 in the beginning 5
+epochs. For OLCO3 with staleness s ∈ {2, 4, 8}, we set the base learning rate to 0.2 due to increased
+staleness. The rank of PowerSGD is 4. Random cropping, random flipping, and standardization are
+applied as data augmentation techniques. We also train ResNet-56 to explore more combinations of
+s and p in Appendix A.4 with the same other settings.
+ImageNet. We train the ResNet-50 model with 16 workers on ImageNet (Russakovsky et al., 2015)
+image classification tasks. The model is trained for 120 epochs with a cosine learning rate schedul-
+ing (Loshchilov & Hutter, 2016). The base learning rate is 0.4 and the total batch size is 2048. The
+momentum constant is 0.9 and the weight decay is 1 × 10-4. We linearly warm up the learning
+rate from 0.025 to 0.4 in the beginning 5 epochs. The rank of PowerSGD is 50. Random cropping,
+random flipping, and standardization are applied as data augmentation techniques.
+The Non-i.i.d. Setting. Similar to (Wang et al., 2020), we randomly choose fraction α of the whole
+data, sort the data by the class, and evenly assign them to all workers in order. For the rest fraction
+(1 - α) of the whole data, we randomly and evenly distribute them to all workers (Figure 3). When
+0 < α ≤ 1 is large, the data distribution across workers is non-i.i.d and highly skewed. When
+α = 0, it becomes i.i.d. data distribution across workers. In our non-i.i.d. experiments, we choose
+α = 0.8.
+Fraction=" Sorted by class.	FraCtion=1-α. RandOmly mixed
+Evenly divided to K workers.	and evenly divided to K workers.
+Class 1	Class 2	…	Class C
+WOrker 1	…	Worker K	Worker 1	…	Worker K
+Figure 3: Non-i.i.d. data partition across workers. Best viewed in color.
+11
+Under review as a conference paper at ICLR 2021
+A.2 Training Curve
+Epoch
+2.00
+1.75
+.1.50
+M
+Ifl
+° 1.25
+E 1.00
+aS 0.75
+L
+l~ 0.50
+0.25
+0°0.0	0.1	0.2	0.3	0.4	0.5	0.6	0.7
+Communication Budget (GB)
+4 3 3 2 2
+sso-j6u=".IJ.
+20	40	60	80	100	120
+Epoch
+ResNet-SOr ImageNet
+4 3 3 2 2
+Sg"! 6ll≡-,-.L
+10 20 30 40 50 60 70 80
+Communication Budget (GB)
+1 for the delay-tolerant methods, and T = 0 and
+Figure 4: Training curves using T = 56 and s
+p = 56 for Local SGD. Best viewed in color.
+ResNet-IlOr CIFAR-IO
+90
+g80
+«70
+u
+3
+u
+< 60
+ω
+l∙
+k 50
+Epoch
+Figure 5: Non-i.i.d. training curves using T = 56 and s = 1 for the delay-tolerant methods, and
+T = 0 and p = 56 for Local SGD. Best viewed in color.
+Communication Budget (GB)
+12
+Under review as a conference paper at ICLR 2021
+A.3 Test Accuracy
+Table 3: Test accuracy (%) of ResNet-110 on CIFAR-10 and ResNet-50 on ImageNet using T = 56
+for the delay-tolerant methods, and T = 0 and p = 56 for Local SGD. CR stands for compression
+ratio. For each method, the first row denotes maintaining momentum and the second row denotes
+resetting momentum (line 6).
+Method	Delay Tolerance T	CR	ResNet110	CR	ResNet-50
+Local SGD	0	1	92.67 ± 0.18	1	74.68
+			92.68 ± 0.21		74.76
+CoCoD-SGD	56	1	91.07 ± 0.14	1	70.52
+			90.84 ± 0.06		70.27
+OverlapLocalSGD	56	1	91.78 ± 0.21 91.45 ± 0.14	1	72.71 72.87
+OLCO3-OC	56	1/2 + 1/32	92.16 ± 0.10	1/2 + 1/32	73.36
+			92.48 ± 0.12		73.40
+	56		91.31 ± 0.08		70.38
+OLCO3-VQ		0.0973	91.05 ± 0.21	0.1633	70.32
+OLCO3-TC	56	1/32	92.15 ± 0.11	1/32	73.49
+			92.31 ± 0.10		73.47
+A.4 HYPERPARAMETERS s & p
+Again, Figure 6 empirically confirms the theoretical results in Theorems 1, 2, 3, and 4 that OLCO3-
+TC can handle a larger period p than OLCO3 and that this gap increases with the staleness s in the
+i.i.d. setting. Note that in the right plot of Figure 2, the gap between OLCO3-TC and OLCO3-VQ
+does not increase with s because the period p is decreasing (the delay tolerance T = sp is fixed).
+Figure 6: Vary delay tolerance T for ResNet-56 on CIFAR-10. We set p of Local SGD equivalent
+to T of other delay-tolerant methods. Left: s = 1 for the OLCO3 variants. Middle: s = 2 for the
+OLCO3 variants. Right: s = 4 for the OLCO3 variants.
+Table 4: Test accuracy (%) in Figure 6 by selecting the best configurations of s and p for the OLCO3
+variants. We set P of Local SGD equivalent to T of other delay-tolerant methods.
+Method	T=8	T =16	T=32	T=64	T= 128
+Local SGD	93.19 ± 0.24	92.98 ± 0.19	92.68 ± 0.15	92.25 ± 0.24	91.98 ± 0.19
+CoCoD-SGD	92.56 ± 0.08	92.10 ± 0.23	90.74 ± 0.14	90.63 ± 0.18	90.40 ± 0.11
+OverlapLocalSGD	92.89 ± 0.11	92.56 ± 0.17	92.22 ± 0.14	91.36 ± 0.23	90.81 ± 0.24
+OLCO3-OC	93.13 ± 0.02	92.76 ± 0.22	92.21 ± 0.06	92.00 ± 0.10	92.02 ± 0.07
+OLCO3-VQ	92.73 ± 0.12	92.11 ± 0.23	91.85 ± 0.12	91.30 ± 0.17	90.58 ± 0.21
+OLCO3-TC	93.09 ± 0.12	92.68 ± 0.21	92.61 ± 0.16	92.27 ± 0.20	91.74 ± 0.22
+13
+Under review as a conference paper at ICLR 2021
+B Assumptions
+Assumption 1. (L-Lipschitz Smoothness) Both the local (fk(∙))andglobal (f (∙) = -1 PK=I fk(∙))
+loss functions are L-smooth, i.e.,
+∣∣Vf(x) - Vf(y)k2 ≤ LkX -y∣∣2,∀XJ ∈ Rd,	(8)
+kVfk(X) -Vfk(y)∣2 ≤ Lkx -y|以 ∀k ∈ [K],∀x J ∈ Rd .	(9)
+Assumption 2. (Local Bounded Variance) The local stochastic gradient VFk (X; ξ) has a bounded
+variance, i.e.,
+Eξ〜DkkVFk(x;ξ) - Vfk(X)∣2 ≤ σ2,∀k ∈ [K],∀x ∈ Rd .	(10)
+Note that Eξ〜Dk VFk (X; ξ) = Vfk (X).
+Assumption 3. (Bounded Variance across Workers) The L2 norm of the difference of the local and
+global full gradient is bounded, i.e.,
+kVfk(X)-Vf(X)k22 ≤κ2,∀k∈ [K],∀X∈Rd,	(11)
+where κ = 0 leads to i.i.d. data distributions across workers.
+Assumption 4. (Bounded Full Gradient) The second moment of the global full gradient is bounded,
+i.e.,
+kVf(X)k22 ≤G2,∀X∈Rd.	(12)
+Assumption 5. (δ-approximate compressor) The compression function C(∙) : Rd → R is a δ-
+approximate compressor for 0 < δ ≤ 1 if for all v ∈ Rd,
+kC(v)-vk22 ≤(1-δ)kvk22.	(13)
+C Basic Lemmas
+Lemma 1. FOrOLCO3-TC,let Xt := -1 PK=I Xtk) — — PK=I e(k) 一 et-sp, then we have
+-
+ηt-1	(k)
+xt =Xt-ι	K 工mt .
+k=1
+(14)
+Proof. For t = np where n is some integer,
+1K	1K
+Xnp = K Σ>nk)- K Σ>nk)-e(n-s)p= Xnp
+k=1	k=1
+K s-1	K
+K XX Cg(n-i)p) - K X enp) - e(n-s)p
+—
+1 K s-1	1 K
+X(n-1)p - C (∆(n-s)p) - K X x Cg(n-i)p) - K X enp - e(n-s)p
+k=1
+s-1	1 K s-1
++ X Cθ(n-i-i)p)) -CO(n-s)p) - K XX C (屋(n-i)p
+i=0	k=1 i=0
+- e(n-s)p
+_1 X x(k)	_ _1 X δ(W) + ɪ X C ^(k)	) -C 3	、) - e,、
+K Z^x(nT)p	K 2^3np + K × C( (3(n-s)p) C(3(n-S)P)	e(n-S)P
+ɪ X X(k)
+K 乙X(n-i)ρ
+1
+- K E 3np - e(n-s)p-1
+k=1
+K
+£ X X(k)
+K 乙 X(n-1)p
+K	np-1	K
+1 XXn m(k)	1 X p(k)
+K	^	方mτ +1 - K 2^enp-1
+- e(n-S)p-1 = Xnp-1 -
+1K
+K 与 ηnp-Imnk)
+—
+(15)
+14
+Under review as a conference paper at ICLR 2021
+For t 6= np,
+KK	KK	K
+P —	1 X x(k)	1 X p(k)	P	—	1	X x(k)	1 X p(k)	P	τ ，	ηt-ι	X m(k)
+Xt =	κ I^Xt	-	κ 2^et	-et-sp	—	κ	2^xt -	κ 2^et-ι-	et-sp-1	= XI- ɪ	mtmt	.
+k=1	k=1	k=1	k=1	k=1
+(16)
+□
+Lemma2. ForOLCO3-OC,let Xt ：= κ1 PK=I X tk) — κ1 PK=I e (k) ,then wehave
+K
+Xt = Xt-1 — ηK1 Xm(k).	(17)
+k=1
+Proof. For t = np where n is some integer,
+Xnp
+1K
+上 X χ(k)
+K 乙 Xnp
+1K
+ɪ X e(k)
+K 乙 enp
+Xnp
+K s-1	K
+- K XX CQ(n-i)P)- K X enP
+k=1 i=0
+k=1
+—
+1K
+χ(n-i)p- K X Co(n-s)P)-
+k=1
+k=1 i=0
+k=1
+K
+K X(χ3)p
+k=1
+s-1
++ X C(∆((kn)-1-i
+i=0
+K s-1
+-K XXC
+k=1 i=0
+1K
+-K X enP)
+k=1
+K
+ɪ X x(k)
+K 乙x(n-Dp
+1K	1K
+K X C ZP- K X 端
+k=1
+k=1
+ɪ X卡
+K 乙x(n-i)p
+1K
+K X ∆n;
+k=1
+K
+L X x(k)
+K 乙x(n-Dp
+np
+-1
+Xnp-1 —
+K	np-	K
+K X	X	i-K X
+k=1τ=(n-1)p
+1K
+KEnnp-Imnk)
+e(k)
+enp-1
+k=1
+—
+—
+—
+〜
+K
+K
+(18)
+For t 6= np,
+K
+K X χ(k)
+k=1
+K
+K X e(k)
+k=1
+K
+K X χ(k)
+k=1
+K
+K X e("
+k=1
+χt-i -
+K
+ηt-1
+ɪ
+k=1
+)
+(19)
+—
+—
+□
+Lemma 3. For OLCO3-VQ, let X t ：=春 PK=I X (k) — 六 PK=I e t-)sp ,then we have
+(20)
+15
+Under review as a conference paper at ICLR 2021
+Proof. For t = np where n is some integer,
+xnp
+-1 XX χ(k)- -1 XT e(k) = = X - -1 XT X δ* 、- -1 XT e(k) 、
+K / n np K / ( e(n-s)p	np K / J (n— ʌʌ(n-i)p	K /( e(n-s)p
+x - - ɪ XX C(Nk)	)- _1 XX X1 δ^	- _1 XX e(k)
+x(nT)P K 乙 CQ(n-s)p) K 乙 Z^A(n-i)p K 乙 e(n-s)p
+K
+K X(χ3)p
+k=1
+s-1
++ X ∆((kn)-1-i)p)
+i=0
+K	K s-1
+K X cg(n-s)p)- K XX	(n-i)p
+k=1
+k=1 i=0
+ɪ X e(k)
+K	(n-s)p
+k=1
+K
+K X(χ3)p
+k=1
+s-1
++ X ∆((kn)-1-i)p)
+i=0
+K
+ɪ X ∆(k)
+K	(n-s)p
+k=1
+K s-1
+-ɪ xx∆(k)
+K	(n-i)p
+k=1 i=0
+_1 X x(k)
+K 乙 x(nT)p
+1K
+K X ∆n
+k=1
+K
+_1 X x(k)
+K 乙(n-1)p
+np
+-1
+Xnp-1 -
+K	np-	K
+K X X	ητmT+ι- K X
+k=1 τ =(n-1)p
+1K
+KEnnp-Imnk)
+e(k)
+enp-1-sp
+k=1
+(21)
+—
+—
+〜
+—
+—
+—
+K
+K
+For t 6= np,
+K
+K X婿
+k=1
+K
+ɪ X e(k)
+K 乙 et-sp
+K
+K X Xtk)
+k=1
+K
+K X e(-)i-sp =Xt-I
+k=1
+ηt-1
+ɪ
+k=1
+K
+(22)
+—
+—
+—
+□
+D Proof of Theorem 1
+Lemma 4. For OLCO3-VQ with vanilla SGD and under Assumptions 2, 3, 4, and 5, the local error
+satisfies
+Eketk)k2 ≤ 12(1 2 δ)p2n2(σ2 + K + G2).	(23)
+δ2
+Proof. First we have
+EkVF(x(k);ξ(k))k2 ≤ 3EkVF(x(k);ξ(k))-Vf®(x(k))k2 + 3EkVfk(Xtk))-Vf(X(k))k2+3E||Vf(x(k))k2
+≤ 3σ2 + 3κ2 + 3G2 .
+(24)
+Let St = b P C,
+Eket(k)k22 = Eke(Skt)pk22 = EkC(∆(Skt)p) - ∆(Skt)pk22 ≤ (1-δ)Ek∆(Skt)pk22
+Stp-1
+= (1 - δ)Ek	X	ηVF (Xt(0k); ξt(0k)) + e((kS)t-s-1)pk22
+t0=(St-1)p
+1 St p-1
+≤ (1 - δ)(1 + P)EIle(St-s-i)pk2 + (1 + δ)(1 + -)Ek	X	2("； ξ(k))k2
+ρ	t0=(St -1)p
+≤ (1 - δ)(1 + P)Eke(St-s-ι)pk2 + 3(1 + δ)(1 + ρ)p2n2(σ2 + κ2 + G2) .
+(25)
+16
+Under review as a conference paper at ICLR 2021
+Therefore,
+ι	b Sst c-1
+Eke(k)k2 ≤ 3(1- δ)(1 +-)p2η2(σ2 + κ2 + G2) X [(1 - δ)(1+ ρ)]i
+t 2	ρ	i=0
+≤
+3(1- δ)(1 + P)
+1 - (1 - δ)(1 + P)
+(26)
+p2η2(σ2+κ2+G2).
+Let P = 2(i-δ) SUchthat 1 + P = ⅛δ ≤ 2, then E∣∣e(k,∣∣2 ≤ 12(I-δ)p2η2(σ2 + κ2 + G2).	□
+Lemma 5. For OLCO3-VQ with vanilla SGD and under Assumptions 1, 2, 3, 4, and 5, if the learning
+rate η ≤ 6L(s+i)p, we have
+T-1 K-1
+KT XX EkM tτ (k)k2
+t=0 k=1
+≤ 3η2(s + 1)pσ2(1 + 12(1 ? ') (S + 1)p) + 9η2(s + 1)2p2κ2(1 + 4(1	'))
+δ2	δ2
++ 36¾=^η2(s + 1)2p2G2 .
+δ2
+(27)
+Proof. LetSt = [PC,
+K	K	K s-1	t-1
+1 X EIIv v(k)∣∣2 _ 1 X e∣∣ 1 X( X ∆∙k'0)	X „VF,, Mk0)∙A(k0)'ι'ι
+K 乙EkXt- xt k2 = K 乙EkK 乙(-Ld(StT)P-	NFk(Xt0 , ξt0	))
+k=1	k=1	k0=1	i=0	t0=Stp
+s-1	t-1	K
+(	X	∆	(k)	X	NFCγ(k).c(k)^	1	X	o(k0)	∣∣2
+-(-rd(St-i)p- X	ηVFk(χt0	； ξt0	)) - K	2_^	et-spk2
+i=0	t0=StP	k0=1
+K	K t-1	t-1
+=K X Ek--K X X	ηVFk0 (x(k0); ξ(k0))+	X	ηVFk(x(k); ξ(k))
+k=1	k0=1 t0=(St-s)P	t0=(St-s)P
+K	K	s-1	s-1
+_ ɪ	X	e(k0) _ 1	X	X e(k0)	+	X e(k)	∣∣2
+K	乙	et-sp	K	乙	乙 e(St-i-s-1)p +	乙 e(St-i-s-1)pk2
+k0=1	k0=1	i=0	i=0
+2 K	K t-1	t-1
+≤ -K X Ek-K X X	VFk0 (x(k0); ξ(k0))+	X	VFk(Xtk); ξ(k) )k2
+k=1	k0=1 t0=(St-s)P	t0=(St-s)P
+÷ 2 XEll 1 X e(k0)	1 X Xe(k0)	+Xe(k)	∣∣2
++ K 乙 Ek- K Let-Sp - K 乙 2^e(St-i-s-1)p + 2^e(St-i-s-1)pk2.
+k=1	k =1	k =1 i=0	i=0	(28)
+17
+Under review as a conference paper at ICLR 2021
+The first term is bounded by
+2 K	K t-1	t-1
+-ɪ XEk- KK X X	VFk0(x(k0);ξ(k0))+	X	NFk(Xtk);ξ(k))k2
+k=1	k0=1 t0=(St-s)p	t0=(St-s)p
+2 K	t-1	K
+< -η E	/	1	2F∕x(k0).广 (k0)∖	N A / fx(k0)'l'l -k fVF (x(k)∙ A(k)3 * sl V A fx(k)'l'l
+≤ ~K 乙 E 2 I - K 乙(VFkO (XtO ; ξt0 ) -VfkO (XtO	)) 十(VFk (Xt0 ；务0 ) -Vfk(Xt0 ))
+k=1	t0=(St-s)p	k0=1
+2 K	t-1	K
+十与 X Ek X (—K X VfkO(XD+ Vfk (X(k)))k2
+k=1	tO=(St-s)p	kO=1
+2
+2
+2 K	t-1	K
+=2K X X Ek- KK X (VFkO(X尸;营')) -VfkO(Xtk))) + (VFk(X(k);ξ(k)) -Vfk(X(k)))k2
+k=1 tO=(St-s)p	kO=1
+2 K	t-1	K
++ 与 XEk	X (-K X VfkOW)•) +Vfk(X(k)))k2
+k=1	tO=(St-s)p	kO=1
+2 K	t-1
+≤ K X X	EkVFk(X(k); ξ(k)) -Vfk(X(k))k2
+k=1 tO=(St-s)p
+- 2 K	t-1	1 K
+十 ɪ X	X	(t - (St	- s)P)Ek	- K X VfkO(x(k	)) 十 Vfk(x(k))k2
+k=1 tO=(St-s)p	kO=1
+≤ -η2(s + 1)Pσ2 + -η (K—	X XEk- K X VfkO(XtkO)) + Vfk(X(k))k2,
+tO=t-(s+1)p k=1	kO=1
+(29)
+where the third inequality follows K PK=I kK PK=I a，k — akk2 = K PK=1 kakk2 -
+k⅛∙ PK=I akk2 ≤ K PK=Ikakk2, and
+1K 1K
+K XEk- K X VfkO(XkO) + Vfk(Xtk))k2
+k=1	kO=1
+3K	1K
+=K ∑E[kVfk(X(k)) - Vfk(Xt)k2 + kVfk(Xt) - Vf(Xt)k2 十 kVf(Xt) - K E VfkO(Xk')k2]
+k=1	kO=1
+3K	1K	O
+≤ K £E[L2kXt -Xtk)k2 + κ2 + K E kVfkO(Xt) - VfkO(Xk )k2]
+k=1	kO=1
+2K
+≤ ~F7~ X EkXt - Xt k2 + 3κ .
+K
+k=1
+(30)
+18
+Under review as a conference paper at ICLR 2021
+The second term is bounded by
+2 XX Ell 1 XX e(k0)	1 XX XeW)	I Xe(k)	∣∣2
+K 乙Ek- κ	et-sp- K	2^e(St-i-s-i)p+ l^e(St-i-s-i)pk2
+K	K	1 K	K s-1	s-1
+≤ 2(1+s) X Ek ɪ X e(k0) )k2 + 2(1 + s) X Ek-ɪ XX e(k0) ,	1, + X e(k) ,	1, k2
+K	K	(St-s)p 2	K	K	(St-i-s-1)p	(St-i-s-1)p 2
+k=1 k0 =1	k=1	k0 =1 i=0	i=0
+≤ 2(1 + S) XX Eke(k)	k2 + 2(1 + 1) XX Ek sX1 e(k∙)	∣∣2
+≤ K 2 Eke(St-s)pk2 + K	乙 Ek 乙 e(St-i-s-1)pk2
+k=1	k=1 i=0
+≤ 2(I + S) XX Eke(k)	k2 I 2(I + S) X X1 Eke(k)	k2
+≤ K 2 Eke(St-s)pk2 十 K	乙乙 Eke(St-i-s-1)pk2
+k=1	k=1 i=0
+Ks
+=2(K1) ∑∑Eke(St-i-s)pk2 ≤ 24V2(S + 1)2p2η2(σ2 + KK + G2),
+k=1 i=0
+(31)
+where the last inequality follows Lemma 4. Combine the bounds of the first term and the second
+term, we have
+K
+K X Ekxt-Xt k2
+k=1
+t-1	2 K
+≤ 2η2(s + 1)pσ2 + 2η2(s + 1)p X	(-K X Ekxt-X(k)k2+ 3κ2)
++ 24(1δ- δ) (s +1)2p2η2(σ2 + K2 + G2)
+≤ 2η2(s + 1)pσ2(1 + 12(1 ? ')(s + 1)p) + 6η2(s + 1)2p2κ2(1 + 4(1	')) + 24(1 ? ')η2(s + 1)2p2G2
+δ2	δ2	δ2
+t-1	K
++ 12η2L2(s + 1)P	X	K XEkXt-Xtk)k2.
+t0 =t-(s+1)p	k=1
+(32)
+Sum the above inequality from t = 0 to t = T - 1 and divide it by T ,
+T-1 K-1
+KT XX EkXt-X(k)k2
+t=0 k=1
+≤ 2η2(s + 1)pσ2(1 + 12(1 ? ')(s + 1)p) + 6η2(s + 1)2p2κ2(1 + 4(1	')) + 24(1 ? ')η2(s + 1)2p2G2
+δ2	δ2	δ2
+T-1 K-1
++ 12η2L2(S + 1)2p2 ∙ KT XX EkXt-X(k)k2 .
+t=0 k=1
+(33)
+Therefore,
+T-1 K-1
+KT XX EkXt-X(k)k2
+t=0 k=1
+2η2(S + 1)pσ2(1 + 12(1-δ) (s + 1)p) + 6η2(s + 1)2p2κ2(1 + 4(；-δ)) + 24(1-δ)η2(S + 1)2p2G2
+-	1 - 12η2L2(S + 1)2p2	.
+(34)
+19
+Under review as a conference paper at ICLR 2021
+If we choose η ≤
+1
+6L(s + 1)p,
+T-1 K-1
+KT XX Ekxt-x(k)k2
+t=0 k=1
+≤ 3η2(s + 1)pσ2(1 + 12(I2，)(S + 1)p) + 9η2(s + 1)2p2κ2(1 + 4(I ')) + 36(I2	η2(s + 1)2p2G2 .
+δ2	δ2	δ2
+(35)
+□
+Theorem 1. For OLCO3-VQ with vanilla SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ min{ 6L(s；i)p, 9L}, then
+T X EkVf (KK XXtk))k2 ≤ 6(f(xθT-f + 9ηKσ2 + 12η2L2(s + 1)pσ2(1 +	(S + 1)p)
+t=0	k=1	η
++ 36η2L2(s + 1)2p2κ2(1 + 51/) + 168(IJ δ)η2L2(s + 1)2p2G2 .
+(36)
+Proof. According to Assumption 1,
+Etf(Xt+ι) - f(xt) ≤ EthVf(Xt),xt+ι - xti + LEtkxt+1 - xtk2
+K	2K
+=-ηhVf(xt), K X Vfk(Xtk))i + LrEtkK X VFk(x(k);ξ(k))k2.
+k=1	k=1
+(37)
+For the first term,
+1K	1 K
+-hVf(Xt), K EVfk (x(k))i = -kVf(Xt )k2-Ef (Xt), K E(Vfk(Xtk))- Vfk (Xt))i
+k=1	k=1
+1	11K
+≤ - 2 kVf (Xt)k2 + 2 k KfCVfk (X(k)) - Vfk(Xt))k2
+k=1
+(38)
+2K
+≤-2 kVf(Xt)k2 + 2K X |氏一£，12,
+k=1
+where the first equality follows that Vf (Xt)=六 PK=I Vfk (Xt). For the second term,
+K
+Etk K X VFk(Xtk)； ξ(k))k2
+k=1
+1K	1K
+=EtkK■ £( VFk (X(k); ξ(k)) - Vfk (Xtk))) + K E(Vfk(Xtk))- Vfk (Xt)) + Vf (Xt)k2
+k=1	k=1
+1K	1K
+≤ 3EtkNE(VFk(X(k);ξ(k)) -Vfk(X(k)))k2 + 3kK∙E(Vfk(X(k)) -Vfk(Xt))k2 +3kVf(Xt)k2
+k=1	k=1
+≤ ~τ~+ ~τ~X llXt -X(k)k2 + 3kVf(Xt)II2.
+KK
+k=1
+(39)
+Combine them and we have
+Et(Xt+1)- f (Xt) ≤ - 2(1 - 3ηL)kVf(Xt) k2 + η2-(1 + 3ηL) K X IlXt- Xtk)k2 + ηK—.
+k=1
+(40)
+20
+Under review as a conference paper at ICLR 2021
+If we choose η ≤ 9L,
+Et(Xt+ι) - f (Xt) ≤ -ηkVf (Xt)k2 + 2ηL2ɪ XX kXt - Xtk)k2 + 3η2Lσ2 .	(41)
+3	3 K	2K
+k=1
+Then for the averaged parameters K PK=I x(k),
+K
+kvf(斤 Xχtk))k2 ≤
+K
+k=1
+1K
+2kvf (诃 ∑χ(k)) - Vf(Xt)k2 + 2kVf (Xt)k2
+K
+k=1
+1 K	2L2 K
+≤ 2L2kN Xe(-)spk2 +2kVf (Xt)k2 ≤ Ir X |禺-幻|2+2|~/国)||2
+k=1	k=1
+<6[f(Xt)-	Etf (Xt+1)]	9ηLσ2	4L2	XX	底	(k)∣∣2 ,	2L2	Xlle(k)	l∣2
+≤--------η----------+-k~+ɪ 工 kXt- Xt k2+ɪ 工 ket-spk2.
+k=1	k=1 (42)
+Take total expectation, sum from t = 0 to t = T -1, and rearrange,
+T-1	K
+T X EkVf (K X Xtk) )k2
+t=0	k=1
+≤ 6[f (Xo) :ZEf(XT)] +9ηKσ2 + 2L2 ∑ XEke(-)spk2 + KLT x XEkXt-Xtk)k2
+η	t=0 k=1	t=0 k=1
+≤ 6[f(XO) ;Ef(XT1 + 9ηLσ2 + 2⅛0*Lyσ + κ + g?)
+ηT	K	δ2
++ 12η2L2(s + 1)pσ2(1 + 12(1 2 δ) (S + 1)p) + 36η2L2(s + 1)2p2κ2(1 + 4(1 '))
+δ2	δ2
++ 144(12-J) η2L2 (s + 1)2p2G2
+δ2
+≤ fX⅛f) + 中 + 12η2L2(s + 1)pσ2(1 + ) (S + 1)p)
+ηT	K	δ2
++ 36η2L2(s + 1)2p2κ2(1 + 5⅛^)) + 竺8J η2L2 (S + 1)2p2G2 ,
+δ2	δ2
+(43)
+where the second inequality follows Lemma 4 and 5.
+□
+E	Proof of Theorem 2
+Lemma 6. For OLCO3-TC with vanilla SGD and under Assumptions 2, 3, 4, and 5, the local error
+satisfies
+Eketk)k2 ≤ 1⅛0P2η2(σ2 + K + G2).	(44)
+δ2
+Proof. Same as the proof of Lemma 4, except that e(S)-S-^ is replaced with e(S)_]2.	□
+Lemma 7. For OLCO3-TC with vanilla SGD and under Assumptions 2, 3, 4, and 5, the server error
+satisfies
+Eketk2 ≤ W-;(I- °)p2η2(σ2 + K + G2).	(45)
+21
+Under review as a conference paper at ICLR 2021
+Proof. LetSt = [PC,
+K	KK	K
+EkL	XC(∆(k) )k2 ≤ 2Ekɪ	XC(∆(k))	- -1	X ∆(k) k2	+ 2Ekɪ X∆(k) k2
+11 K S↑' StpJ ∣∣2 — Il K JkjStp/ K	乙 StP112	1	11 K	StP112
+k=1	k=1	k=1	k=1
+V 2 X λ ιp∣∣ f7/\(k)、	/\(k) ∣∣2 _1_ 2 X λ KI |/\(k)||2	/46、
+≤ K 乙EkC(ΛStP) - ∆StPk2 + K 乙EkAstpg	(46)
+k=1	k=1
+≤ 2⅛δ2 X Ek∆SktPk2.
+k=1
+Following the proof ofLemma 4 we have Ek∆SkP∣∣2 ≤ ]_(：-+)PLP) p2η2(σ2+κ2 +G2). Therefore,
+1K
+EketlI2 = EkeStPk2 ≤ (1 - δ)E∣∣K £。。霁)+ e(St-i)pk2
+k=1
+1	1K
+≤ (1 - δ)(1 + 一)EkK Ec(∆StP)k2 + (1 - δ)(1 + P)Eke(St-I)pk2
+ρ	K k=1
+11K
+≤ 2(2 - δ)(1 - δ)(1 + P)K MEk∆StP∣∣2 + (1 - δ)(1+ P)Eke(St-1)Pk22
+≤ 2(2 - δ)(1 - δ)(1 + -)~∖	∩^~4pJ∣、p2η2(σ2 + κ + G2) + (1 - δ)(1 + P)Eke(St-i)Pk2
+P 1 - (1 - δ)(1 + P)	t 2
+6(2- δ)(1- δ)(1 + P)2 2 2	2 厘、
+≤ [1 -(1 - δ)(1 + P)]2 P η (σ + K + G ).
+(47)
+Let P = 2(i-δ) such that 1 + ɪ = 2-δ ≤ δ ,then E∣∣e(k)k2 ≤ 耿2-*…)p2η2 (σ2 + K2 + G2). □
+Lemma 8. For OLCO3-TC with vanilla SGD and under Assumptions 1, 2, 3, 4, and 5, if the learning
+rate η ≤ 6l(s∖)p and let h(δ) = 1-δ(1 + 4(；-δ)), we have
+T-1 K-1
+X X EkXt — x(k)k2 ≤ 3η2pσ2(s +1 + 72h(δ)p) + 9η2p2κ2((s + 1)2 + 24h(δ)) + 216h(δ)η2p2G2 .
+KT
+t=0 k=1
+(48)
+Proof. LetSt = [PC,
+K	K	K s-1	t-1
+1 X E∣∣⅜	√k)∣∣2 _ 1 X Ell 1 X( X C (∆k0)	∖ X nVF,, Mk0)∙√k0)'l'l
+K乙EkXt-χt k2 = K乙EkK 2^(-2^cQ(St-i)P) -	ηvFk0(Xt0 ；ξt0 ))
+k=1	k=1	k0=1	i=0	t0=StP
+s-1	t-1	K
+-(- X。。(St-i)P) - X N Fk (X(Ok)； ξ(0k))) - K X etk )-et-SPk2，
+i=0	t0=StP	k0=1
+(49)
+where
+s-1	s-1	s-1 (St -i)P-1
+XC(∆(k)	) = X[∆(k)	- e(k)	] = X[ X	闪鼠(χ(k)∙ ξ(k))+ e(k)	- e(k)]
+乙 CQ(St-i)P)= ZJδ(ST)p e(St-i)P ]=乙[ 乙	ηvFk(xt0 ； ξt0 )+ e(St-i-1)P e(St -i)P]
+i=0	i=0	i=0 t0=(St-i-1)P
+s-1	(St -i)P-1
+=X X	vFk(X(t0k); ξt(0k)) + e((kS)t-s)P - e(Skt)P.
+i=0 t0=(St-i-1)P
+(50)
+22
+Under review as a conference paper at ICLR 2021
+Therefore
+k=1
+K	K	t-1	t-1
+=K X Ek-KK X X	NFk (x(k0); ξ(k0))+	X	NFk(XB ξ(k))
+k=1	k0=1 t0=(St -s)p	t0=(St -s)p
+KK
+1	X( p(k0)	p(k0b∣	,	Uk)	0(k)∖	1 X	p(k0)	(I ∣∣2	∕5n
+-K 2√e(St-s)p	—	eStp	) + (e(St-s)p -	eStP) - K	et	-	et-spk2	(51)
+k0=1	k0=1
+2 K	K t-1	t-1
+≤ 2K X Ek-K X X	NFk (x(k0); ξ(k0))+ X	ηVFk (Xtk); ξ(k))k2
+k=1	k0 =1 t0 =(St -s)p	t0 =(St -s)p
+K	K0
++ K X Ek- K X e(St-s)p + e(St-s)p - eStp - e(St-s)pk2 ,
+k=1	k0=1
+where the first term can be bounded following Eqs. (29,30). The second term satisfies
+K X Ek- K X e(St)-S)P + e(St-s)p - eStp -e(St-s)pk2
+k=1	k0=1
+KK	K	K
+≤ -6 X Ek-± X e(k0)、+ e(k J2 + ? X Eke(k) k2 + ɪ X Eke S S)J|2
+K	K	(St	-s)p	(St	-s)p	2 K	Stp	2 K	(St	-s)p	2
+K	KK
+≤ K X Eke(St-S)Pk2 + K X EkeStPk2 + K X Eke(St-S)Pk2
+k=1	k=1	k=1
+≤ ⅛δ(1 + 4¾0) ∙ 144p2η2(σ2 + κ2 + G2),
+δ2	δ2
+(52)
+where the last inequality follows Lemmas 6 and 7. Let h(δ) = 1-δ (1 + 4(：-δ)). Combine the above
+two inequalities and we have
+K
+K X EkXt-X(k)k2
+k=1
+t-1	6L2 K
+≤ 2η2(s + 1)pσ2 + 2η2(s + 1)p	X	(-ɪ XEkXt- x(k)k2 + 3κ2) + 144h(δ)p2η2(σ2 + κ2 + G2)
+≤ 2η2pσ2 (s + 1 + 72h(δ)p) +6η2p2κ2((s + 1)2 + 24h(δ)) + 144h(δ)p2η2G2
+t-1	K
++ 12η2L2(s + 1)p	X	K X EkXt-Xtk) k2 ∙
+t0=t-(S+1)p	k=1
+(53)
+Following Eqs. (33,34,35),
+T-1K-1
+KT X X EkXt — Xtk)k2 ≤ 3η2pσ2(s +1 + 72h(δ)p) + 9η2p2κ2((s + 1)2 + 24h(δ)) + 216h(δ)η2p2G2 .
+t=0 k=1
+(54)
+23
+□
+Under review as a conference paper at ICLR 2021
+Theorem 2. For OLCO3-TC with vanilla SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ min{ 6L(§+i)p, 9l} and let h(δ) = 1-zδ (1 + 4(2-δ)), then
+1XEkVf(ɪXxtk))k2 ≤ 6fφf2 + 9ηLσ2
+T	K	ηT	K
+t=0	k=1	η
+(55)
++ 12η2 *pσ2(s + 1 + 80h(δ)p) + 12η2p2κ2(3(s + 1)2 + 80h(δ)) + 960η2p2G2h(δ) .
+Proof. Following the proof of Theorem 1, we have the same inequality as Eq. (41):
+Etf(Xt+ι) - f (Xt) ≤ - η kvf (Xt)k2 + 2ηL2 ɪ X kxt - χtk)k2 + 3η2Lσ2.	(56)
+3	3 K	2K
+k=1
+Then for the averaged parameters K PK=I x(k),
+1K	1K
+kVf(IKEXtk))k2 ≤ 2kVf(KK 汇Xtk))- Vf(Xt)k2 + 2kVf(Xt)k2
+k=1	k=1
+1K
+≤ 2L2kkk Eetk)+ et-spk2+2kVf(Xt)k2
+k=1
+4L2	K	4L2
+≤ ~F7~ X ket k2 + -^ket-sp k2 + 2kVf (Xt)k2
+KK
+k=1
+6[f(Xt)-Etf (Xt+ι)]
+η
+≤
++ 9ηKσ2 + 4K2 X kXt - Xtk)k2 + 4K2 X ketk)k2 + 4K2ket-spk2.
+k=1	k=1
+(57)
+Take total expectation, sum from t = 0 to t = T - 1, and rearrange,
+T-1	K
+T X EkVf (K XXtk))k2
+t=0	k=1
+6[f (Xo) - Ef(XT)]
+ηT
+9ηLσ2
++ ~κ~
+≤
+2 T -1 K	2 T -1
++ kt XX Eket-)spk2 + kt X Eket-Spk2
+t=o k=1	t=o
++ KT x X EkXt-Xtk)k2
+t=o k=1
+6[f (Xo) - Ef(XT)]	9ηLσ2	2 2r	9.m q4(1- δ)	32(2 - δ)(1 - δ)
+≤ —ητ—+—+12η pσ (s+1+72h(δ)p+P+—δ4—Pp
++ 12η2p2κ2(3(s +1)2 + 72h(δ) + 4⅛δ) + 32(2 - δ4(1 - δ))
+δ2	δ4
++ 12η2p2G2(72h(δ) + 4⅛^ + 32(2 - δ4(1 - δ))
+δ2	δ4
+≤ 6(f(Xo) - f*) + 9ηLσ2
+- ηT + K
++ 12η2Pσ2(s + 1 + 80h(δ)P) + 12η2P2κ2 (3(s + 1)2 + 80h(δ)) + 960η2P2G2 h(δ) ,
+(58)
+where the second inequality follows Lemmas 6, 7 and 8.	□
+F Proof of Theorem 3
+We first define two virtual variables zt and pt satisfying
+Pt =(广(tX=U-"
+t≥1
+(59)
+24
+Under review as a conference paper at ICLR 2021
+and
+Zt = Xt + Pt .
+(60)
+Then the update rule of zt satisfies
+Zt+1 — Zt = (Xt+1 — Xt) + J— (Xt+1 — Xt)
+1 — μ
+七(Xt- XtT)
+K
+-K X m(+)ι
+k=1
+K
+τ-rμK X m(+)ι +
+k=1
+K
+Xm(tk)
+k=1
+η
+(i-μ)κ
+η
+(i-μ)κ
+K
+X(m(+)ι - μm(k))
+k=1
+K
+X Nfk (χ(k); ξ(k)),
+k=1
+(61)
+—
+—
+μ η
+1 — μ K
+—
+—
+which exists for OLCO3-OC, OLCO3-VQ and OLCO3-TC.
+Lemma 9.
+For OLCO3 with Momentum SGD, we have
+Ekmt(k)k22 ≤
+3(σ2 + κ2 + G2 )
+(i-μ)2
+(62)
+Proof.
+t-1
+Ekmtk)k2 = EkX μt-1-t0VFk(X(k); ξ(k))k2
+t0=0
+(X μT-tj2Ek X pt-1	t-1-t0 VFk(Xtk);端)k2
+t0=0	t0=0 2^t0=0μ
+≤ (X μt-1-t0 )2 EkVFk(X(k)； ξ(k))k2 ≤ 3(［； ：+ G2).
+t0=0	, μ
+(63)
+□
+Lemma 10.
+For OLCO3 with Momentum SGD, we have
+Ekptk2 ≤
+3μ2η2(σ2 + K + G2)
+O-MP
+(64)
+Proof.
+2	22	K	22 K
+Ekptk2 = (⅛fEkXt-XTk2 = ∏μ¾EkIKXmt k2 ≤ o-⅛κXEkmtk)k2
+3μ2η2(σ2 + K + G2)
+≤	(ɪ—^p	.
+(65)
+□
+Lemma 11. For OLCO3-VQ with Momentum SGD and under Assumptions 2, 3, 4, and 5, the local
+error satisfies
+Eke(k)k2 ≤『(1 -2δ)2p2η2(σ2 + κ + G2).	(66)
+(1 — μ)2δ2
+Proof. LetSt = bPC，
+Eket(k)k22 = Eke(Skt)pk22 = EkC(∆(Skt)p) - ∆(Skt)pk22 ≤ (1 - δ)Ek∆(Skt)pk22
+ST p-1
+= (1 - δ)Ek	X	ηm(t0k) +e((kS)t-s-1)pk22
+t0=(St-1)p
+≤ (1 — δ)(1+ P)Eke(St-s-ι)pk2 + (1 - δ)(1 + 1)3η2p2(σι2+ ；； + G2)
+P (ɪ	μ)
+(67)
+25
+Under review as a conference paper at ICLR 2021
+Therefore,
+Eke叫2 ≤ 3(1-δ)(1 + 1)再2(；2+：+8 IX [(1-δ)(1+ ρ)]i
+P (I μ)	i=0	(68)
+≤ 3(I- δ)(1 + P) p2η2(σ2 + κ2 + G2)
+—1 - (I - δ)(1 + P)	(I - μ)2
+Let P = 2(1-) such that 1 + P = ⅛δ ≤ 2 ,then Eketk) k2 ≤(比湍 P2η2(σ2 + κ2 + G2).	□
+we have
+产σ22 (,+(S+1)p+12(I- δ):+1)2p2)
+(1 — μ)2 (1 — μ)2	δ2
+Lemma 12. For OLCO3-VQ with Momentum SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ √72L-S+i)p，
+T-1 K
+KT ∑∑EkZ—(k)k2 ≤
+t=0 k=1
+,12η2κ2	z 1 z	n2	2	4(1 - δ)(s + 1)2p2	12η2G2	1	4(1-	δ)(s +	1)2p2∖
++ (T-凝((T-淳 + (s + 1)p +--------δ2---------) + 1^评(Dɪ +---------δ2-------)
+(69)
+Proof. LetSt = bPC,
+K	K	K	s-1
+κ X EkZt-Xtk) k2 = K X EkK X(-X △("P
+k=1
+- (- sX-1 ∆(k)
+(St-i)P
+i=0
+k=1
+k0=1
+—
+—
+Xtk))- K
+i=0
+K
+X et(k0s)Pk22
+(x(Skt0p)
+K	K0
+K X EkK X (ηm(St)-S)P
+k=1
+k0=1
+k0=1
+t-1-(St -s)P
+X	μτ+1+
+τ=0
+t-1
+X
+t0 =(St s)p
+ηVFk,(χ(k0); ξ(。k0))
+t-1-t0
+X μτ)
+τ=0
+- (ηm((kS)ts)p
+t-1-(St-s)P
+X	μτ+1 +
+τ=0
+t1
+X	ηVFk (Xtk)； ξ(k)) X μτ)
+t0 =(St s)p
+τ=0
+—
+—
+K	K s-1
++ K X et-Sp+ K X Xe(St)-i-s-i)p
+k0=1	k0=1 i=0
+s-1
+X e(k)	k2
+(St-i-s-1)p 2
+i=0
+—
+2K	K
+≤ W XEkK X m(St)-s)P
+k=1
+k0=1
+t-1-(St -s)P
+X	τ+1	(k)
+乙 μ - m(St-s)p
+τ=0
+t1(St s)p
+E	μτ+1k2
+τ=0
+2 K	K t-1	t-1-t0
++ 3K- XEkKK X X	VFk0(x(k0);炉)X
+t1
+k=1
+k0 =1 t0 =(St s)p
+τ=0
+μτ
+X	VFk(xtk); ξ(k)) X μτk2
+t0=(Sts)p
+τ=0
+3K 1K
++K X Ek K X
+k=1
+k0=1
+K s-1	s-1
+e(k0) + L X Xe(k0)	+ Xe(k)	k2
+et-sp + K 乙 Z^e(St-i-s-1)p + Z^e(St-i-s-1)pk2 .
+k0=1 i=0	i=0
+(70)
+—
+The first term
+2K	K
+W X Ek K X m(St-s)p
+k=1
+k0=1
+t-1-(St-s)P
+X	τ+1	(k)
+μ - m(St-s)p
+2K
+≤ ④ X Ekmtk))
+K	(St-s)P
+k=1
+τ=0
+t-1-(St-s)P	2
+X	UT +ik2 ≤ Rn
+T=0	μ k2 —(1-μ)2K
+t-1-(St-s)P
+X	μτ+1k2
+τ=0
+K
+XEkm((kS)t-s)pk22 ≤
+k=1
+9η2 (σ2 + κ2 + G2)
+(1-μ)4
+(71)
+26
+Under review as a conference paper at ICLR 2021
+where the last inequality follows Lemma 9. Following Eq. (29), the second term can be bounded by
+2 K	K	t-1	t-1-t0	t-1	t-1-t0
+-ɪ X Ek KK X X VFkO	(x(k0);	ξ(k0))	X	μτ	- X VFk(Xtk)；	ξ(k)) X	μτk2
+k=1	k0=1	t0=(St-s)p	τ=0	t0=(St-s)p	τ=0
+2 K	t-1	K	t-1-t0
+-K XEk X [" X (VFkO(X(k0); ξ(k0)) -VfkO(x(k0))) - (VFk(Xtk); ξ(k)) -Vfk(x(k)))] X μτ∣∣2
+k=1	t0=(St-s)p	k0=1	τ=0
+2 K	t-1	K	t-1-tO
++ % XEk	X (KK X VfkO(x(k0))-Vfk(Xtk))) X μτk2
+k=1	tO=(St-s)p	kO=1	τ=0
+2	K	t-1
+≤ (I 」)2K X X	EkVFk(x(k)；ξ(k)) -Vfk(x(k))k2
+( μ) K k=1 tO = (St-s)p
++	-η2
+十 (1- μ)2κ
+K t-1	1 K
+(t-(St-s)p) X X Ek左 X VfkO(X(k0)) -Vfk(x(k))k2
+/ -η2(s + 1)pσ2
+≤	(i-μ)2	+
+k=1 tO=(St-s)p	kO=1
+-η2(s + 1)p	X	(6KL2 XEkztO - x(k)k2 +-κ2),
+(1-μ)2
+tO=t-(s+1)p	k=1
+(72)
+where the last inequality follows Eq. (30). Combine the bounds of the first and second term with
+Lemma 11 and Eq. (31),
+1K
+K X
+k=1
+Ekzt - xt(k)k22
+≤
+9η2(σ2 + κ2 + G2)	-η2(s + 1)pσ2
+—Lp — +	(1 - μ)2
+ι -η2(s +1)p
++ (1-μ)2
+t-1	2 K
+X (夫 X EkztO - x(k) k2 + -κ2)
+tOt-(s+1)p k=1
++ -⅛j2 X X Eke(St-i-s)pk2
+k=1 i=0
+9η2(σ2 + κ2 + G2)	-η2(s + 1)pσ2	9η2(s + 1)2p2κ2	-6(1 — δ)η2(s + 1)2p2(σ2 + κ2 + G2)
+一①—不一+	(1 - μ)2	+ ―①-力—+	(1 - μ)2δ2
+18η2L2(s + 1)p
+(1 - μ)2
++
+t-1	K
+X κ X EkztO-Xtk)k2.
+tOt-(s+1)p k=1
+(73)
+Sum the above inequality from t = 0 to t = T - 1 and divide it by T ,
+T-1 K
+KT XXEkzt-X(k)k2
+t=0 k=1
+V -η2σ2 (-
+一 (1-μ)2 ((I-μ)2
++ (s+ 1)p+
+12(1 - δ)(s + 1)2p2
+δ2	)
+,9η2κ2 (	1	, 2 , n2 2 , 4(1- δ)(s + 1)2p2- 9η2G2(	1	, 4(1 - δ)(s + 1)2p2∖
++ (T-凝((T-评 + (s + 1) P +-δ2--) + 1■评(Dɪ +------δ2----)
++
+18η2L2(s + 1)2p2 1
+(1 - μ)2 KT
+T-1 K
+X X Ekzt - xt(k)k22.
+t0 k=1
+(74)
+27
+Under review as a conference paper at ICLR 2021
+Ifwechoose η ≤ √721L-μ+ι)p,
+T-1 K
+KT XX Ekzt-χ(k)k2
+t=0 k=1
+≤	4η2σ2 (	3
+一 (1-μ)2((1-μ)2
++ (s +1)p +W- % + I)2P2 )
+δ2
+,12η2κ2 z 1	2 n2 2 , 4(I- S)(S + 1)2p2A , 12η2G2 z 1	4(1 - S)(S +I)2p2、
++ (T-凝((T-淳 +(S + 1)p +-----δ2-----) + (1-■评(Dɪ +--------δ2----)
+(75)
+□
+Theorem 3. For OLCO3-VQ with Momentum SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ min{谬；-3咕,⅛Lμ} and let g(μ, δ, s,p)=鼻-% + 60(I-吨+1)?Pp, then
+T-1	K
+T XEkVf(KK XX(k))k2 ≤
+t=0	k=1
+6(1 一 μ)(f(x 0) — f*) + 9Lησ2
+ητ	+ (1 - μ)K
+4η2L2
+(I-μ2
+[(4(s + 1)p + g(μ, δ, S,p))σ2
++
++ (12(S + 1)2p2 + g(μ, δ, s,p))κ2 + g(μ, δ, s,p)G2].
+(76)
+Proof. Following the proof of Theorem 1 and the update rule Eq. (61), we have a similar inequality
+as Eq. (41) by choosing η ≤ 19L:
+Etf(zt+1) - f(zt)
+≤ 1 -	(-2kVf (zt)k2 +	2K X	kzt	- xtk)k2) + 2(1-η u)2(Kr +	^K X kzt	- x(k)k2 +	3kVf (zt)k2)
+-μ	k = 1	( - μ)	k=1
+ʒzɪʒ (1 -产上)kVf (Zt)k2 +
+2(1 — μ)	1 — μ
+L2η
+≤ -而'kVf(Zt)k2 + ( 2ηL2
+3(1 — μ)	3(1 — μ)K
+2(1 - μ)K
+K
+(1 +
+Xkzt - xt(k)k22 +
+k=1
+ημ) X kzt - x(k)k2 + 2(⅛
+3Lη2σ2
+2(1 - μ)2K .
+(77)
+Then for the averaged parameters K PK=I x(k),
+1K	1K
+kVf(K £x(k))k2 ≤ 2kvf(K£x(k)) - Vf(Zt)k2 + 2kvf(Zt)k2
+k=1
+k=1
+1K
+≤ 2L2kK ∑>("p- ptk2 + 2kVf (zt)k2
+k=1
+1K
+≤ 4L2kK Xet-)spk2 +4L2kPtk2 + 2kVf(zt)k2.
+k=1
+(78)
+Therefore
+T-1	K
+T X EkVf (K X χtk))k2
+≤ 6(1- μ)[f(ζ0)- f (ZT)]
+t=0
+k=1
+4L2 T-1	1 K
++ 彳 X Ek K X e：
+t=0	k=1
+≤ 6(1- μ)(f(x0)- f*)
+ηT
+ηT
+4L2 T-1
+'t-spk2 + ~T~ X Ekptk
+ι 9Lησ2
++ (1 - μ)K
+2 T-1 K
+4L2
++ KT
+XXEkzt -x(tk)k22
+t=0 k=1
+(k)
+t=0
+ι 9Lησ2
++ (1 - μ)K
+—
+2
+2
+4η2L2
++ 7；----G [(4(s + 1)P + g(μ, δ, s,P))σ	+ (12(s	+	1)2p2	+	g(μ,	δ, s,p))κ2 + g(μ,	δ, s,P)G2]	.
+(1 - μ)2
+(79)
+28
+Under review as a conference paper at ICLR 2021
+where the last inequality follows Lemmas 10,11and12and g(μ,δ,s,p)=(1-力产 + 阿1-，?；+I) P .
+□
+G Proof of Theorem 4
+Lemma 13. For OLCO3-TC with Momentum SGD and under Assumptions 2, 3, 4, and 5, the local
+error satisfies
+Eke(k)k2 ≤『(I -2?2p2η2(σ2 + κ + G2).	(8O)
+(1 — μ)2δ2
+(k)	(k)
+Proof. Same as the proof of Lemma 11, except that e(5；-s-i)p is replaced With e(5；-])?.	□
+Lemma 14. For OLCO3-TC with vanilla SGD and under Assumptions 2, 3, 4, and 5, the server
+error satisfies
+Eketk2 ≤ 96(2l_"(1 J- δ)p2η2(σ2 + κ2 + G2).	(81)
+(1 — μ)2δ4
+Proof. Let St	= [P].	Following the proof of Lemma 11 we have Ek∆Skpk2	≤
+1-(MP3 Ppη2((⅞)2+G2). Therefore,	‘
+11K
+Eketk2 ≤ 2(2 — δ)(1 — δ)(1 + 一)KK EEk∆StPk2 + (1 — δ)(1 + P)Eke(St-i)pk2
+ρ K k=1
+1	3(1 + 1) n2n2(σ2 +	K +	G2)
+≤ 2(2 - δ)(I	- δ)(I + P)1 —	(1 — δ)P1 + P)	((I +	μ)2+	)	+(1 — δ)(1+ P)Eke(St-1)Pk2
+≤
+6(2 — δ)(1 — δ)(1 + P )2
+[1 — (1 — δ)(1 + ρ)]2 (1— μ)2
+p2η2(σ2+κ2+G2),
+(82)
+where the first inequality follows the proof of Lemma 7. Let P = 2(1-δ) SUCh that 1 +1 = 2-δ ≤ 2,
+thenEke(k)k2 ≤ Eke(k)k2 ≤ W：-*)-，)p2η2(σ2 + κ2 + G2).	□
+Lemma 15. For OLCO3-TC with Momentum SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ √72L-μ+i)P, we have
+T-1 K
+KT XX EkZ t—x (k)k2
+t=0 k=1
+3η2σ2	3
+≤ (1二评((1-” + (s + 1)p + 72h(δ)p )
+3η2κ2	3
+十 (((T-m
++ 3(S + 1)2p2 + 72h(δ)p2) + ^⅜ ((Γ⅛ + 72h(δ)p2)，
+(83)
+where h(δ) = 1-δ (1 + 4(，-δ)).
+Proof. Let St = [ P ],
+K	K	K	s-1
+一XEkzt — x(k)k2 = — XEk — X (— XC(∆(k0) ,)) — (x* — x(k0)))
+K	t t 2 K	K	(St-i)P	StP	t
+s-1	K
+—(—XCg(St-i)P)— (XStj)— χ(k))— N X etk)—et-sPk2,
+i=0	k0=1
+(84)
+29
+Under review as a conference paper at ICLR 2021
+where
+s-1	s-1
+XC ∆(k)	(k)	(k)	X ∆(k)	(k)	(k)	(k)
+C(∆(St-i)p) + (xStp -xt ) =	[∆(St-i)p - e(St-i)p] + (xStp -xt )
+i=0	i=0
+s-1	p-1	(St-i)p-1	(St-i)p-1-t0
+X[m(St -i-i)p X μτ+1 +	X	ηVF (x(k)； ξ(k)) tX
+μτ+e(St-dp - e(St-i)p]
+i=0	τ=0	t0=(St-i-1)p	τ=0
+t-1-St p	t-1	t-1-t0
++ mSkP	X	μτ+1+ X ηVFk(X(k); ξ(Ok)) X μ
+τ=0	t0=Stp	τ=0
+t-1-(St-s)p	t-1	t-1-t0
+m(St-s)p	X	μτ+1+ X	ηVFk (Xt(0k); ξt(0k)) X μ+e(St-s)p- eStP.
+τ=0	t0=(St-s)p	τ=0
+(85)
+Therefore,
+ɪ X EkZt-X(k)k2 一 X Ek ɪ X ηm(k0)	t-1-X-S)P μτ+1-ηm(k)	[-X-S)P 〃t+1
+KA^ 11 t t 112 KA^ 11 κ / (St-s)p	μ	/ (St-s)p	μ
+K	t-1	t-1-t0	t-1	t-1-t0
++ KK X	X	ηVFk0(X(k0); ξ(k0)) X μτ	- X	ηVFk(x(k)；ξ(k)) X	μτ
+k0=1 t0=(St-S)P	τ=0	t0 =(St -S)P	τ=0
+K
+ɪ X e(k0)
+K	e(St-s)p
+k0=1
+- e((kS)t-S)P + e(Skt)P + et-SPk22
+2K	K	K
+—3η______XEIlm(k)	∣∣2 + ± X Ek ɪ X e(kO)	— e(k)	+ e(k) + e ∣∣2
+(1 -	μ)2κ	2Ekm(St-S)Pk2	+ κ 2^Ek	κ 乙 e(St-s)p	e(St-s)p	+ eStp	+ et-sPk2
+I	μ	k=1	k = 1	k0 = 1
+2 K	K t-1	t-1-tO	t-1	t-1-tO
++ 3K X Ek KK X X	VFkO(X(k0)； ξtok0)) X μτ - X	NFk(XB * X μτk2 ,
+k=1	kO=1 tO=(St-S)P	τ=0	tO=(St-S)P	τ=0
+(86)
+where the first term is bounded following Lemma 9 and the third term is bounded following Eq. (72).
+The second term
+K	KO
+K X Ek K X e(St-s)P -e(St-s)P + eStP + et-sPk2
+k=1	kO=1
+K	KK
+≤ -9 VEke(k) 、k2 + ɪ VEke(k) k2 + ɪ VEkefS s.J∣2
+K	(St-S)P 2 K	StP 2 K	(St-S)P 2
+≤ (1 - μ)2δ2 (1 + 4([ S' ) ^ 216p2η2(σ2 + K + G2) .
+Combine these bounds,
+(87)
+1 X ElIZ γ(k)∣∣2 / 9η2(σ2 + κ2 + G2) I
+K IIEkzt-Xtk2 ≤ -(1-^p - +
+万上篇(1 + 4⅛δ2) ∙ 216p2η2(σ2 + κ2 + G2)
+(1 — μ)2δ2	δ2
++
+3η2(s + 1)pσ2	3η2(s + 1)p
+(i-μ)2	+
+(i-μ)2
+t-1
+K
+X	(6K X EkZtO-Xtk) k2 + 3κ2)
+tO=t-(S+1)P	k=1
+ι8η2L-(μ; 1)p	X KXEkztO-Xtk)k2
+tO=t-(S+1)P	k=1
+(88)
+30
+Under review as a conference paper at ICLR 2021
+Sum the above inequality from t = 0 to t = T - 1, divide it by T , and choose η ≤
+1-μ
+√72L(s + 1)p
+T-1 K	3 2 2	3
+KT XX EkZt — Xt	k2	≤ (1 - )2	((I - G2	+ (S + I)P	+ 72h(δ)p	)
+t=0 k=1	(	μ)	(	μ)
++ ψr~—72 ( T∖	λ2	+ 3(S	+ I)2p2 +	72h(δ)p2)	+ #	72	( Ti ∖2 +	72h(δ)p2)	.
+(I- μ)2 (I-	μ)2	(I- μ)2	(I- μ)2
+(89)
+□
+Theorem 4. For OLCO3-TC with Momentum SGD and under Assumptions 1, 2, 3, 4, and 5, if the
+learning rate η ≤ min{ √72L-+i)p, 1-Lμ} and let h(δ) = 1-2δ (1 + 4(j-), then
+T-1	K
+T XEkVf(KK XX(k))k2 ≤
+t=0	k=1
+≤
+6(1- μ)(f (X0)-储 +
+ηT
+9Lησ2	∣
+(1 - μ)K +
+七 [σ2(d⅛ + 2(S+1)p+168h(δ)p2)
+99
++ κ2((1 - μ)2 + 6(s + 1)2p2 + 168h(δ)p2) + G2((1 - μ产 + 168h(δ)p2)].
+(90)
+Proof. Following the proof of Theorem 3,
+Etf(Zt+1) -f(Zt) ≤
+η
+3(I- μ)
+kVf (Zt )k22 +
+2ηL2	X kz -x(k)k2 I	3Lη2σ2
+3(1 - μ)K ^k t t k2 +2(1 - μ)2K
+, (91)
+1K	1K
+kVf(K £x(k))k2 ≤ 2kVf(K 汇Xtk))- Vf(Zt)k2 + 2kVf(Zt)k2
+k=1	k=1
+1K
+≤ 2L2kK Eetk) + et-sp - Ptk2 + 2∣∣Vf(zt)∣2	(92)
+k=1
+1K
+≤ 6L2kK Eet-)spk2 + 6L2ket-spk2 +6L2kptk2 +2∣∣Vf(zt)k2.
+k=1
+Therefore
+T-1	K
+T X EkVf (K XXtk))k2
+≤ 6(1- μ)[f(zo)- f (ZT)]
+t=0
+k=1
+2 T-1	K
++ 牛 X Ek K X et-sp
+t=0	k=1
+ηT
+2 T-1
+k2 + -T~ X Eket-Spk2 +
+T t=0
++ 9Lησ2	4L2 XX e∣∣	(k)∣∣2
++ (1-μ)K + KTr 2.Ekzt - xt k2
+v μ	t=0 k=1
+2 T-1
+与 X EkPtk2
+T t=0
+≤
+6(1 - μ)(f(χo) - f*) + 9Lησ2 + 6η2L2 [ 2(	9
+ηT	十(1 - μ)K十]μ2 [σ (1评
++ 2(S + 1)p + 168h(δ)p2)
+99
++ K ((1-)2 + 6(s + 1) p + 168h(δ)p ) + G ((ɪ-予 + 168h(δ)p )],
+(93)
+where the last inequality follows Lemmas 10, 13, 14 and 15.
+□
+31

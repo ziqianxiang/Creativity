@@ -1,0 +1,816 @@
+﻿Under review as a conference paper at ICLR 2022
+A Branch and Bound Framework for Stronger
+Adversarial Attacks of ReLU Networks
+Anonymous authors
+Paper under double-blind review
+Ab stract
+Strong adversarial attacks are important for evaluating the true robustness of deep
+neural networks. Most existing attacks find adversarial examples by searching the
+input space, e.g., using gradient descent, and may miss adversarial examples due
+to non-convexity. In this work, we search adversarial examples in the activation
+space of ReLU networks, which allows a systematic search of adversarial exam-
+ples and can tackle hard instances where none of the existing adversarial attacks
+succeed. Unfortunately, searching the activation space typically relies on generic
+mixed integer programming (MIP) solvers and is limited to small networks and
+easy problem instances. To improve scalability and practicability, we use branch
+and bound (BaB) with specialized GPU-based bound propagation methods, and
+propose a top-down beam-search approach to quickly identify the subspace that
+may contain adversarial examples. Moreover, we build an adversarial candidates
+pool using cheap attacks to further assist the search in activation space via diving
+techniques and a bottom-up large neighbourhood search (LNS). Our adversarial
+attack framework, BaB-Attack, opens up a new opportunity for designing novel
+adversarial attacks not limited to searching the input space, and enables us to bor-
+row techniques from integer programming theory and neural network verification
+to build stronger attacks. In experiments, we can successfully generate adversar-
+ial examples for hard input instances where existing strong adversarial attacks fail,
+and outperform off-the-shelf MIP solver based attacks in both success rates and
+efficiency. Our results further close the gap between the upper bound of robust
+accuracy obtained by attacks and the lower bound obtained by verification.
+1	Introduction
+Adversarial attacks aim to find adversarial examples (Szegedy et al., 2013), which are close to benign
+inputs in certain distance metrics yet trigger wrong behavior of neural networks (Carlini & Wagner,
+2017; Madry et al., 2018; Athalye et al., 2018; Croce & Hein, 2020b). Adversarial attacks are
+important tools to gauge the empirical robustness of deep neural networks. Finding an adversarial
+example can be generally formulated as a constrained optimization problem:
+xadv = arg min f (x)	(1)
+x∈C
+where C is often an '∞ or '2 norm ball around the original input xo, and f (x) is an attack success
+criterion involving a neural network (such as the margin between the groundtruth class and another
+class): f(x) < 0 indicates a successful attack. A straightforward way of solving Eq. (1) is via first-
+order constrained optimization methods, such as projected gradient descent (PGD) (Madry et al.,
+2018) and its variants (Croce & Hein, 2020b; Tashiro et al., 2020; Croce & Hein, 2020a; Xie et al.,
+2019; Dong et al., 2018; Zheng et al., 2019). Additionally, some gradient-free attacks were pro-
+posed (Brendel et al., 2018; Cheng et al., 2018; Alzantot et al., 2019; Andriushchenko et al., 2020),
+mostly based on certain heuristic search on the input space x.
+Limitations of existing attacks. As f(x) usually consists ofa highly non-convex neural network,
+solving Eq. (1) to its global minimum is challenging. This leads to failures in adversarial attacks:
+an adversarial example may exist but no attacks can find it, giving a false sense of security (Athalye
+et al., 2018). Especially, gradient based attacks can be easily trapped into a local minimum or
+misguided by masked gradients (Papernot et al., 2016; Tramer et [ 2017). Even if We give the
+attacker an infinite amount of time (e.g., run a very large number of PGD steps, or allowing a large
+number of samples on input space), it is still hard to guarantee to find the adversarial example, since
+1
+Under review as a conference paper at ICLR 2022
+it is extremely difficult to systematically search the high dimensional and continuous input space.
+Models concluded robust under existing attacks might still have security vulnerability in practice,
+leading to an urgent request for stronger attacks that can possibly approach ground-truth robustness.
+The mixed-integer approach. This paper seeks stronger adversarial attacks from a different an-
+gle: instead of searching for adversarial examples in the input space, we look for adversarial ex-
+amples in the activation space. The main intuition is that neural networks with piece-wise linear
+activation functions (e.g., ReLU) can be seen as a piece-wise linear function and each piece is
+uniquely defined by a specific setting of activation function status. For ReLU networks, each neu-
+ron can either be active (its input is positive) or inactive (its input is negative so the output is 0),
+which can be encoded by discrete 0-1 variables. This leads to a mixed integer programming (MIP)
+formulation (Ehlers, 2017), and Tjeng et al. (2019) conducted attacks using a MIP solver.
+Benefits of the MIP formulation. The MIP formulation with the 0-1 encoding of ReLU neurons
+allows us to systematically search all the linear pieces in the input space, theoretically guarantee to
+enumerate the entire input space and obtain the global minimum of Eq. (1) given sufficient time.
+Practically, MIP-based attacks can often find adversarial examples that are missed by existing attacks
+and identify true weaknesses of a model. It also helps to close the gap between the upper and lower
+bounds of robust accuracy (i.e., attack accuracy vs. verified accuracy). Existing works aimed to
+reducing this gap by tightening the lower bound with stronger verifiers (Raghunathan et al., 2018b;
+Wang et al., 2021), while our work aims to tighten the upper bound by a systematic search of
+adversarial examples. Closing this gap is difficult even on small models (Dathathri et al., 2020).
+Generic MIP solvers are inefficient for adversarial attacks. Despite its strengths, a MIP-based
+attack are often a few orders of magnitudes slower than existing attacks due to the high cost of
+running an off-the-shelf solver such as Gurobi (Tjeng et al., 2019). There are three root causes for
+its inefficiency. First, an off-the-shelf solver is not aware of the underlying optimization problem
+corresponds to a neural network, and has to apply generic solving techniques (e.g., using Simplex
+algorithm with relaxations) which can be expensive or ineffective. Second, it cannot utilize solutions
+obtained cheaply from gradient based attacks to accelerate its search. Third, generic MIP solvers are
+mostly restricted to CPUs and can hardly utilize GPU acceleration, which is crucial for efficiency.
+Contributions of this paper. We address the above weaknesses in MIP solvers for adversarial
+attacks, by developing a GPU-accelerated branch and bound procedure to systematically search
+adversarial examples in the activation space, which is more efficient than generic MIP solvers. We
+focus on solving hard instances, where none of existing adversarial attacks based on searching the
+input space are successful but no verifier can prove their robustness. Our contributions includes:
+•	We apply the GPU-accelerated bound propagation based methods (Wang et al., 2021; Xu et al.,
+2020; Zhang et al., 2018; Wong & Kolter, 2018), which were originally developed for neural net-
+work verification, to the adversarial attack setting. These specialized methods can quickly examine
+thousands of regions in activation space in parallel and rule out the regions with no adversarial
+examples, which is difficult in off-the-shelf MIP solvers with a generic solving procedure.
+•	We employ a top-down beam-search to explore the activation space. Unlike the best-first search
+scheme used in many neural network verifiers, we can quickly go deep in the search tree and identify
+the most promising regions with adversarial examples. A smaller sub-MIP can then be created on-
+the-fly to search adversarial examples in the reduced regions with much fewer integer variables.
+•	We collect adversarial examples generated by cheap attacks in a candidate pool and utilize them in
+two ways. First, we conduct a bottom-up search on examples close to decision boundary by applying
+large neighborhood search (LNS). Second, when conducting the top-down search, we adopt diving
+by fixing integer variables according to adversarial examples in the pool to reduce the search space.
+•	Our new attack framework, BaB-Attack, is designed to tackle hard instances where existing strong
+adversarial attacks (such as AutoAttack) cannot succeed. Despite being more expensive than attacks
+on the input space, BaB-Attack is about an order of magnitude faster than using an MIP solver on
+hard instances, and can find adversarial examples that cannot be discovered by any existing attacks.
+2	Background
+Notations. We define a L layer feed-forward ReLU network as f : Rn0 → R and f(x) :=
+z(L)(x), where z(i)(x) = W(i)Z(i-1)(x) + b(i) with i-th layer weight matrix W⑴ and bias b(i),
+Z(Z)(X) = ReLU(Z(i)(x)), and input z(0)(x) = x. Layer i has dimension ni, and N is the total
+number of neurons. We denote the j-th neuron in layer i as zj(i). For a simpler presentation, we
+2
+Under review as a conference paper at ICLR 2022
+assume f(x) is a binary classifier and benign input x0 has f(x0) > 0. An attacker seeks to minimize
+f (x) within a '∞ norm perturbation set C to make f (x) < 0. We can attack a multi-class classifier by
+considering each pair of target and ground-truth label individually where f is defined as the margin
+between them, similarly to (GoWal et al., 2019b). We use [N] to represent the set {1,…，N}.
+The MIP formulation for adversarial attack. Tjeng et al. (2019) formulated the adversarial
+attack and verification of ReLU network into a mixed integer programming (MIP) problem, solved
+by existing MIP solvers (refer to as the “MIP attack”). It has binary variables s(ji) for each ReLU:
+minf (x) s,t. z(i)(x) = W(i)Z(i-1)(x) + b(i);	f(x) = Z(L)(x);	X ∈ C;
+^ji)(x) ≥	Zji)(x)；	Zji)(X)	≤	Uji)Sj"；	Zji)(X) ≤	Zji)(X)- ji)(1 -	sji));	(2)
+^ji)(x) ≥ 0；	Zji)(X) ∈ [lji),uji)];	Sji) ∈ {0,1}； i ∈ [L], j ∈ [ni]
+(i)	(i)
+where Sj indicating the two status of a ReLU neuron: (1) inactive: when Sj = 0, constraints on
+Zli simplifies to ^ji) = 0; or (2) active: when Sji) = 1 we have Zji) = Zji). Here lji), Uji are pre-
+computed intermediate lower and upper bounds on pre-activation Zji) such that lji) ≤ Zji)(X) ≤ uji)
+for any X ∈ C. The complexity of this problem can increase exponentially with the number of ReLU
+neurons, so it can take hours to run even on a small network, unless the network is trained with a
+strong regularization such as a certified dense (Wong & Kolter, 2018; Xiao et al., 2019).
+Searching in the Activation Space via Branch and Bound.
+Given the formulation in Eq. (2), we can view a neural net-
+work in the activation space A = [0, 1]n where N is the total
+number of neurons, and each dimension corresponds to the
+setting of a sji) ∈ {0,1} variable. To determine sji) corre-
+sponding to a known adversarial example Xadv, we can prop-
+agate XadV through the network and check the sign of each
+neuron /j", so sji) = I(Zji) ≥ 0). This uniquely locates the
+linear piece of f (x) where XadV lies, because Eq. (2) becomes
+a set of linear inequalities when all sji) are fixed. Intuitively,
+we can search adversarial examples by fixing all sji) to one
+of the 2n possible combinations in A, and then solve Eq. (2)
+exactly using linear programming; an adversarial example is
+found when the solution is negative. To avoid clutter, we flat-
+ten the ordering of sji) for i ∈ [L],j ∈ [ni] and use a single
+subscript si,…,sn to denote all binary variables.
+To effectively and systematically search in the activation
+Figure 1: A branch and bound search
+tree. Each node represents a subdomain
+determined by S, and the numbers are
+LB(S). No adversarial example exist in
+the subdomain if LB(S) > 0 (green).
+A concrete adversarial example is a leaf
+node Sleaf where LB(Sleaf) < 0.
+Leaf nodes: all binary variables have been fixed
+space, instead of fixing all Si (i ∈ [N]), we can first fix a subset of them and bound the objective f (χ)
+to guide the search, leading to the branch and bound (BaB) method. In BaB, we solve Eq. (2) by cre-
+ating subproblems constraining some binary variables, for example, si = 0 or si = 1 (since we can
+branch on the neurons in any fixed order, without loss of generality, we branch the neurons chrono-
+logically). We define a set S containing all the branching constraints (e.g., S = {si = 0, s2 = 1}),
+which corresponds to a subdomain of the original problem Eq. (2). BaB requires the LB primitive
+on S, which relaxes the remaining binary variables to obtain a lower bound ofEq. (2):
+Lower bound in subdomain: LB(S) ≤ min f(X)	s.t. s ∈ S and all other constraints in Eq. (2)
+Here s ∈ S means setting binary variables s(ji) according to the constraints in S. Typically, more
+constraints in S lead to tighter bounds. LB(S) > 0 indicates that no adversarial example exist
+within this subdomain, otherwise adversarial examples may exist in this subdomain.
+We illustrate a BaB search tree in Fig. 1. Initially, Sroot = 0, where X ∈ C without any extra
+constraints in activation space and a lower bound of Eq. (2) is obtained. When LB(0) < 0, an
+adversarial example may exist, and we branch Sroot into two subdomains:
+Si- = Sroot ∪ {si = 0}； Si+ = Sroot ∪ {si = 1}
+Then we bound each subdomain. Since more constraints are added, LB(Si-) and LB(Si+) are
+usually improved. The branching procedure continues recursively, and if any LB(S) > 0, no further
+3
+Under review as a conference paper at ICLR 2022
+branching is needed since no adversarial examples are in that subdomain. Each branching increases
+the cardinality of S by 1, and eventually we reach leaf nodes with |Sleaf | = N , each leaf locating a
+linear piece of f (x). In that case, LB(Sleaf) is an exact solution since no binary variables are left,
+and if LB(Sleaf) < 0, a concrete adversarial example is the minimizer x* of Eq. (2) with S ∈ Sieaf.
+Since N can be quite large and adversarial examples lie in the leaf level, we must guide the search
+to reach there quickly. Although BaB is used in existing neural network verifiers (Bunel et al., 2018;
+De Palma et al., 2021a), they do not aim to reach the leaf level and typically branch the node with
+the worst bound first, generally leading to a wide but shallow search tree and unsuitable for detecting
+adversarial examples. We will discuss our search algorithm in Sec. 3.
+Bounding in Branch and Bound of Neural Networks. The LB(S) primitive is crucial in the
+BaB process: it needs to provide a tight lower bound efficiently. A simple way to lower bound
+the objective of Eq. (2) is via relaxation of integer variables and linear programming (LP) (Bunel
+et al., 2018; Lu & Kumar, 2020); but an LP solver is needed which restricts its efficiency. Recently,
+a popular choice in neural network verifiers is the specialized bound propagation methods (Zhang
+et al., 2018; Wong & Kolter, 2018) which exploit the structure of the optimization problem (which
+a generic LP/MIP solver cannot) and give LB(S) efficiently on GPUs without an LP solver. Essen-
+tially, they relax each ReLU neuron into convex domains (Salman et al., 2019) and propagate them
+layer by layer through the network while maintaining sound bounds. A BaB and bound propagation
+based verifier α,β-CROWN (Zhang et al., 2018; Xu et al., 2021; Wang et al., 2021), achieves the
+state-of-the-art verification performance (Bak et al., 2021), and We utilize its bounding subprocedure
+to produce LB(S). Importantly, We will show that how We use LB(S) to guide adversarial attacks,
+while existing works mostly use them for verification.
+3	Method
+Overview of BaB attack. To systematically
+search adversarial examples in activation space,
+we must explore the search tree and enumerate
+as more leaf nodes as possible. Although the
+worst case search time complexity is exponen-
+tial in the numbers of ReLU neurons (visiting ev-
+ery leaf node of the tree), practically, if a right
+search procedure is chosen, only a small fraction
+of nodes need to be visited to find an adversarial
+example. In this paper, we propose BaB attack,
+Output - adversarial example detected: /(xadv) < 0
+Figure 2: Overview of BaB attack.
+specializing the BaB searching strategy over the
+activation space for the purpose of adversarial at-
+tacks. The search is well guided by(1)a top-down
+beam-search thread accelerated on GPUs which quickly goes deep into the search tree, and (2) a
+bottom-up search thread on CPUs for large neighborhood search. The top-down and bottom-up
+searches run in parallel threads and they both benefit from the adversarial candidates pool P, which
+contains examples P = {x^,…，Xc.} where M is the pool capacity. f (Xci) is still positive but
+small; the pool keeps the M best (ranked by f (χci); smaller is better) examples it receives. The
+activation space representations of these candidates are used as extra information to guide the search
+towards adversarial examples. We detail each part of BaB attack in next sub-sections.
+3.1	Top-down Beam Search Guided by Neural Network Verifiers
+Challenges in searching adversarial examples. The activation space can be quite large (e.g.,
+with thousands or more dimensions), and adversarial examples are at the leaf level of the search
+tree. Searching directly from the root node and traversing the search tree in an exhaustive manner
+(such as BFS or DFS) can be quite insufficient. To locate adversarial examples faster, we propose to
+use beam search guided by lower bounds from neural network verifiers, as detailed below.
+Beam search in activation space. The key insight in our procedure is to accelerate the search
+by prioritizing suspicious subdomains with small LB(S), quickly excluding the tree branches that
+are guaranteed with no adversarial examples. At the root node in the search tree, our beam search
+procedure expands the tree by D levels, yielding 2D subdomains:
+Sl = Sroot ∪{S1 =0,S1 = 0 …，SD = 0}, S2 = Sroot ∪{si = 1,S1 = 0 ∙∙∙ ,SD = 0},
+S3 = Sroot ∪{S1 = 0,S1 = 1 ∙∙∙ ,SD = 0},	•一，	S?D = Sroot ∪{si =1,S1 = 1 ∙∙∙ ,SD = 1}
+4
+Under review as a conference paper at ICLR 2022
+For each subdomain, we obtain its lower bound via the primitive LB(S). We use the bound propaga-
+tion procedure in the α,β-CROWN verifier to efficiently provide LB(S), but other efficient bounding
+methods can also be used in principle. Then, We sample K subdomains without replacement out of
+the 2D domains, with the following probability associated with each S%:
+pi
+exp(-T ∙ LB(Si)) ∙ I(LB(Si) < 0)	, J ^d`
+——2D--------------------------------------, i ∈ {1,… ,2D}, T is the temperature, set to 0.1
+A subdomain with more negative lower bound has a higher
+probability to be selected, since the large negative bounds may
+indicate a higher chance of the existence of adversarial exam-
+ples. Subdomains with positive bounds will never be selected,
+since they are guaranteed to not contain adversarial examples.
+The picked out subdomains S1 ,…，SK become the parent
+nodes for the next iteration of beam search. In the next itera-
+tions, we explore K ∙ 2D subdomains and increase the depth by
+D per iteration. Since allthe subdomain lower bounds are com-
+puted in a large batch on GPUS and only take a few seconds,
+our search procedure quickly explore deep in the search tree.
+Our specialized top-down beam search procedure with lower
+^0o2 ^0o1AdxemIaesl
+Leaf nodes: all binary variables have been fixed
+Figure 3: Beam search: we select K
+subdomains probabilistically accord-
+ing to LB(S), and expand the search
+tree by D levels using bound propaga-
+tion on GPU.
+bounds computed efficiently by bound propagation methods on
+GPUs brings us great advantages over existing MIP solvers,
+which conduct BaB on CPUs using a generic procedure such
+as the Simplex algorithm. In practice, we can visit several or-
+ders of magnitude more subdomains.
+Sub-MIP on most promising subdomains. Before the beam search reaches the leaf level, we
+start searching adversarial examples in the most promising subdomains (e.g., in some of the selected
+domains Sj, •一，SK), by constructing a sub-MIP problem ofEq. (2): in the k-th sub-MIP, we fix its
+binary variables Sji) based on constraints in Sk. In this step, although a generic MIP solver is used,
+it is instructed to search in subdomains guided by beam search to be likely to contain adversarial
+examples. With a large number of Sj) fixed during beam search, the MIP solver only needs to work
+on a much smaller problem and can be much more effective than solving Eq. (2) directly.
+Completeness. Beam search, if implemented with back-tracking, can achieve completeness (Zhou
+& Hansen, 2005): given sufficient time, it will systematically visit all leaf nodes, and guarantee to
+either locate an adversarial example, or prove the network safe. However, due to the large number of
+neurons and associated binary variables, achieving completeness often requires an infeasibly large
+amount of time and space. We thus focus on searching adversarial examples as fast as possible rather
+than exhaustively visiting every node, although theoretically our procedure can be made complete.
+3.2	Diving in Branch and Bound with Common Adversarial Patterns
+What is diving? “Diving” refers to diving deep in the BaB search tree by heuristically fixing some
+integer variables without exploring all possible branches. It is a common strategy in generic MIP
+solvers, able to quickly uncover feasible solutions of a MIP problem (Berthold, 2006; Nair et al.,
+2020). In our case, we want to fix binary variables S(ji) in Eq. (2), and a feasible solution x with
+f(x) < 0 is an adversarial example (Figure 4). A generic MIP solver uses diving to hopefully find
+high quality feasible solutions quickly, however it cannot use the information provided by cheaply
+generated adversarial examples like PGD attack to guide this heuristic. In this work, we propose a
+specialized diving scheme in the activation space based on the statistics in the adversarial candidates
+pool, and construct sub-MIPs with additional diving constraints to reduce the search space.
+Diving with common adversarial patterns. Given the candidates pool P = {χ5,…，XcM }, we
+first extract the corresponding binary variables Si for each example, by propagating them through the
+network (see Section 2). The binary variable corresponds to the i-th neuron of the m-th adversarial
+example is denoted as Si,m (0 or 1). A variable Si is called a common activation when the function
+c(i) is greater than a threshold:
+PmM=
+c(i) :=
+1 Si,m
+M
+- M/2
++ 0.5 ≥ C,
+C ∈ [0.5, 1.0]
+For example, when C = 0.9, a common activation requires that at least 90% examples in the pool
+share the same value of Si (0 or 1). All the common activations and their common values (0 or 1)
+5
+Under review as a conference paper at ICLR 2022
+are called common adversarial patterns, indicating that an adversarial examples will be very likely
+to contain these settings of si . We can thus construct a set of constraints Scommon, setting common
+activations and their common values:
+MM
+{Si = I(E si,m ≥ y), c(i) ≥ C,i ∈ [N ]}
+m=1
+Scommon
+Then, when constructing the top-down SUb-MIPs in Sec. 3.1, We provide additional constraints
+Scommon. Including these additional constraints further reduces the search space for the MIP solver
+(the MIP solver solves Eq. (2) with both beam search constraints S1 and diving constraints Scommon),
+making it easier to find an solution. The threshold C controls the aggressiveness of diving; too much
+diving may lead to a too small search space so good adversarial examples cannot be found.
+HoW to fill the adversarial candidates pool? To obtain use-
+ful common adversarial pattern, we maintain an adversarial
+candidates pool with up to M most promising adversarial can-
+didates (f (x) is close to 0 but the label is not yet flipped).
+The pool is initialized with perturbed samples bounded within
+C found with output diversified PGD (Tashiro et al., 2020),
+which creates a diverse set of adversarial candidates. Dur-
+ing our BaB attack process, new adversarial candidates come
+from three sources: (1) some neural network verifier provides
+upper bounds for each subdomain during beam search; in
+α,β-CROWN these upper bounds are obtained via conduct-
+ing PGD on its dual solutions (Wang et al., 2021) produced
+by the solver, and they are added to the pool; (2) the solutions
+returned by the top-down sub-MIP solved with beam search
+and diving constraints, and (3) the solutions returned by the
+bottom-up sub-MIP with large neighborhood search (which
+will be discussed in the next subsection). When new adver-
+sarial candidates are inserted, they are compared to existing
+ones in the pool, and we keep the best M adversarial candi-
+dates with distinct activation patterns.
+3.3	Bottom-Up Large neighborhood Search (LNS)
+What is bottom-up search? The bottom-up search proce-
+dure starts at the leaf nodes of the BaB search tree (Figure 5):
+we start from a known adversarial candidate Xc that is close
+to decision boundry (f (Xc) > 0 but very small), and want to
+further reduce f (Xc) by searching around xc. A naive way is
+to conduct PGD attack in the input space with Xc as the start-
+ing point, but we found it not helpful because the adversarial
+candidates in the pool have already been optimized using PGD
+or stronger attacks. Thus, we propose to use a large neighbor-
+hood search in the activation space.
+Fix more variables
+Leaf nodes: all binary variables have been fixed
+Figure 4: We dive the search tree with
+additional constraints constructed by
+common adversarial patterns to greatly
+reduce top-down sub-MIP search space.
+Figure 5: In bottom-up search, we free
+some fixed integer variables at a leaf
+node (an adversarial candidate) search-
+ing its neighborhood in activation space.
+Bottom-up search via large neighborhood search. Large neighborhood Search (LNS) (Walser,
+2003; Schrijver, 2003) is a generic local search heuristic: one defines a neighborhood around a ref-
+erence point (a feasible solution) and finds the optimum objective in this neighborhood, typically by
+constructing a sub-MIP problem with neighborhood constraints. In the setting of integer program-
+ming, the neighborhood can be defined by freeing certain fixed integer variables, allowing them to
+be optimized while fixing other integer variables. However, traditional local search algorithms in
+MIP solvers has little guidance regarding promising subdomains in common adversarial examples
+and can be ineffective due to the high dimensional search space in the adversarial attack problem.
+In BaB attack, we extend the general idea of LNS to a specialized local search for adversarial attacks
+by selecting the most promising adversarial candidates in the pool as the reference point and then
+use the statistics from the pool to free certain binary variables Si . Specifically, among all the binary
+variables corresponding to ReLU neurons on the selected candidate, we find the ReLU neurons
+where adversarial candidates in the pool that disagree the most and define the disagreed adversarial
+patterns. Formally, similar to the setting in Sec. 3.2, a variable Si is called a disagreed activation if:
+c(i) := 1 - c(i) ≥ C, C ∈ [0.0, 0.5]
+6
+Under review as a conference paper at ICLR 2022
+(S-Ino)
+U-PeE me IUnlUU-IU
+0no)
+U-Pelu V-Urosra LUn
+(S-Ino)
+U-PeE me IUnlUU-IU
+(a) MNIST CNN-A-Adv
+(S-Jno)
+u⅞elu V-Urosro LUnLUU - LU
+(b) MNIST Small-Adv
+(S-Jno)
+U-PeLU XUEZne Lunluu-
+(c) CIFAR CNN-B-Adv
+(S-Ino)
+u⅞elu V-Urosro
+minmum attack margin
+(M『PGD, ODS-PGD, AutoAttack)
+(d) CIFAR CNN-A-Mix	(e) CIFAR Marabou	(f) MNIST Conv-Small
+Figure 6: For examples that all attacks failed, we compare the minimum margin between the ground-truth
+label and all other target labels for the adversarial candidate. A smaller margin is better. Our attack achieves
+noticeably smaller margins compared to other attacks (margins from other attacks are below the y = x line).
+For example, When C = 0.3, Si is a disagreed activation When there are at least 30% examples in
+the pool do not share the same value of si . Since these variables are quite different across existing
+adversarial examples, We remove their corresponding binary variables to alloW the MIP solver to
+search for a better setting of these variables. The aggressiveness of freeing variables in LNS is
+determined by C. The set of disagreed adversarial patterns is a set of binary variables:
+Sdisagreed = {Si | c(i) ≥ C,i ∈ [N]}
+Formally, to search around an adversarial candidate xc , We first propagate xc through the netWork
+and obtain activation values zi , extract the corresponding binary variables si for xc , and remove the
+constraints that are in Sdisagreed to construct the set of constraints for bottom-up search:
+Sbottom-up =
+{Si = U(Zi ≥ 0),Si ∈ Sdisagreed, i ∈ [N]}
+We then construct a sub-MIP using Eq. (2) With the additional constraints Sbottom-up and solve it
+using a MIP solver. The optimal solution to each sub-MIP (if still not an adversarial example) Will
+be added back to adversarial candidates pool again Waiting for another round of local search.
+4	Experiments
+Setup. We evaluate our methods on all 10,000 test examples of MNIST (LeCun, 1998) and CI-
+FAR10 (Krizhevsky et al., 2009) dataset, and select 9 models Which are mostly benchmarking mod-
+els used in previous Works or competitions (details in Appendix A). For each model, We first run
+three commonly used strong adversarial attacks: a multi-targeted PGD (MT-PGD) attack (GoWal
+et al., 2019a) With 100 Adam steps and 30 random restarts; a multi-targeted PGD attack With Out-
+put Diversified Sampling (ODS-PGD) (Tashiro et al., 2020) With 100 Adam steps and 30 random
+restarts, and AutoAttack (Croce & Hein, 2020b) Which is an ensemble of parameter-free attacks.
+The remaining robust images are then tested With α,β-CROWN verifier (Wang et al., 2021; Xu
+et al., 2021; Zhang et al., 2018) to see if they can be verified robust so no further attack is needed.
+Any images that failed With the verifier are then evaluated in an MIP formulation (Tjeng et al., 2019)
+solved using Gurobi. The MIP solver is used as the last resort because it is usually much more ex-
+pensive than other approaches. We set an one hour timeout for MIP attack and our BaB attack,
+but our attack usually terminates much faster than a generic MIP solver. Any instance that cannot
+be attacked via a combination of MT-PGD, ODS-PGD and AutoAttack nor verified is referred to
+as a hard instance, and the main evaluation is conducted on these instances. An attacks are '∞
+norm-based With listed in Table 1. The hyperparameters can be found in Appendix A.2.
+7
+Under review as a conference paper at ICLR 2022
+MNIST Small-Adv: Running time (in S)
+(a) MNIST Small-Adv
+(b) MNIST CNN-A-ADV
+Figure 7: Running time vs. num-
+ber of attacked images compared to
+MIP attack.
+Results. Table 1 shows a breakdown of all 10,000 test exam-
+ples on the 5 models. Among these models, MNIST Small-Adv,
+MNIST Conv-Small, CIFAR LPD-CNN-A, and LPD-ResNet are
+relatively easy, and most of datapoints can be either attacked or
+verified by SOTA tools. The LPD-CNN-A and LPD -ResNet mod-
+els were among the largest ones in (Tjeng et al., 2019), however
+they have become quite easy due to the recent progress of neu-
+ral network verifiers - only 2 and 1 (out of 10,000) examples are
+hard instances. On the relatively small MNIST Small-Adv model,
+a MIP solver can terminate within a reasonable amount of time,
+and we can attack the same number of images while being faster.
+On the MNIST CNN-A-Adv model, many instances timeout with
+the MIP solver and we can attack more images under less time;
+see Fig. 7 and Fig. 8 (in Appendix) for time vs. number of images
+attacked. The CIFAR CNN-B-Adv, CNN-A-Mix, and Marabou
+models are much harder, and we managed to solve 5, 17, and 27
+more images compared to MIP attack within much shorter time.
+BaB attack can solve the same number of images as MIP attack
+on MNIST Conv-Small and CIFAR CNN-A-Adv but is over 10x
+faster in average. For images that none of the attacks work, we
+plot the minimum margin between the ground-truth label and other
+labels in Fig. 6 and compare the margins against ODS-PGD, MT-
+PGD attacks and AutoAttack. Our method consistently achieves smaller margins on all 6 models.
+Comparison to more attacks. We compare our BaB attack to 5 state-of-the-art attacks on all hard
+instances in Table 2. Attacks we evaluated include 1) FAB attack (Croce & Hein, 2020a): a white-
+box boundary adversarial attack; 2) Square attack (Andriushchenko et al., 2020): a query-efficient
+black-box adversarial attack using randomized search with localized square-shaped updates; 3)
+DIFGSM attack (Xie et al., 2019): a white box attack leveraging input diversity; 4) MIFGSM at-
+tack (Dong et al., 2018): a momentum-based iterative white box attack to escape from poor local
+maxima and 5) Distributional attack (Zheng et al., 2019): a white box attack considering adversarial-
+data distribution. We increased steps and iterations to make some attacks stronger; hyperparameters
+are in Appendix A.3. Most attacks are not effective on these hard instances. Square attack is the
+strongest among them but still finds less adversarial examples than us and is also relatively slow.
+Ablation study. To fully understand how each proposed component contributes to the overall
+performance of BaB attack, we conduct ablation study on MNIST Small-Adv and MNIST CNN-A-
+Adv models and show the number of successfully attacked instances and average time in Table 3. We
+first show that the beam search guided by verifier α,β-CROWN significantly helps the performance
+compared to random top-down search without any guidance. We then show that the top-down diving
+and bottom-up large neighborhood search contribute to different hard instances and the combination
+of them lead to the best attack performance. Note that the average time here is on successfully
+attacked Samples by each method only, ShoWing the efficiency of each Component instead of Strength.
+Dataset ∣ Model ∣ eps ∣ Clean Acc. Total verified Total attacked ∣ Hard instances ∣ MIP attack Avg. time(s) ∣ BaB attack Avg. time(s)
+	Small-Adv	0.3	97.94%	8176	1559	59	37	439.88	37	16.15
+MNIST	CNN-A-Adv	0.3	96.33%	6757	2239	637	51	2546.13	67	111.77
+	Conv-Small	0.12	98.04%	7628	2159	38	17	3358.49	17	8.52
+	LPd-CNN-A	2/255	60.86%	5019	1065	2	2	13.80	2	9.90
+	LPd-RES	8/255	27.07%	2243	463	1	0	-	0	-
+CIFAR	CNN-A-Adv	2/255	65.63%	4755	1660	148	8	906.77	8	57.98
+	CNN-B-Adv	2/255	78.25%	4539	1735	1551	1	3661.40	6	65.61
+	CNN-A-Mix	2/255	74.18%	4298	2058	1062	2	3467.52	19	71.65
+	Marabou	2/255	63.14%	875	4188	1251	15	1470.22	42	56.82
+Table 1: Comparison between MIP attack (Tjeng et al., 2019) (Using GurObi) and our BaB Attack. Both
+attacks focus on hard instances Where a combination of MT-PGD, ODS-PGD and AutoAttack cannot attack
+and their robustness also cannot be verified using a verifier. We are faster than MIP Attack and can also find
+more adversarial examples in all models. Average time excludes examples where all methods time out.
+5	Related Work
+Adversarial examples and attacks. Adversarial examples were first discovered in (Szegedy et al.,
+2013; Biggio et al., 2013) and they can be easily constructed by single-/multi-step gradient descent
+to fool regularly trained neural networks (Kurakin et al., 2016; Goodfellow et al., 2015). However,
+purely gradient-based methods can fail due to gradient masking and obfuscated gradients (Tramer
+et al., 2017; Papernot et al., 2016; Athalye et al., 2018). Popular attacks like PGD (Madry et al.,
+2018) or CW (Carlini & Wagner, 2017) can lead to overestimation of robustness (Mosbach et al.,
+8
+Under review as a conference paper at ICLR 2022
+Dataset	Model	# Total	FAB	Square	DIFGSM	MIFGSM	Distributional	BaB attack
+			# succ. Time(s)	# succ. Time(s)	# succ. Time(s)	# succ. Time(s)	# succ. Time(s)	# succ. Time(s)
+	Small-Adv	-59-	1	32.29	12	79.61	0	0.04	0	0.02	0	0.03	-37	16.15
+MNIST	CNN-A-Adv	637	0	33.96	17	117.51	0	0.04	0	0.02	1	0.01	67	111.77
+	Conv-Small	38	1	31.90	14	113.03	0	0.04	0	0.02	1	0.03	17	8.52
+	LPd-CNN-A	2	0	34.61	0	117.33	0	0.02	0	0.02	0	0.64	2	9.90
+	LPd-RES	1	0	48.98	0	242.52	0	0.42	0	0.06	0	1.62	0	-
+CIFAR	CNN-A-Adv	148	0	33.22	0	116.76	0	0.39	0	0.02	0	0.01	8	57.98
+	CNN-B-Adv	1551	3	16.81	3	119.88	2	0.01	2	0.02	2	0.01	6	65.61
+	CNN-A-Mix	1062	0	34.13	0	117.16	0	0.04	0	0.02	0	0.02	19	71.65
+	Marabou	1251	0	29.21	0	111.70	0	0.04	0	0.02	1	0.03	42	56.82
+Table 2: Number of successfully (# succ.) attacked hard instances (from Table 1) under five more attacks.
+	MNIST-Small-Adv			MNIST-CNN-A-Adv		
+	# success	# total	Avg. time	# success	# total	Avg. time
+Random top-down beam search	8	59	19.52	22	637	13.46
+Verifier guided beam search	36	59	21.58	54	637	203.75
+Verifier guided beam search + diving	36	59	20.63	57	637	105.49
+Verifier guided beam search + bottomup search	36	59	22.67	66	637	110.65
+Verifier guided beam search + diving + bottomup search	37	59	16.15	67	637	111.77
+Table 3: Ablation study on how each proposed component contributes to the overall performance.
+2018; Croce et al., 2020) despite their empirically good performance and efficiency. A large body of
+white-box adversarial attacks have been proposed to strengthen adversarial attacks; many of them
+are variants of PGD based attacks (Zheng et al., 2019; Tashiro et al., 2020; Gowal et al., 2019b;
+Wang et al., 2019). Due to non-convexity of the adversarial attack objective, gradient-free methods
+and black-box attacks are also widely explored but mostly result in similar or worse performance
+compared to gradient-based ones (Papernot et al., 2017; Chen et al., 2017; Ilyas et al., 2018a;b; Xiao
+et al., 2018; Andriushchenko et al., 2020). Recently, stronger attacks (Croce & Hein, 2020a;b) are
+proposed but they are also restricted to searching in input space. In this paper, we are the first to
+conduct a systematic and efficient search of adversarial examples in activation space inspired by
+branch and bound techniques used for integer optimization and neural network verification.
+Neural network verification. Early neural network verifiers solve the verification problem with
+satisfiability modulo theories (SMT) or MIP solvers and can only scale to very small networks (Katz
+et al., 2017; Huang et al., 2017; Ehlers, 2017; Dutta et al., 2018; Tjeng et al., 2019). Efficient
+verification methods with various sound relaxations are then proposed for verifying larger networks
+but without completeness guarantee (Wong & Kolter, 2018; Dvijotham et al., 2018; Raghunathan
+et al., 2018a;b; Singh et al., 2018b;a; Zhang et al., 2018; Tjandraatmadja et al., 2020). Branch and
+bound (BaB) based verifiers can efficiently branch on ReLU neurons and achieve completeness on
+ReLU networks using efficient incomplete verifiers (Bunel et al., 2018; Wang et al., 2018a; Lu &
+Kumar, 2020; Botoeva et al., 2020). BaB based methods with input domain split and refinements
+are also investigated but they are limited to low input dimensions (Wang et al., 2018b; Royo et al.,
+2019; Anderson et al., 2019). Recent verifiers use GPU accelerated incomplete solvers to further
+scale up verification and achieve several orders of magnitude speedup (Bunel et al., 2020; De Palma
+et al., 2021b; Anderson et al., 2020; XU et al., 2021; Muller et al., 2021; 2020; Wang et al., 2021).
+Our BaB attack relies on the lower bounds of BaB subdomains computed by α,β-CROWN (Zhang
+et al., 2018; Xu et al., 2021; Wang et al., 2021), one of the most efficient GPU-based verifiers that
+won the second neural network verification competition (VNN-COMP 2021) (Bak et al., 2021).
+6	Conclusion
+In this paper, we proposed BaB attack, a strong adversarial attack using branch and bound to sys-
+tematically search adversarial examples in activation space. We propose a top-down beam search
+utilizing bound propagation methods from neural network verifiers on GPUs to quickly locate po-
+tential subdomains containing adversarial examples. We further exploit the common activation pat-
+terns of adversarial candidates obtained by cheap attacks to guide the searching process with diving.
+Moreover, a bottom-up large neighborhood search procedure explores around promising adversarial
+candidates to find potential adversarial examples. Experimental results show that our BaB attack can
+find adversarial examples for hard input instances where SOTA adversarial attacks fail. We achieve
+higher attack success rates within much less time compared to generic MIP solver based attacks.
+Limitations of this study. One limitation of BaB Attack is speed - it usually takes a few minutes
+to explore a branch and bound tree using beam search, while gradient based adversarial attacks are
+often very fast, in a few seconds. Practically, BaB attack is mostly useful for hard instances, and we
+can use other simpler attacks as a filter to reduce the number of inputs for BaB attack. Additionally,
+BaB attack currently relies on neural network verifiers to give a lower bound for each subdomain
+to guide the beam search, so its scalability is limited by SOTA verification tools. Yet, we have
+demonstrated that it is faster and also more effective than attacks using an off-the-shelf MIP solver.
+9
+Under review as a conference paper at ICLR 2022
+References
+Moustafa Alzantot, Yash Sharma, Supriyo Chakraborty, Huan Zhang, Cho-Jui Hsieh, and Mani B
+Srivastava. Genattack: Practical black-box attacks with gradient-free optimization. In Proceed-
+ingsof the Genetic and Evolutionary Computation Conference, pp. 11l1-1119, 2019.
+Greg Anderson, Shankara Pailoor, Isil Dillig, and Swarat Chaudhuri. Optimization and abstraction:
+A synergistic approach for analyzing neural network robustness. In Proceedings of the 40th ACM
+SIGPLAN Conference on Programming Language Design and Implementation (PLDI), 2019.
+Ross Anderson, Joey Huchette, Christian Tjandraatmadja, and Juan Pablo Vielma. Strong convex
+relaxations and mixed-integer programming formulations for trained neural networks. Mathemat-
+ical Programming, 2020.
+Maksym Andriushchenko, Francesco Croce, Nicolas Flammarion, and Matthias Hein. Square at-
+tack: a query-efficient black-box adversarial attack via random search. In European Conference
+on Computer Vision, pp. 484-501. Springer, 2020.
+Anish Athalye, Nicolas Carlini, and David Wagner. Obfuscated gradients give a false sense of
+security: Circumventing defenses to adversarial examples. In ICML, 2018.
+Stanley Bak, Changliu Liu, and Taylor Johnson. The second international verification of neural
+networks competition (vnn-comp 2021): Summary and results. arXiv preprint arXiv:2109.00498,
+2021.
+Timo Berthold. Primal heuristics for mixed integer programs. 2006.
+Battista Biggio, Igmo Corona, Davide Maiorca, Blame Nelson, Nedim Srndic, Pavel Laskov, Gior-
+gio Giacinto, and Fabio Roli. Evasion attacks against machine learning at test time. In Joint
+European conference on machine learning and knowledge discovery in databases, 2013.
+Elena Botoeva, Panagiotis Kouvaros, Jan Kronqvist, Alessio Lomuscio, and Ruth Misener. Effi-
+cient verification of relu-based neural networks via dependency analysis. In AAAI Conference on
+Artificial Intelligence (AAAI), 2020.
+Wieland Brendel, Jonas Rauber, and Matthias Bethge. Decision-based adversarial attacks: Reliable
+attacks against black-box machine learning models. In ICLR, 2018.
+Rudy Bunel, Alessandro De Palma, Alban Desmaison, Krishnamurthy Dvijotham, Pushmeet Kohli,
+Philip H. S. Torr, and M. Pawan Kumar. Lagrangian decomposition for neural network verifica-
+tion. Conference on Uncertainty in Artificial Intelligence (UAI), 2020.
+Rudy R Bunel, Ilker Turkaslan, Philip Torr, Pushmeet Kohli, and Pawan K Mudigonda. A unified
+view of piecewise linear neural network verification. In Advances in Neural Information Process-
+ing Systems (NeurIPS), 2018.
+Nicholas Carlini and David Wagner. Towards evaluating the robustness of neural networks. In
+Security and Privacy (SP), 2017 IEEE Symposium on, pp. 39-57. IEEE, 2017.
+Pin-Yu Chen, Huan Zhang, Yash Sharma, Jinfeng Yi, and Cho-Jui Hsieh. Zoo: Zeroth order opti-
+mization based black-box attacks to deep neural networks without training substitute models. In
+Proceedings of the 10th ACM Workshop on Artificial Intelligence and Security, pp. 15-26. ACM,
+2017.
+Minhao Cheng, Thong Le, Pin-Yu Chen, Jinfeng Yi, Huan Zhang, and Cho-Jui Hsieh. Query-
+efficient hard-label black-box attack: An optimization-based approach. arXiv preprint
+arXiv:1807.04457, 2018.
+Francesco Croce and Matthias Hein. Minimally distorted adversarial examples with a fast adaptive
+boundary attack. In International Conference on Machine Learning, pp. 2196-2205. PMLR,
+2020a.
+Francesco Croce and Matthias Hein. Reliable evaluation of adversarial robustness with an ensemble
+of diverse parameter-free attacks. In International conference on machine learning, pp. 2206-
+2216. PMLR, 2020b.
+10
+Under review as a conference paper at ICLR 2022
+Francesco Croce, Jonas Rauber, and Matthias Hein. Scaling up the randomized gradient-free adver-
+sarial attack reveals overestimation of robustness using established attacks. International Journal
+of Computer Vision, 2020.
+Sumanth Dathathri, Krishnamurthy Dvijotham, Alexey Kurakin, Aditi Raghunathan, Jonathan Ue-
+sato, Rudy R Bunel, Shreya Shankar, Jacob Steinhardt, Ian Goodfellow, Percy S Liang, et al.
+Enabling certification of verification-agnostic networks via memory-efficient semidefinite pro-
+gramming. Advances in Neural Information Processing Systems (NeurIPS), 2020.
+Alessandro De Palma, Harkirat Singh Behl, Rudy Bunel, Philip H. S. Torr, and M. Pawan Kumar.
+Scaling the convex barrier with active sets. International Conference on Learning Representations
+(ICLR), 2021a.
+Alessandro De Palma, Rudy Bunel, Alban Desmaison, Krishnamurthy Dvijotham, Pushmeet Kohli,
+Philip HS Torr, and M Pawan Kumar. Improved branch and bound for neural network verification
+via lagrangian decomposition. arXiv preprint arXiv:2104.06718, 2021b.
+Yinpeng Dong, Fangzhou Liao, Tianyu Pang, Hang Su, Jun Zhu, Xiaolin Hu, and Jianguo Li. Boost-
+ing adversarial attacks with momentum. In Proceedings of the IEEE conference on computer
+vision and pattern recognition, pp. 9185-9193, 2018.
+Souradeep Dutta, Susmit Jha, Sriram Sankaranarayanan, and Ashish Tiwari. Output range analysis
+for deep feedforward neural networks. In NASA Formal Methods Symposium, 2018.
+Krishnamurthy Dvijotham, Robert Stanforth, Sven Gowal, Timothy Mann, and Pushmeet Kohli. A
+dual approach to scalable verification of deep networks. Conference on Uncertainty in Artificial
+Intelligence (UAI), 2018.
+Ruediger Ehlers. Formal verification of piece-wise linear feed-forward neural networks. In Interna-
+tional Symposium on Automated Technology for Verification and Analysis (ATVA), 2017.
+Ian J Goodfellow, Jonathon Shlens, and Christian Szegedy. Explaining and harnessing adversarial
+examples. In ICLR, 2015.
+Sven Gowal, Krishnamurthy Dvijotham, Robert Stanforth, Rudy Bunel, Chongli Qin, Jonathan Ue-
+sato, Timothy Mann, and Pushmeet Kohli. On the effectiveness of interval bound propagation for
+training verifiably robust models. Proceedings of the IEEE International Conference on Computer
+Vision (ICCV), 2019a.
+Sven Gowal, Jonathan Uesato, Chongli Qin, Po-Sen Huang, Timothy Mann, and Pushmeet Kohli.
+An alternative surrogate loss for pgd-based adversarial testing. arXiv preprint arXiv:1910.09338,
+2019b.
+Xiaowei Huang, Marta Kwiatkowska, Sen Wang, and Min Wu. Safety verification of deep neural
+networks. In International Conference on Computer Aided Verification (CAV), 2017.
+Andrew Ilyas, Logan Engstrom, Anish Athalye, and Jessy Lin. Black-box adversarial attacks with
+limited queries and information. In International Conference on Machine Learning (ICML),
+2018a.
+Andrew Ilyas, Logan Engstrom, and Aleksander Madry. Prior convictions: Black-box adversarial
+attacks with bandits and priors. arXiv preprint arXiv:1807.07978, 2018b.
+Guy Katz, Clark Barrett, David L Dill, Kyle Julian, and Mykel J Kochenderfer. Reluplex: An
+efficient smt solver for verifying deep neural networks. In International Conference on Computer
+Aided Verification (CAV), 2017.
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images.
+Technical Report TR-2009, 2009.
+Alexey Kurakin, Ian Goodfellow, and Samy Bengio. Adversarial examples in the physical world.
+arXiv preprint arXiv:1607.02533, 2016.
+Yann LeCun. The mnist database of handwritten digits. http://yann. lecun. com/exdb/mnist/, 1998.
+11
+Under review as a conference paper at ICLR 2022
+Jingyue Lu and M Pawan Kumar. Neural network branching for neural network verification. Inter-
+national Conference on Learning Representation (ICLR), 2020.
+Aleksander Madry, Aleksandar Makelov, Ludwig Schmidt, Dimitris Tsipras, and Adrian Vladu.
+Towards deep learning models resistant to adversarial attacks. In International Conference on
+Learning Representations (ICLR), 2018.
+Marius Mosbach, Maksym Andriushchenko, Thomas Trost, Matthias Hein, and Dietrich Klakow.
+Logit pairing methods can fool gradient-based attacks. arXiv preprint arXiv:1810.12042, 2018.
+Christoph Muller, GagandeeP Singh, Markus PuscheL and Martin Vechev. Neural network robust-
+ness verification on gpus. arXiv preprint arXiv:2007.10868, 2020.
+Mark Niklas MUller, Gleb Makarchuk, Gagandeep Singh, Markus PUschel, and Martin Vechev. Pre-
+cise multi-neuron abstractions for neural network certification. arXiv preprint arXiv:2103.03638,
+2021.
+Vinod Nair, Sergey Bartunov, Felix Gimeno, Ingrid von Glehn, Pawel Lichocki, Ivan Lobov, Bren-
+dan O’Donoghue, Nicolas Sonnerat, Christian Tjandraatmadja, Pengming Wang, et al. Solving
+mixed integer programs using neural networks. arXiv preprint arXiv:2012.13349, 2020.
+Nicolas Papernot, Patrick McDaniel, Arunesh Sinha, and Michael Wellman. Towards the science of
+security and privacy in machine learning. arXiv preprint arXiv:1611.03814, 2016.
+Nicolas Papernot, Patrick McDaniel, Ian Goodfellow, Somesh Jha, Z Berkay Celik, and Ananthram
+Swami. Practical black-box attacks against machine learning. In Proceedings of the 2017 ACM
+on Asia Conference on Computer and Communications Security, pp. 506-5l9. ACM, 2017.
+Aditi Raghunathan, Jacob Steinhardt, and Percy Liang. Certified defenses against adversarial exam-
+ples. International Conference on Learning Representations (ICLR), 2018a.
+Aditi Raghunathan, Jacob Steinhardt, and Percy S Liang. Semidefinite relaxations for certify-
+ing robustness to adversarial examples. In Advances in Neural Information Processing Systems
+(NeurIPS), 2018b.
+Vicenc Rubies Royo, Roberto Calandra, Dusan M Stipanovic, and Claire Tomlin. Fast neural net-
+work verification via shadow prices. arXiv preprint arXiv:1902.07247, 2019.
+Hadi Salman, Greg Yang, Huan Zhang, Cho-Jui Hsieh, and Pengchuan Zhang. A convex relaxation
+barrier to tight robustness verification of neural networks. In Advances in Neural Information
+Processing Systems (NeurIPS), 2019.
+Alexander Schrijver. Combinatorial optimization: polyhedra and efficiency, volume 24. Springer
+Science & Business Media, 2003.
+Gagandeep Singh, Timon Gehr, Matthew Mirman, Markus Puschel, and Martin Vechev. Fast
+and effective robustness certification. In Advances in Neural Information Processing Systems
+(NeurIPS), 2018a.
+Gagandeep Singh, Timon Gehr, Markus Puschel, and Martin Vechev. Boosting robustness certifica-
+tion of neural networks. In International Conference on Learning Representations, 2018b.
+Christian Szegedy, Wojciech Zaremba, Ilya Sutskever, Joan Bruna, Dumitru Erhan, Ian Goodfellow,
+and Rob Fergus. Intriguing properties of neural networks. In ICLR, 2013.
+Yusuke Tashiro, Yang Song, and Stefano Ermon. Diversity can be transferred: Output diversification
+for white-and black-box attacks. Advances in Neural Information Processing Systems (NeurIPS),
+2020.
+Christian Tjandraatmadja, Ross Anderson, Joey Huchette, Will Ma, Krunal Patel, and Juan Pablo
+Vielma. The convex relaxation barrier, revisited: Tightened single-neuron relaxations for neural
+network verification. Advances in Neural Information Processing Systems (NeurIPS), 2020.
+Vincent Tjeng, Kai Xiao, and Russ Tedrake. Evaluating robustness of neural networks with mixed
+integer programming. International Conference on Learning Representations (ICLR), 2019.
+12
+Under review as a conference paper at ICLR 2022
+Florian Tramer, Alexey Kurakin, Nicolas Papernot, Ian Goodfellow, Dan Boneh, and Patrick Mc-
+Daniel. Ensemble adversarial training: Attacks and defenses. arXiv preprint arXiv:1705.07204,
+2017.
+Joachim P Walser. Integer optimization by local search: A domain-independent approach. Springer,
+2003.
+Shiqi Wang, Kexin Pei, Justin Whitehouse, Junfeng Yang, and Suman Jana. Efficient formal safety
+analysis of neural networks. In Advances in Neural Information Processing Systems (NeurIPS),
+2018a.
+Shiqi Wang, Kexin Pei, Justin Whitehouse, Junfeng Yang, and Suman Jana. Formal security analysis
+of neural networks using symbolic intervals. In USENIX Security Symposium, 2018b.
+Shiqi Wang, Yizheng Chen, Ahmed Abdou, and Suman Jana. Enhancing gradient-based attacks
+with symbolic intervals. arXiv preprint arXiv:1906.02282, 2019.
+Shiqi Wang, Huan Zhang, Kaidi Xu, Xue Lin, Suman Jana, Cho-Jui Hsieh, and J Zico Kolter. Beta-
+crown: Efficient bound propagation with per-neuron split constraints for complete and incomplete
+neural network verification. arXiv preprint arXiv:2103.06624, 2021.
+Eric Wong and Zico Kolter. Provable defenses against adversarial examples via the convex outer
+adversarial polytope. In International Conference on Machine Learning (ICML), 2018.
+Eric Wong, Frank Schmidt, Jan Hendrik Metzen, and J Zico Kolter. Scaling provable adversarial
+defenses. In Advances in Neural Information Processing Systems (NeurIPS), 2018.
+Chaowei Xiao, Bo Li, Jun-Yan Zhu, Warren He, Mingyan Liu, and Dawn Song. Generating adver-
+sarial examples with adversarial networks. International Joint Conference on Artificial Intelli-
+gence (IJCAI), 2018.
+Kai Y Xiao, Vincent Tjeng, Nur Muhammad Shafiullah, and Aleksander Madry. Training for faster
+adversarial robustness verification via inducing relu stability. In ICLR, 2019.
+Cihang Xie, Zhishuai Zhang, Yuyin Zhou, Song Bai, Jianyu Wang, Zhou Ren, and Alan L Yuille.
+Improving transferability of adversarial examples with input diversity. In Proceedings of the
+IEEe/CVF Conference on Computer Vision and Pattern Recognition, pp. 2730-2739, 2019.
+Kaidi Xu, Zhouxing Shi, Huan Zhang, Yihan Wang, Kai-Wei Chang, Minlie Huang, Bhavya
+Kailkhura, Xue Lin, and Cho-Jui Hsieh. Automatic perturbation analysis for scalable certified
+robustness and beyond. Advances in Neural Information Processing Systems (NeurIPS), 2020.
+Kaidi Xu, Huan Zhang, Shiqi Wang, Yihan Wang, Suman Jana, Xue Lin, and Cho-Jui Hsieh. Fast
+and complete: Enabling complete neural network verification with rapid and massively parallel
+incomplete verifiers. International Conference on Learning Representations (ICLR), 2021.
+Huan Zhang, Tsui-Wei Weng, Pin-Yu Chen, Cho-Jui Hsieh, and Luca Daniel. Efficient neural net-
+work robustness certification with general activation functions. In Advances in Neural Information
+Processing Systems (NeurIPS), 2018.
+Tianhang Zheng, Changyou Chen, and Kui Ren. Distributionally adversarial attack. In Proceedings
+of the AAAI Conference on Artificial Intelligence (AAAI), 2019.
+Rong Zhou and Eric A Hansen. Beam-stack search: Integrating backtracking with beam search. In
+ICAPS, pp. 90-98, 2005.
+13
+Under review as a conference paper at ICLR 2022
+A Appendix
+A.1 Details of Models
+MNIST CNN-A-Adv, CIFAR CNN-A-Adv, CIFAR CNN-B-Adv and CIFAR CNN-A-Mix models
+are provided by (Dathathri et al., 2020) and were trained with adversarial training, except that CI-
+FAR CNN-A-Mix is trained with a mixture of adversarial training loss and certified defense loss.
+These models were used as a benchmark to evaluate the gap between verified accuracy and attack
+acucracy in a few papers (Dathathri et al., 2020; Wang et 疝，2021; Muller et al., 2021). MNIST
+Small-Adv is trained using adversarial training with architecture similar to the MNIST model used
+in (Madry et al., 2018) but scaled down by 4X and maxpool layers removed. MNIST Conv-Small
+is a naturally trained model from the ERAN benchmarks (Singh et al., 2018a; Muller et al., 2021).
+CIFAR LPd-CNN-A and LPd-RES (Tjeng et al., 2019) are trained using a dual linear programming
+based certified defense (Wong et al., 2018), so they are relatively easy to attack and verify. The CI-
+FAR Marabou model is from the marabou-cifar10 benchmark in 2nd International Verification
+of Neural Networks Competition (VNN-Comp) 2021 (Bak et al., 2021); the model (original name
+cifar10-small.onnx) is naturally trained on CIFAR-10 dataset.
+A.2 Hyperparameters for our BaB Attack
+We set the common adversarial pattern threshold C to be 1.0 for both top-down diving and disagreed
+adversarial pattern threshold C to 0.0 for bottom-up large neighborhood search. We use state-
+of-the-art verifier α,β-CROWN to provide verified lower bounds LB(S), prioritizing suspicious
+subdomains. We use the default learning rates 0.01 and 0.05 for both α-CROWN and β-CROWN.
+To tighten the estimation for each subdomain and provide more accurate guidance for suspicious
+ones, we increase the optimization iterations to 100 for both α-CROWN and β-CROWN with a
+learning rate decay of 0.999. We use the maximal batch size B to fit into the GPU memory. For
+each step of our beam search, we set the depth for each iteration of beam search D to be 8 and the
+number of picked out subdomains K to be B/2D . One can adjust D to control the searching speed.
+We run all our experiments on a EPYC 7502 CPU with 32 physical cores, and use up to 32 sub-MIP
+threads for top-down or bottom-up search. We set a timeout threshold for each sub-MIP to be 30
+seconds for MNIST-Small-Adv (because it is a relatively small model), 180s for the other MNIST
+models and 360s for CIFAR10 models. We run each attack for up to an hour to be consistent with
+the timeout threshold of baseline MIP attack while our BaB attack usually terminates much faster.
+A.3 Setup for Compared Attacks
+We did a small scale grid search for the best combination of hyperparameters for each attack. For
+FAB attack, we select a 100-steps attack with 50 restarts and set αmax = 0.1, β = 0.9 andη = 1.05;
+for Square attack, we use 7000 queries, 20 restarts and set 0.6 as the size of squares. Note that
+FAB and Square attacks are part of the AutoAttack suite, but here we significantly increased their
+steps and number of iterations compared to the defaults in AutoAttack. For DIFGSM attack, we
+set α = 6/255, decay rate as 0.9, number of iterations as 50 and the probability of applying input
+diversity as 0.5; for MIFGSM attack, we set α = 2/255, decay rate as 0.9 and number of iterations as
+20; for Distributional attack, we used 100 attack iterations, step size 0.01, and a balancing parameter
+of 0.05.
+A.4 More Experimental Results
+We plot running time vs. number of attacked images for five more models in Figure 7. Our BaB at-
+tack achieves distinctly faster running time and produces more successful attacked images compared
+to the MIP attack using an off-the-shelf sovler.
+14
+Under review as a conference paper at ICLR 2022
+No. of images attacked
+MNlST-Conv-SmaII: running time (in s)
+0
+8 6 4 2
+p,u,°1=,°sω6,°lu- JO
+1	10	100	1000
+ClFAR-CNN-A-Adv: running time (in s)
+6 4 2-
+p,u,°1=,°sω6,°lu- JO∙ON
+					
+BaB attack MlPattack				ɪ	
+					
+					
+	I				
+	Γ				Γ
+					
+1	10	100	1000
+CIFAR-CNN-B-Adv: running time (in s)
+ClFAR-CNN-A-Mix: running time (in s)
+Figure 8: Running time vs. number of attacked images compared to MIP attack on five models.
+15

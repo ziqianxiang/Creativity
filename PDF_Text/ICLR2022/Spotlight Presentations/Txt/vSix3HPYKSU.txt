@@ -1,0 +1,1296 @@
+﻿Published as a conference paper at ICLR 2022
+Message Passing Neural PDE Solvers
+Johannes Brandstetter*
+University of Amsterdam
+Johannes Kepler University Linz
+brandstetter@ml.jku.at
+Daniel E. Worrall*
+Qualcomm AI Researcht
+dworrall@qti.qualcomm.com
+Max Welling
+University of Amsterdam
+m.welling@uva.nl
+Ab stract
+The numerical solution of partial differential equations (PDEs) is difficult, hav-
+ing led to a century of research so far. Recently, there have been pushes to build
+neural-numerical hybrid solvers, which piggy-backs the modern trend towards
+fully end-to-end learned systems. Most works so far can only generalize over a
+subset of properties to which a generic solver would be faced, including: reso-
+lution, topology, geometry, boundary conditions, domain discretization regular-
+ity, dimensionality, etc. In this work, we build a solver, satisfying these proper-
+ties, where all the components are based on neural message passing, replacing
+all heuristically designed components in the computation graph with backprop-
+optimized neural function approximators. We show that neural message passing
+solvers representationally contain some classical methods, such as finite differ-
+ences, finite volumes, and WENO schemes. In order to encourage stability in
+training autoregressive models, we put forward a method that is based on the prin-
+ciple of zero-stability, posing stability as a domain adaptation problem. We val-
+idate our method on various fluid-like flow problems, demonstrating fast, stable,
+and accurate performance across different domain topologies, discretization, etc.
+in 1D and 2D. Our model outperforms state-of-the-art numerical solvers in the
+low resolution regime in terms of speed and accuracy.
+1	Introduction
+In the sciences, years of work have yielded extremely detailed mathematical models of physical
+phenomena. Many of these models are expressed naturally in differential equation form (Olver,
+2014), most of the time as temporal partial differential equations (PDE). Solving these differential
+equations is of huge importance for problems in all numerate disciplines such as weather forecast-
+ing (Lynch, 2008), astronomical simulations (Courant et al., 1967), molecular modeling (Lelievre &
+Stoltz, 2016) , or jet engine design (Athanasopoulos et al., 2009). Solving most equations of impor-
+tance is analytically intractable and necessitates falling back on numerical approximation schemes.
+Obtaining accurate solutions of bounded error with minimal computational overhead requires the
+need for handcrafted solvers, always tailored to the equation at hand (Hairer et al., 1993).
+The design of “good” PDE solvers is no mean feat. The perfect solver should satisfy an almost
+endless list of conditions. There are user requirements, such as being fast, using minimal compu-
+tational overhead, being accurate, providing uncertainty estimates, generalizing across PDEs, and
+being easy to use. Then there are structural requirements of the problem, such as spatial resolution
+and timescale, domain sampling regularity, domain topology and geometry, boundary conditions,
+dimensionality, and solution space smoothness. And then there are implementational requirements,
+such as maintaining stability over long rollouts and preserving invariants. It is precisely because of
+this considerable list of requirements that the field of numerical methods is a splitter field (Bartels,
+2016), tending to build handcrafted solvers for each sub-problem, rather than a lumper field, where
+a mentality of “one method to rule them all” reigns. This tendency is commonly justified with
+* Equal contribution
+^Qualcomm AI Research is an initiative of Qualcomm Technologies, Inc.
+1
+Published as a conference paper at ICLR 2022
+reference to no free lunch theorems. We propose to numerically solve PDEs with an end-to-end,
+neural solver. Our contributions can be broken down into three main parts: (i) An end-to-end fully
+neural PDE solver, based on neural message passing, which offers flexibility to satisfy all structural
+requirements of a typical PDE problem. This design is motivated by the insight that some classical
+solvers (finite differences, finite volumes, and WENO scheme) can be posed as special cases of mes-
+sage passing. (ii) Temporal bundling and the pushforward trick, which are methods to encourage
+zero-stability in training autoregressive models. (iii) Generalization across multiple PDEs within a
+given class. At test time, new PDE coefficients can be input to the solver.
+2	Background and related work
+Here in Section 2.1 we briefly outline definitions and notation. We then outline some classical
+solving techniques in Section 2.2. Lastly, in Section 2.3, we list some recent neural solvers and split
+them into the two main neural solving paradigms for temporal PDEs.
+2.1	Partial differential equations
+We focus on PDEs in one time dimension t = [0, T] and possibly multiple spatial dimensions
+x = [x1, x2, . . . , xD]> ∈ X. These can be written down in the form
+∂tu = F(t,x, u, ∂xu, ∂xxu, ...)	(t, x) ∈ [0,T] × X	(1)
+u(0, x) = u0(x), B[u](t, x) = 0	x ∈ X, (t, x) ∈ [0, T] × ∂X	(2)
+where u : [0, T] × X → Rn is the solution, with initial condition u0(x) at time t = 0 and bound-
+ary conditions B[u](t, x) = 0 when x is on the boundary ∂X of the domain X. The notation
+∂χU, ∂χχU,... is shorthand for partial derivatives ∂u∕∂x, ∂2u∕∂x2, and so forth. Most notably,
+∂u∕∂x represents a n X D dimensional Jacobian matrix, where each row is the transpose of the
+gradient of the corresponding component of u. We consider Dirichlet boundary conditions, where
+the boundary operator BD[u] = u - bD for fixed function bD and Neumann boundary conditions,
+where BN [u] = n>∂xu - bN for scalar-valued u, where n is an outward facing normal on ∂X.
+Conservation form Among all PDEs, we hone in on solving those that can be written down in
+conservation form, because there is already precedent in the field for having studied these (Bar-Sinai
+et al., 2019; Li et al., 2020a). Conservation form PDEs are written as
+∂tu + V ∙ J(u) =0 ,	(3)
+where V∙J is the divergence of J. The quantity J : Rn → Rn is the flux, which has the interpretation
+of a quantity that appears to flow. Consequently, u is a conserved quantity within a volume, only
+changing through the net flux J(u) through its boundaries.
+2.2	Classical solvers
+Grids and cells Numerical solvers partition X into a finite grid X = {ci }iN=1 of N small non-
+overlapping volumes called cells ci ⊂ X. In this work, we focus on grids of rectangular cells. Each
+cell has a center at xi . uik is used to denote the discretized solution in cell ci and time tk . There are
+two main ways to compute uik: sampling uik = u(tk, xi) and averaging uik = c u(tk, x) dx. In
+our notation, omitting an index implies that we use the entire slice, so uk = (u1k, u2k, ..., ukN).
+Method of lines A common technique to solve temporal PDEs is the method of lines (Schiesser,
+2012), discretizing domain X and solution U into a grid X and a vector Uk. We then solve ∂tut 院 =
+f(t, uk) for t ∈ [0, T] , where f is the form of F acting on the vectorized ut instead of the function
+U(t, x). The only derivative operator is now in time, making it an ordinary differential equation
+(ODE), which can be solved with off-the-shelf ODE solvers (Butcher, 1987; Everhart, 1985). f can
+be formed by approximating spatial derivatives on the grid. Below are three classical techniques.
+Finite difference method (FDM) In FDM, spatial derivative operators (e.g., ∂x) are replaced with
+difference operators, called stencils. For instance, ∂xuk |xi might become (uik+1 - uik)/(xi+1 - xi).
+Principled ways to derive stencils can be found in Appendix A. FDM is simple and efficient, but
+suffers poor stability unless the spatial and temporal discretizations are carefully controlled.
+2
+Published as a conference paper at ICLR 2022
+Finite volume method (FVM) FVM works for equations in conservation form. It can be shown
+via the divergence theorem that the integral of u over cell i increases only by the net flux into the
+cell. In 1D, this leads to f(t,uk) = ∆X(Jik-1/2 - J+i/2), where ∆xi is the cell width, and
+Jik-1/2, Jik+1/2 the flux at the left and right cell boundary at time tk, respectively. The problem thus
+boils down to estimating the flux at cell boundaries xi±1/2. The beauty of this technique is that the
+integral of u is exactly conserved. FVM is generally more stable and accurate than FDM, but can
+only be applied to conservation form equations.
+Pseudospectral method (PSM) PSM computes derivatives in Fourier space. In practical terms,
+the mth derivative is computed as IFFT{(ιω)mFFT(u)} for ι = ʌ/-1. These derivatives obtain
+exponential accuracy (Tadmor, 1986), for smooth solutions on periodic domains and regular grids.
+For non-periodic domains, analogues using other polynomial transforms exist, but for non-smooth
+solution this technique cannot be applied.
+2.3	Neural s olvers
+We build on recent exciting developments in the field to learn PDE solvers. These neural PDE
+solvers, as we refer to them, are laying the foundations of what is becoming both a rapidly growing
+and impactful area of research. Neural PDE solvers for temporal PDEs fall into two broad categories,
+autoregressive methods and neural operator methods, see Figure 1a.
+Neural operator methods Neural operator methods treat the mapping from initial conditions to
+solutions at time t as an input-output mapping learnable via supervised learning. For a given PDE
+and given initial conditions u0, a neural operator M : [0, T] × F → F, where F is a (possibly
+infinite-dimensional) function space, is trained to satisfy
+M(t, u0) = u(t) .	(4)
+Finite-dimensional operator methods (Raissi, 2018; Sirignano & Spiliopoulos, 2018; Bhatnagar
+et al., 2019; Guo et al., 2016; Zhu & Zabaras, 2018; Khoo et al., 2020), where dim(F) < ∞ are
+grid-dependent, so cannot generalize over geometry and sampling. Infinite-dimensional operator
+methods (Li et al., 2020c;a; Bhattacharya et al., 2021; Patel et al., 2021) by contrast resolve this is-
+sue. Each network is trained on example solutions of the equation of interest and is therefore locked
+to that equation. These models are not designed to generalize to dynamics for out-of-distribution t.
+Autogressive methods An orthogonal approach, which we take, is autoregressive methods. These
+solve the PDE iteratively. For time-independent PDEs, the solution at time t + ∆t is computed as
+u(t + ∆t) = A(∆t, u(t)) ,	(5)
+where A : R>0 × RN → RN is the temporal update. In this work, since ∆t is fixed, we just write
+A(u(t)). Three important works in this area are Bar-Sinai et al. (2019), Greenfeld et al. (2019), and
+Hsieh et al. (2019). Each paper focuses on a different class of PDE solver: finite volumes, multigrid,
+and iterative finite elements, respectively. Crucially, they all use a hybrid approach (Garcia Satorras
+et al., 2019), where the solver computational graph is preserved and heuristically-chosen parameters
+are predicted with a neural network. Hsieh et al. (2019) even have convergence guarantees for their
+method, something rare in deep learning. Hybrid methods are desirable for sharing structure with
+classical solvers. So far in the literature, however, it appears that autoregressive methods are more
+the exception than the norm, and for those methods published, it is reported that they are hard to
+train. In Section 3 we explore why this is and seek to remedy it.
+3	Method
+In this section we detail our method in two parts: training framework and architecture. The training
+framework tackles the distribution shift problem in autoregressive solvers, which leads to instability.
+We then outline the network architecture, which is a message passing neural network.
+3.1	Training framework
+Autoregressive solvers map solutions uk to causally consequent ones uk+1. A straightforward way
+of training is one-step training. Ifp0(u0) is the distribution of initial conditions in the training set,
+andpk(uk) = p(uk |u0)p0(u0) du0 is the groundtruth distribution at iteration k, we minimize
+Lone-step = EkEuF 廿廿~?忆[L(A(uk ), Uk+1)] ,	(6)
+3
+Published as a conference paper at ICLR 2022
+Initial
+conditions
+time
+Neural operator
+Mapping from initial
+conditions to output
+Autoregressive model
+Mapping between temporally
+consecutive time steps
+Temporal bundling
+Fewer calls to solver reduces
+error propagation speed
+(a) Neural solver frameworks
+(b) Temporal bundling
+Figure 1:	(a) Left: Neural operators perform a direct mapping from initial conditions to a solution
+at time t. RIGHT: Autoregressive models on the other hand compute the solution at time t based on
+the computed solution at a fixed time offset before. (b) Our autoregressive solver outputs multiple
+time slices on every call, to reduce number of solver calls and therefore error propagation speed.
+where L is an appropriate loss function. At test time, this method has a key failure mode, instability:
+small errors in A accumulate over rollouts greater in length than 1 (which is the vast majority of
+rollouts), and lead to divergence from the groundtruth. This can be interpreted as overfitting to the
+one-step training distribution, and thus being prone to generalize poorly if the input shifts from this,
+which is usually the case after a few rollout steps.
+The pushforward trick We approach the problem in probabilistic terms. The solver maps pk 7→
+A]pk at iteration k + 1, where A] : P(X) → P(X) is the pushforward operator for A and P(X)
+is the space of distributions on X . After a single test time iteration, the solver sees samples from
+A]pk instead of the distribution pk+1, and unfortunately A]pk 6= pk+1 because errors always survive
+training. The test time distribution is thus shifted, which we refer to as the distribution shift problem.
+This is a domain adaptation problem. We mitigate the distribution shift problem by adding a stability
+loss term, accounting for the distribution shift. A natural candidate is an adversarial-style loss
+Lstability = EkEuk+1 ∣uk,uk〜Pk [Ee∣uk [L(A(Uk + €), uk + 1)]],	⑺
+where |uk is an adversarial perturbation sampled from an appropriate distribution. For the per-
+turbation distribution, We choose € such that (Uk + €) 〜A]Pk. This can be easily achieved
+by using (uk + €) = A(uk-1) for uk-1 one step causally preceding uk. Our total loss is then
+Lone-step + Lstability . We call this the pushforward trick. We implement this by unrolling the solver
+for 2 steps but only backpropagating errors on the last unroll step, as shoWn in Figure 2. This is
+also outlined algorithmically in the appendix. We found it important not to backpropagate through
+the first unroll step. This is not only faster, it also seems to be more stable. Exactly Why, We are
+not sure, but We think it may be to ensure the perturbations are large enough. Training the ad-
+versarial distribution itself to minimize the error, defeats the purpose of using it as an adversarial
+distribution. Adversarial losses Were also introduced in Sanchez-Gonzalez et al. (2020) and later
+used in Mayr et al. (2021), Where BroWnian motion noise is used for € and there is some similarity
+to Noisy Nodes (GodWin et al.), Where noise injection is found to stabilize training of deep graph
+neural netWorks. There are also connections With zero-stability (Hairer et al., 1993) from the ODE
+solver literature. Zero-stability is the condition that perturbations in the input conditions are damped
+out sublinearly in time, that is ∣∣A(u0 + €) - u11∣ < κ∣∣ek, for appropriate norm and small κ. The
+pushforWard trick can be seen to minimize κ directly.
+The temporal bundling trick The second trick We found to be effective for stability and reducing
+rollout time is to predict multiple timesteps into the future synchronously. A typical temporal solver
+only predicts u0 7→ u1; Whereas, We predict K steps u0 7→ (u1, u2, ..., uK) = u1:K together. This
+reduces the number of solver calls by a factor of K and so reduces the number of times the solution
+distribution undergoes distribution shifts. A schematic of this setup can be seen in Figure 1b.
+3.2 Architecture
+We model the grid X as a graph G = (V , E ) With nodes i ∈ V, edges ij ∈ E , and node features
+fi ∈ Rc . The nodes represent grid cells ci and the edges define local neighborhoods. Modeling
+the domain as a graph offers flexibility over grid sampling regularity, spatial/temporal resolution,
+4
+Published as a conference paper at ICLR 2022
+今;今
+Unrolled training
+Gradients flow back
+through all time steps
+Pushforward training
+Gradients flow only
+through last time step
+One-step training
+Gradients flow back one
+time step only
+Figure 2:	Different training strategies. Left: One-step training only predicts solutions one step
+into the future. MIDDLE: Unrolled training predicts N steps into the future. RIGHT: Adversarial
+training predicts N steps into the future, but only backprops on the last step.
+domain topology and geometry, boundary modeling and dimensionality. The solver is a graph neural
+network (GNN) (Scarselli et al., 2009; Kipf & Welling, 2017; Defferrard et al., 2016; Gilmer et al.,
+2017; Battaglia et al., 2018), representationally containing the function class of several classical
+solvers, see Section 3.2. We follow the Encode-Process-Decode framework of Battaglia et al. (2018)
+and Sanchez-Gonzalez et al. (2020) , with adjustments. We are not the first to use GNNs as PDE
+solvers (Li et al., 2020b; De Avila Belbute-Peres et al., 2020), but ours have several notable features.
+Different aspects of the chosen architecture are ablated in Appendix G.
+Encoder The encoder computes node embeddings. For each node i it maps the last K solution
+values uik-K:k, node position xi, current time tk, and equation embedding θPDE to node embedding
+vector fi0 = v([uik-K:k, xi, tk, θPDE]). θPDE contains the PDE coefficients and other attributes such
+as boundary conditions. An exact description is found in Section 4. The inclusion of θPDE allows us
+to train the solver on multiple different PDEs.
+Processor The processor computes M steps of learned message passing, with intermediate graph
+representations G1, G2, ..., GM. The specific updates we use are
+edge j → i message：	mg = Φ (『fjm, Ui-Kk - Uk-K:k, Xi- Xj, Θpde) ,	(8)
+node i update:	fim+1 = ψ fim , X mimj , θPDE ,	(9)
+j∈N(i)
+where N(i) holds the neighbors of node i, and φ and ψ are multilayer perceptrons (MLPs). Using
+relative positions Xj - Xi can be justified by the translational symmetry of the PDEs we consider.
+Solution differences Ui - Uj make sense by thinking of the message passing as a local difference
+operator, like a numerical derivative operator. Parameters θPDE are inserted into the message passing
+similar to Brandstetter et al. (2021)
+Decoder After message passing, we use a shallow 1D convolutional network with shared weights
+across spatial locations to output the K next timestep predictions at grid point Xi . For each node
+i, the processor outputs a vector fiM . We treat this vector as a temporally contiguous signal, which
+we feed into a CNN over time. The CNN helps to smooth the signal over time and is reminiscent
+of linear multistep methods (Butcher, 1987), which are very efficient but generally not used because
+of stability concerns. We seem to have avoided these stability issues, by making the time solver
+nonlinear and adaptive to its input. The result is a new vector di = (di1, di2, ..., diK) with each
+element dik corresponding to a different point in time. We use this to update the solution as
+uk+' = uk + (tk+' - tk )d' ,	1 ≤ ' ≤ K.	(10)
+The motivation for this choice of decoder has to do with a property called consistency (Arnold,
+2015), which states that lim∆t→0 kA(∆t, U0) - U(∆t)k = 0, i.e. the prediction matches the exact
+solution in the infinitesimal time limit. Consistency is a requirement for zero-stability of the rollouts.
+5
+Published as a conference paper at ICLR 2022
+Figure 3: Schematic sketch of our MP-PDE Solver.
+Connections. As mentioned in Bar-Sinai et al. (2019), both FDM and FVM are linear methods,
+which estimate nth-order point-wise function derivatives as
+[∂x(n)u]i ' X α(jn)uj	(11)
+j∈N(i)
+for appropriately chosen coefficients α(jn), where N (i) is the neighborhood of cell i. FDM computes
+this at cell centers, and FVM computes this at cell boundaries. These estimates are plugged into
+flux equations, see Table 3 in the appendix, followed by an optional FVM update step, to compute
+time derivative estimates for the ODE solver. The WENO5 scheme computes derivative estimates
+by taking an adaptively-weighted average over multiple FVM estimates, computed using different
+neighborhoods of cell i (see Equation 23). The FVM update, Equation 11, and Equation 23 are just
+message passing schemes with weighted aggregation (1 layer for FDM, 2 layers for FVM, and 3
+layers for WENO). It is through this connection, that we see that message-passing neural networks
+representationally contain these classical schemes, and are thus a well-motivated architecture.
+4	Experiments
+We demonstrate the effectiveness of the MP-PDE solver on tasks of varying difficulty to showcase
+its qualities. In 1D, we study its ability to generalize to unseen equations within a given family;
+we study boundary handling for periodic, Dirichlet, and Neumann boundary conditions; we study
+both regular and irregular grids; and we study the ability to model shock waves. We then show
+that the MP-PDE is able to solve equations in 2D. We also run ablations over the pushforward trick
+and variations, to demonstrate its utility. As baselines, we compare against standard classical PDE
+solvers, namely; FDM, pseudospectral methods, and a WENO5 solver, and we compare against
+the Fourier Neural Operator of Li et al. (2020a) as an example of a state-of-the-art neural operator
+method. The MP-PDE solver architecture is detailed in Appendix F.
+4.1	Interpolating between PDEs
+Data We focus on the family of PDEs
+[∂tu + ∂x(αu2 - β∂xu + γ∂xxu)](t, x) = δ(t, x),	(12)
+J
+u(0, x) = δ(0, x),	δ(t, x) = ^X Aj sin(ωjt + 2π'jx/L + φj).	(13)
+j=1
+Writing θPDE = (α, β, γ), corner cases are the heat equation θPDE = (0, η, 0), Burgers’ equation
+θPDE = (0.5, η, 0), and the KdV equation θPDE = (3, 0, 1). The term δ is a forcing term, fol-
+lowing Bar-Sinai et al. (2019), with J = 5, L = 16 and coefficients sampled uniformly in Aj ∈
+[-0.5, 0.5], ωj ∈ [-0.4, -0.4], `j ∈ {1, 2, 3}, φj ∈ [0, 2π). This setup guarantees periodicity of the
+initial conditions and forcing. Space is uniformly discretized to nx = 200 cells in [0, 16) with peri-
+odic boundary and time is uniformly discretized to nt = 200 points in [0, 4]. Our training sets consist
+of 2096 trajectories, downsampled to resolutions (nt, nx) ∈ {(250, 100), (250, 50), (250, 40)}. Nu-
+merical groundtruth is generated using a 5th-order WENO scheme (WENO5) (Shu, 2003) for the
+convection term ∂xu2 and 4th -order finite difference stencils for the remaining terms. The temporal
+solver is an explicit Runge-Kutta 4 solver (Runge, 1895; Kutta, 1901) with adaptive timestepping.
+Detailed methods and implementation are in Appendix C. All methods are implemented for GPU,
+so runtime comparisons are fair. For the interested reader comparison of WENO and FDM schemes
+against analytical solutions can be found in Appendix C to establish utility in generating groundtruth.
+6
+Published as a conference paper at ICLR 2022
+Experiments and results We consider three scenarios: E1 Burgers’ equation without diffusion
+θPDE = (1, 0, 0) for shock modeling; E2 Burgers’ equation with variable diffusion θPDE = (1, η, 0)
+where 0 ≤ η ≤ 0.2; and E3 a mixed scenario with θPDE = (α, β, γ) where 0.0 ≤ α ≤ 3.0,
+0.0 ≤ β ≤ 0.4 and 0.0 ≤ γ ≤ 1.0. E2 and E3 test the generalization capability. We compare against
+downsampled groundtruth (WENO5) and a variation of the Fourier Neural Operator with an autore-
+gressive structure (FNO-RNN) used in Section 5.3 of their paper, and trained with unrolled training
+(see Figure 2). For our models We run the MP-PDE solver, an ablated version (MP-PDE-ΘpdE),
+without θPDE features, and the Fourier Neural Operator method trained using our temporal bundling
+and pushforWard tricks (FNO-PF). Errors and runtimes for all experiments are in Table 1. We see
+that the MP-PDE solver outperforms WENO5 and FNO-RNN in accuracy. Temporal bundling and
+the pushforWard trick improve FNO dramatically, to the point Where it beats MP-PDE on E1. But
+MP-PDE outperforms FNO-PF on E2 and E3 indicating that FNO is best for single equation mod-
+eling, but MP-PDE is better at generalization. MP-PDE predictions are best if equation parameters
+θPDE are used, evidenced in E2 and E3. This effect is most pronounced for E3, Where all parameters
+are varied. Exemplary rollout plots for E2 and E3 are in Appendix F.1. Figure 4 (TOP) shoWs shock
+formation at different resolutions (E1), a traditionally difficult phenomenon to model—FDM and
+PSM methods cannot model shocks. Strikingly, shocks are preserved even at very loW resolution.
+4.2	Validating temporal bundling and the pushforward method
+We observe solver survival times on E1, defined as the time until the solution diverges from
+groundtruth. A solution Uk diverges from the groundtruth Uk when its max-normalized Li -error
+n- PnxI maX-U^I exceeds 0.1. The solvers are unrolled to n = 1000 timesteps with T = 16
+s. Examples are shown in Figure 4 (Bottom), where we observe increasing divergence after 〜8
+s. This is corroborated by Figure 5a where we see survival ratio against timestep. This is in line
+with observed problems with autoregressive models from the literature—see Figure C.3 of Sanchez-
+Gonzalez et al. (2020) or Figure S9 of Bar-Sinai et al. (2019)
+In a second experiment, we compare the efficacy of the pushforward trick. Already, we saw that,
+coupled with temporal bundling, it improved FNo for our autoregressive tasks. In Figure 5b, we plot
+the survival ratios for models trained with and without the pushforward trick. As a third comparison
+we show a model trained with Gaussian noise adversarial perturbations, similar to that proposed
+in Sanchez-Gonzalez et al. (2020). We see that applying the pushforward trick leads to far higher
+survival times, confirming our model that instability can be addressed with adversarial training.
+×
+EXemPlary ID rollout Of ShOCk fgrmation at different resolutions
+ΠX=2QQ
+ground truth
+I nx=ιoo
+；PrediCtiOn
+I nx=50
+I PrediCtiOn
+I/ L…
+P I PrediCtiOn
+——t=0.0s
+——t=0.3s
+—t=0.6s
+—t=1.0s
+t=1.3s
+—t=1.6s
+t=1.9s
+t=2.2s
+t=2.6s
+——t=2.9s
+—t=3.2s
+—t=3.5s
+——t=3.9s
+Figure 4: Top: Exemplary 1D rollout of shock formation at different resolutions. The different
+colors represent PDE solutions at different timepoints. Both the small and the large shock are neatly
+captured and preserved even for low resolutions; boundary conditions are perfectly modeled. Bot-
+tom: Exemplary long 2D rollout of shock formations over 1000 timesteps. Different colors repre-
+sent PDE solutions at different space-time points.
+7
+Published as a conference paper at ICLR 2022
+Table 1: Error and runtime experiments targeting shock wave formation modeling and generalization
+to unseen equations. Runtimes are for one full unrolling over 250 timesteps on a GeForce RTX 2080
+Ti GPU. FNO-PF, MP-PDE-θP≤, and MP-PDE are all ours. Accumulated error is 亡 Px,t MSE.
+		Accumulated Error J					Runtime [s] J	
+	 (nt, nx)		WENO5	FNO-RNN	FNO-PF	MP-PDE:θPDE	MP-PDE	WENO5	MP-PDE
+E1	(250, 100)	2.02	11.93	0.54	-	1.55	1.9	0.09
+E1	(250, 50)	6.23	29.98	0.51	-	1.67	1.8	0.08
+E1	(250, 40)	9.63	10.44	0.57	-	1.47	1.7	0.08
+E2	(250, 100)	1.19	17.09	2.53	1.62	1.58	1.9	0.09
+E2	(250, 50)	5.35	3.57	2.27	1.71	1.63	1.8	0.09
+E2	(250, 40)	8.05	3.26	2.38	1.49	1.45	1.7	0.08
+E3	(250, 100)	4.71	10.16	5.69	4.71	4.26	4.8	0.09
+E3	(250, 50)	11.71	14.49	5.39	10.90	3.74	4.5	0.09
+E3	(250, 40)	15.94	20.90	5.98	7.78	3.70	4.4	0.09
+Accurate rollouts - shock formation
+(a)
+Figure 5: Survival times at E1. Rollout for long trajectories of 8 s (left), pushforward (pf) ablation
+(right). The ablation compares survival times at resolutions nx = 100 (solid) and nx = 50 (dashed)
+against survival times using pushforward (no pf), no pushforward but putting Gaussian noise (σ =
+0.01), pushforward but without cutting the gradients (pf gradients).
+Accurate rollouts - shock formation - ablation
+(b)
+Interestingly, injecting Gaussian perturbations appears worse than using none. Closer inspection of
+rollouts shows that although Gaussian perturbations improve stability, they lead to lower accuracy,
+by nature of injecting noise into the system.
+4.3	S olving on irregular grids with different boundary conditions
+The underlying motives for designing this experiment are to investigate (i) how well our MP-PDE
+solver can operate on irregular grids and (ii) how well our MP-PDE solver can generalize over
+different boundary conditions. Non-periodic domains and grid sampling irregularity go hand in
+hand, since pseudo-spectral methods designed for closed intervals operate on non-uniform grids.
+Data We consider a simple 1D wave equation
+∂ttu - c2∂xxu = 0, x ∈ [-8, 8]	(14)
+where c is wave velocity (c = 2 in our experiments). We consider Dirichlet B [u] = u = 0
+and Neumann B [u] = ∂xu = 0 boundary conditions. This PDE is 2nd-order in time, but can
+be rewritten as 1st-order in time, by introducing the auxilliary variable v = ∂tu and writing
+∂t [u, v] - [v, c2∂xxu] = 0 . The initial condition is a Gaussian pulse with peak at random loca-
+tion. Numerical groundtruth is generated using FVM and Chebyshev spectral derivatives, integrated
+in time with an implicit Runge-Kutta method of Radau IIA family, order 5 (Hairer et al., 1993). We
+solve for groundtruth at resolution (nt, nx) = (250, 200) on a Chebyshev extremal point grid (cell
+edges are located at Xi = cos(in/(n, + 1)).
+Experiments and results We consider three scenarios: WE1 Wave equation with Dirichlet bound-
+ary conditions; WE2 Wave equation with Neumann boundary conditions and, WE3 Arbitrary com-
+binations of these two boundary conditions, testing generalization capability of the MP-PDE solver.
+8
+Published as a conference paper at ICLR 2022
+Ablation studies (marked with jθpDEE) have no equation specific parameters input to the MP-PDE
+solver. Table 2 compares our MP-PDE solver against state-of-the art numerical pseudospectral
+solvers. MP-PDE solvers obtain accurate results for low resolutions where pseudospectral solvers
+break. Interestingly, MP-PDE solvers can generalize over different boundary conditions, which gets
+more pronounced if boundary conditions are injected into the equation via θPDE features.
+Table 2: Error and runtime comparison on tasks with non-periodic boundaries and irregular grids.
+Runtimes measure one full 250 timesteps unrolling on a GeForceRTX 2080 Ti GPU for MP-PDE
+solvers, and on a CPU for our pseudospectral (PS) solver implementation based on scipy.
+(nt, nx)	-1 XMSE φ (WE1) nx x,t		-1 XMSE φ (WE2) nx x,t		-1 XMSE φ (WE3) nx x,t			Runtime [s] J	
+	PS	MP-PDE	PS	MP-PDE	PS	MP-PDE ^fn≤ MP-PDE		PS	MP-PDE
+(250, 100)	0.004	0.137	-0.004	0.111	~0.004	38.775	0.097	0.60	0.09
+(250, 50)	0.450	0.035	0.681	0.034	0.610	20.445	0.106	0.35	0.09
+(250, 40)	194.622	0.042	217.300	0.003	204.298	16.859	0.219	0.25	0.09
+(250, 20)	breaks	0.059	breaks	0.007	breaks	17.591	0.379	0.20	0.07
+4.4	2D experiments
+We finally test the scalability of our MP-PDE solver to a higher number of spatial dimensions,
+more specifically to 2D experiments. We use data from PhiFlow1, an open-source fluid simula-
+tion toolkit. We look at fluid simulation based on the Navier-Stokes equations, and simulate smoke
+inflow into a 32 × 32 grid, adding more smoke after every time step which follows the buoyancy
+force. Dynamics can be described by semi-Lagrangian advection for the velocity and MacCormack
+advection for the smoke distribution. Simulations run for 100 timesteps where one timestep corre-
+sponds to one second. Smoke inflow locations are sampled randomly. Architectural details are in
+Appendix F. Figure 12 in the appendix shows results of the MP-PDE solver and comparisons to the
+groundtruth simulation. The MP-PDE solver is able to capture the smoke inflow accurately over the
+given time period, suggesting scalability of MP-PDE solver to higher dimensions.
+5	Conclusion
+We have introduced a fully neural MP-PDE solver, which representationally contains classical meth-
+ods, such as the FDM, FVM, and WENO schemes. We have diagnosed the distribution shift problem
+and introduced the pushforward trick combined with the idea of temporal bundling trying to alleviate
+it. We showed that these tricks reduce error explosion observed in training autoregressive models,
+including a SOTA neural operator method (Li et al., 2020a). We also demonstrated that MP-PDE
+solvers offer flexibility when generalizing across spatial resolution, timescale, domain sampling
+regularity, domain topology and geometry, boundary conditions, dimensionality, and solution space
+smoothness. In doing so, MP-PDE solvers are much faster than SOTA numerical solvers.
+MP-PDE solvers cannot only be used to predict the solution of PDEs, but can e.g. also be re-
+interpreted to optimize the integration grid and the parameters of the PDE. For the former, simply
+position updates need to be included in the processor, similar to Satorras et al. (2021). For the
+latter, a trained MP-PDE solver can be fitted to new data where only θPDE features are adjusted. A
+limitation of our model is that we require high quality groundtruth data to train. Indeed generating
+this data in the first place was actually the toughest part of the whole project. However, this is a
+limitation of most neural PDE solvers in the literature. Another limitation is the lack of accuracy
+guarantees typical solvers have been designed to output. This is a common criticism of such learned
+numerical methods. A potential fix would be to fuse this work with that in probabilistic numerics
+(Hennig et al., 2015), as has been done for RK4 solvers (Schober et al., 2014). Another promising
+follow-up direction is to research alternative adversarial-style losses as introduced in Equation 7.
+Finally, we remark that leveraging symmetries and thus fostering generalization is a very active
+field of research, which is especially appealing for building neural PDE solvers since every PDE is
+defined via a unique set of symmetries (Olver, 1986).
+1https://github.com/tum-pbs/PhiFlow
+9
+Published as a conference paper at ICLR 2022
+6	Reproducibility Statement
+All data used in this work is generated by ourselves. It is thus of great importance to make sure that
+the produced datasets are correct. We therefore spend an extensive amount of time cross-checking
+our produced datasets. For experiments E1, E2, E3, this is done by comparing the WENO scheme
+to analytical solutions as discussed in detail in Appendix Section C.3, where we compare our imple-
+mented WENO scheme against two analytical solutions of the Burgers equation from literature. For
+experiments W1, W2, W3, we cross-checked if Gaussian wave packages keep their form through-
+out the whole wave propagation phase. Furthermore, the wave packages should change sign for
+Dirichlet boundary conditions and keep the sign for Neumann boundary conditions. Examples can
+be found in Appendix Section D.
+We have described our architecture in Section 3.2 and provided further implementation details in
+Appendix Section F. We have introduced new concepts, namely temporal bundling and the pushfor-
+ward method. We have described these concepts at length in our paper. We have validated temporal
+bundling and pushforward methods on both our and the Fourier Neural Operator (FNO) method Li
+et al. (2020a). We have not introduced new mathematical results. However, we have used data gener-
+ation concepts from different mathematical fields and therefore have included a detailed description
+of those in our appendix.
+For reproducibility, we provide our at https://github.com/brandstetter-johannes/MP-Neural-PDE-
+Solvers.
+7	Ethical S tatement
+The societal impact of MP-PDE solvers is difficult to predict. However, as stated in the introduc-
+tion, solving differential equations is of huge importance for problems in many disciplines such as
+weather forecasting, astronomical simulations, or molecular modeling. As such, MP-PDE solvers
+potentially help to pave the way towards shortcuts for computationally expensive simulations. Most
+notably, a drastical computational shortcut is always somehow related to reducing the carbon foot-
+print. However, in this regard, it is also important to remind ourselves that relying on simulations or
+now even shortcuts of those always requires monitoring and thorough quality checks.
+Acknowledgments
+Johannes Brandstetter thanks the Institute of Advanced Research in Artificial Intelligence (IARAI)
+and the Federal State Upper Austria for the support. The authors thank Markus Holzleitner for
+helpful comments on this work.
+References
+Douglas N Arnold. Stability, consistency, and convergence of numerical discretizations. 2015.
+Michael Athanasopoulos, Hassan Ugail, and Gabriela Gonzalez. Parametric design of aircraft ge-
+ometry using partial differential equations. Advances in Engineering Software, 40, 2009.
+Yohai Bar-Sinai, Stephan Hoyer, Jason Hickey, and Michael P. Brenner. Learning data-driven dis-
+cretizations for partial differential equations. Proceedings of the National Academy of Sciences,
+116(31):15344-15349, Jul2019. ISSN 1091-6490. doi: 10.1073∕pnas.1814058116.
+Soren Bartels. Numerical Approximation ofPartial Differential Equations. Springer, 2016.
+Claude Basdevant, Michel Deville, Pierre Haldenwang, Jean Lacroix, Jalil Ouazzani, R. Peyret,
+Paolo Orlandi, and Patera A.T. Spectral and finite difference solutions of the burgers equation.
+Computers and Fluids, 14(1):23-41, 1986.
+Peter W. Battaglia, Jessica B. Hamrick, Victor Bapst, Alvaro Sanchez-Gonzalez, Vinicius Zambaldi,
+Mateusz Malinowski, Andrea Tacchetti, David Raposo, Adam Santoro, Ryan Faulkner, Caglar
+Gulcehre, Francis Song, Andrew Ballard, Justin Gilmer, George Dahl, Ashish Vaswani, Kelsey
+Allen, Charles Nash, Victoria Langston, Chris Dyer, Nicolas Heess, Daan Wierstra, Pushmeet
+Kohli, Matt Botvinick, Oriol Vinyals, Yujia Li, and Razvan Pascanu. Relational inductive biases,
+deep learning, and graph networks. arXiv preprint arXiv:1806.01261, 2018.
+10
+Published as a conference paper at ICLR 2022
+Saakaar Bhatnagar, Yaser Afshar, Shaowu Pan, Karthik Duraisamy, and Shailendra Kaushik. Predic-
+tion of aerodynamic flow fields using convolutional neural networks. Computational Mechanics,
+64(2):525-545, JUn 2019.
+Kaushik Bhattacharya, Bamdad Hosseini, Nikola B. Kovachki, and Andrew M. Stuart. Model re-
+dUction and neUral networks for parametric pdes, 2021.
+Johannes Brandstetter, Rob Hesselink, Elise van der Pol, Erik Bekkers, and Max Welling. Ge-
+ometric and physical qUantities improve e(3) eqUivariant message passing. arXiv preprint
+arXiv:2110.02905, 2021.
+John Charles BUtcher. Coefficients for the stUdy of rUnge-kUtta integration processes. Journal of the
+Australian Mathematical Society, 3(2):185-201, 1963.
+John Charles BUtcher. The numerical analysis of ordinary differential equations: Runge-Kutta and
+general linear methods. Wiley-Interscience, 1987.
+Djork-Ame Clevert, Thomas Unterthiner, and SePP Hochreiter. Fast and accurate deep network
+learning by exponential linear Units (elUs). In International Conference on Learning Representa-
+tions (ICLR), 2016.
+Richard Courant, Kurt Otto Friedrichs, and Hans Lewy. On the Partial difference equations of
+mathematical Physics. IBM J. Res. Dev., 11(2):215-234, 1967. ISSN 0018-8646.
+FiliPe De Avila Belbute-Peres, Thomas Economon, and Zico Kolter. Combining differentiable PDE
+solvers and graph neural networks for fluid flow prediction. In Hal DaUme In and Aarti Singh
+(eds.), Proceedings of the 37th International Conference on Machine Learning, volume 119 of
+Proceedings of Machine Learning Research, pp. 2402-2411. PMLR, 13-18 Jul 2020.
+Michael Defferrard, Xavier Bresson, and Pierre Vandergheynst. Convolutional neural networks on
+graphs with fast localized spectral filtering. In D. Lee, M. Sugiyama, U. Luxburg, I. Guyon,
+and R. Garnett (eds.), Advances in Neural Information Processing Systems, volume 29. Curran
+Associates, Inc., 2016.
+Edgar Everhart. An efficient integrator that uses gauss-radau spacings. International Astronomical
+Union Colloquium, 83:185-202, 1985.
+Victor Garcia Satorras, Zeynep Akata, and Max Welling. Combining generative and discriminative
+models for hybrid inference. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d’Alche Buc,
+E. Fox, and R. Garnett (eds.), Advances in Neural Information Processing Systems 32, pp. 13802-
+13812. Curran Associates, Inc., 2019.
+Justin Gilmer, Samuel S Schoenholz, Patrick F Riley, Oriol Vinyals, and George E Dahl. Neural
+message passing for quantum chemistry. In International Conference on Machine Learning, pp.
+1263-1272. PMLR, 2017.
+Jonathan Godwin, Michael Schaarschmidt, Alexander Gaunt, Alvaro Sanchez-Gonzalez, Yulia
+Rubanova, Petar Velickovic, James Kirkpatrick, and Peter W. Battaglia. Very deep graph neu-
+ral networks via noise regularisation. arXiv preprint arXiv:2106.07971.
+Daniel Greenfeld, Meirav Galun, Ronen Basri, Irad Yavneh, and Ron Kimmel. Learning to opti-
+mize multigrid PDE solvers. In Proceedings of the 36th International Conference on Machine
+Learning, ICML 2019, 9-15 June 2019, Long Beach, California, USA, pp. 2415-2423, 2019.
+Xiaoxiao Guo, Wei Li, and Francesco Iorio. Convolutional neural networks for steady flow ap-
+proximation. In Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge
+Discovery and Data Mining, KDD ’16, pp. 481-490. Association for Computing Machinery,
+2016.
+Ernst Hairer, Syvert N0rsett, and Gerhard Wanner. Solving Ordinary Differential Equations I (2nd
+Revised. Ed.): Nonstiff Problems. Springer-Verlag, Berlin, Heidelberg, 1993. ISBN 0387566708.
+11
+Published as a conference paper at ICLR 2022
+Philipp Hennig, Michael A. Osborne, and Mark Girolami. Probabilistic numerics and uncertainty
+in computations. Proceedings of the Royal Society A: Mathematical, Physical and Engineering
+Sciences, 471(2179):20150142, Jul 2015. ISSN 1471-2946. doi: 10.1098/rspa.2015.0142. URL
+http://dx.doi.org/10.1098/rspa.2015.0142.
+Jun-Ting Hsieh, Shengjia Zhao, Stephan Eismann, Lucia Mirabella, and Stefano Ermon. Learning
+neural PDE solvers with convergence guarantees. arXiv preprint arXiv:1906.01200, 2019.
+Sergey Ioffe and Christian Szegedy. Batch normalization: Accelerating deep network training by
+reducing internal covariate shift. In International conference on machine learning, pp. 448-456.
+PMLR, 2015.
+Guang-Shan Jiang and Chi-Wang Shu. Efficient implementation of weighted eno schemes. Journal
+of Computational Physics, 126(1):202 - 228, 1996. ISSN 0021-9991.
+Yuehaw Khoo, Jianfeng Lu, and Lexing Ying. Solving parametric pde problems with artificial neural
+networks. European Journal of Applied Mathematics, 32(3):421-435, Jul 2020. ISSN 1469-4425.
+Thomas N. Kipf and Max Welling. Semi-supervised classification with graph convolutional net-
+works. In International Conference on Learning Representations (ICLR), 2017.
+Wilhelm Kutta. Beitrag ZUr naherungsweisen integration totaler differentialgleichungen. Zeitschrift
+fUr Mathematik und Physik, 46:435 - 453,1901.
+Tony Lelievre and Gabriel Stoltz. Partial differential equations and stochastic methods in molecular
+dynamics. Acta Numerica, 25:681-880, 2016.
+Zongyi Li, Nikola Kovachki, Kamyar Azizzadenesheli, Burigede Liu, Kaushik Bhattacharya, An-
+drew Stuart, and Anima Anandkumar. Fourier neural operator for parametric partial differential
+equations. arXiv preprint arXiv:2010.08895, 2020a.
+Zongyi Li, Nikola Kovachki, Kamyar Azizzadenesheli, Burigede Liu, Kaushik Bhattacharya, An-
+drew Stuart, and Anima Anandkumar. Multipole graph neural operator for parametric partial
+differential equations. arXiv preprint arXiv:2006.09535, 2020b.
+Zongyi Li, Nikola Kovachki, Kamyar Azizzadenesheli, Burigede Liu, Kaushik Bhattacharya, An-
+drew Stuart, and Anima Anandkumar. Neural operator: Graph kernel network for partial differ-
+ential equations. arXiv preprint arXiv:2003.03485, 2020c.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. arXiv preprint
+arXiv:1711.05101, 2017.
+Peter Lynch. The origins of computer weather prediction and climate modeling. Journal of compu-
+tational physics, 227(7):3431-3444, 2008.
+Andreas Mayr, Sebastian Lehner, Arno Mayrhofer, Christoph Kloss, Sepp Hochreiter, and Jo-
+hannes Brandstetter. Boundary graph neural networks for 3d simulations. arXiv preprint
+arXiv:2106.11299, 2021.
+Peter J Olver. Introduction to partial differential equations. Springer, 2014.
+P.J. Olver. Symmetry groups of differential equations. In Applications of Lie Groups to Differential
+Equations, pp. 77-185. Springer, 1986.
+Ravi G. Patel, Nathaniel A. Trask, Mitchell A. Wood, and Eric C. Cyr. A physics-informed oper-
+ator regression framework for extracting data-driven continuum models. Computer Methods in
+Applied Mechanics and Engineering, 373:113500, Jan 2021. ISSN 0045-7825.
+Maziar Raissi. Deep hidden physics models: Deep learning of nonlinear partial differential equa-
+tions. J. Mach. Learn. Res., 19:25:1-25:24, 2018.
+Prajit Ramachandran, Barret Zoph, and Quoc V. Le. Searching for activation functions. arXiv
+preprint arXiv:1710.05941, 2017.
+12
+Published as a conference paper at ICLR 2022
+Carl Runge. Uber die numeriSche auflosung Von dιfferentιalgleιChUngen. Mathematische Annalen,
+46:167- 178,1895.
+Alvaro Sanchez-Gonzalez, Jonathan Godwin, Tobias Pfaff, Rex Ying, Jure Leskovec, and Pe-
+ter W. Battaglia. Learning to simulate complex physics with graph networks. arXiv preprint
+arXiv:2002.09405, 2020.
+Victor Garcia Satorras, Emiel Hoogeboom, and Max Welling. E (n) equivariant graph neural net-
+works. arXiv preprint arXiv:2102.09844, 2021.
+Franco Scarselli, Marco Gori, Ah Chung Tsoi, Markus Hagenbuchner, and Gabriele Monfardini.
+The graph neural network model. IEEE Transactions on Neural Networks, 20(1):61-80, 2009.
+William E Schiesser. The numerical method of lines: integration of partial differential equations.
+Elsevier, 2012.
+Michael Schober, David Duvenaud, and Philipp Hennig. Probabilistic ode solvers with runge-kutta
+means, 2014.
+C.-W. Shu. High-order finite difference and finite volume weno schemes and discontinuous galerkin
+methods for cfd. International Journal of Computational Fluid Dynamics, 17(2):107-118, 2003.
+Justin Sirignano and Konstantinos Spiliopoulos. Dgm: A deep learning algorithm for solving partial
+differential equations. Journal of Computational Physics, 375:1339 - 1364, 2018. ISSN 0021-
+9991. doi: https://doi.org/10.1016/j.jcp.2018.08.029.
+Eitan Tadmor. The exponential accuracy of fourier and chebyshev differencing methods. SIAM
+Journal on Numerical Analysis, 23:1-10, 1986.
+Dmitry Ulyanov, Andrea Vedaldi, and Victor Lempitsky. Instance normalization: The missing in-
+gredient for fast stylization. arXiv preprint arXiv:1607.08022, 2016.
+Yinhao Zhu and Nicholas Zabaras. Bayesian deep convolutional encoder-decoder networks for sur-
+rogate modeling and uncertainty quantification. Journal of Computational Physics, 366:415-447,
+Aug 2018. ISSN 0021-9991.
+13
+Published as a conference paper at ICLR 2022
+A Interpolation
+To compute classical numerical derivatives of a function u : R → R, which has been sampled on a
+mesh of points x1 < x2 < ... < xN it is common to first fit a piecewise polynomial p : R → R on
+the mesh. We assume we have function evaluations ui = u(xi) at the mesh nodes for all i = 1, ..., N
+and once we have fitted the polynomial, we can use its derivatives at any new off-mesh point, for
+instance the half nodes Xi+1. Here We illustrate how to carry out this procedure.
+A polynomial of degree N - 1 (note the highest degree polynomial we can fit to N points has degree
+N - 1) can be fitted at the mesh points by solving the following linear system in a
+-uι]	Γ P(xi ) ]	Γ PN-1 aiXi ]	I ..	. .=	.	=	.	= ..	. UN	p(XN)	PiN=-01 aiXiN |	-X0	…xN-11 γ ao ] .....I I . I .	(15) 一XN	…XN-1J LaN-J Z
+^^{z u	{^^^^^^^^^"∙r	{z Xa
+To find the polynomial interpolation at a new point x, we then do
+p(x) = x>a = x>X-1u	(16)
+where x> = [1, x, x2, ..., xN-1]. To retrieve the mth derivative, where m < N - 1, is also very
+simple. For this we have that
+m N-1 m i	N-1
+dxmp = X aiB = X …m ∙ xi-m = x(m)>a = x(m)>χ-1u,	(17)
+xx
+i=0	i=0
+where x(m)> = [(0)m x0-m , (1)m x1-m ,...,(N-1)m xN-1-m ]	(18)
+where (i)m = i(i 一 1)(i 一 2) …(i 一 m + 1) is the mth Pochhammer symbol and (i)o := 1.
+Note that is typical to fold s = x> X-1 into a single object, which we call a stencil.
+B Reconstruction
+Reconstruction is the task of fitting a piecewise polynomial on a mesh of points, when instead of
+functions values at the grid points we have cell averages Ui, where
+(19)
+where each cell Ii = [χi-1,χ%+1], the half nodes are defined as 加点+ι := ɪ(Xi + Xi+ι) and
+∆xi = Xi+1 一 Xi_1. The solution is to note that we can fit a polynomial P(X) to the integral of
+u(X), which will be exact at the half nodes, so
+P(Xi+1) = U(Xi+I) = /
+x
+"+2 u(X)dX = X Z
+-1	k=1Jx
+1i
+k+ 2
+U(X) dx = 2, Uk ∆xk .
+-2	k = 1
+(20)
+x
+x
+1
+k
+We can then differentiate this polynomial to retrieve an estimate for the U at off-mesh locations.
+Recall that polynomial differentiation is easy with the interpolant differentiation operators x(m).
+The system of equations we need to solve is thus
+(21)
+where U is the vector of cell averages and L is a lower triangular matrix performing the last sum in
+Equation 20. Thus the mth derivative of the polynomial p(X) = P0 (X) is
+Sp = dm⅛1=χ(m+1)> XTLu=S(m)>u
+(22)
+14
+Published as a conference paper at ICLR 2022
+C WENO Scheme
+The essentially non-oscillating (ENO) scheme is an interpolation or reconstruction scheme to esti-
+mate function values and derivatives of a discontinuous function. The main idea is to use multiple
+overlapping stencils to estimate a derivative at point x ∈ [xi, xi+1]. We design N stencils to fit the
+function on shifted overlapping intervals I1, ..., IN, where Ik = [xi-N+1+k, xi+k]. In the case of
+WENO reconstruction these intervals are Ik = [xi-N +ι+k-1, Xi+k+1 ]. If a discontinuity lies in
+I = Uk Ik, then it is likely that one of the substencils Skm) or Skm) (defined on interval Ik) will not
+contain the discontinuity. We can thus use the substencil Skm) or Skm) from the relatively smooth
+region to estimate the function derivatives at x. In the following, we focus on WENO reconstruction.
+The weighted essentially non-oscillating (WENO) scheme goes one step further and takes a convex
+combination of the substencils to create a larger stencil S on I, where (dropping the superscript for
+brevity)
+N
+S = EwkSk.
+k=1
+(23)
+Here the nonlinear weights wk satisfy PkN=1 wk = 1. It was shown in Jiang & Shu (1996) that these
+nonlinear weights can be constructed as
+γk
+(E + βk)2 ,
+(24)
+where γk is called the linear weight, E is a small number, and βk is the smoothness indicator. The
+linear weights are set such that the sum PN=I YkSk over the order N - 1 stencils matches a larger
+order 2N - 2 stencil. The smoothness indicators are computed as
+βk
+N-1
+X ∆x2km-1
+m=1
+∕xi+2
+ʌi-2
+胃）dx：
+(25)
+where Pk is the polynomial corresponding to substencil Sk.
+C.1 Weno5 scheme
+A conservative finite difference spatial discretization approximates a derivative f (u)x by a conser-
+vative difference
+f (u)χ∣χ=Xi ≈ ∆x (fi+1 - fi-1) ,	(26)
+where 力+ι and fi-1 are numerical fluxes. Since g(u) is approximated in the same way, fi-
+nite difference methods have the same format for more than one spatial dimensions. The left-
+reconstructed (reconstruction is done from left to right) fifth order finite difference WENO scheme
+(WENO5) (Shu, 2003) has the U-1 given by:
+i+ 2
+U-+1 = wιU-(1) + w2U-'1) + w3U-+? .	(27)
+i+ 2	i+ 2	i+ 2	i+ 2
+In equation 27, U-?〕are the left WENO reconstructions on three different stencils given by
+U-(I)= ui+1 =	1	7	11 + 3Ui-2 - 6Ui-I + ^6Ui ,		(28)
+U-⑵= ui+1 =	1	51 -6 Ui-I + 6 Ui + 3 Ui+1 ,		(29)
+U-⑶= Ui+1 =	15 + 3 Ui + 6 Ui+1	1 -6Ui+2，	(30)
+and the non-linear weights wj given by	wj	〜 J	 O，，,一	=	Yk	(31)
+wj = P3 k	,	wk - =1 wk	一(E + βk )2 ,	
+15
+Published as a conference paper at ICLR 2022
+with γ{i,2,3} = {110, 3,10}, and E a tiny-valued parameter to avoid the denominator becoming 0.
+The left smoothness indicators βk- are given by:
+β「	=12 (ui-2	- 2Ui—1	+ Ui	+	4 (u	i—2 - 4Ui—1 + 3Ui	,	(32)
+β-	=12 (UiT	- 2Ui +	Ui+1	+	4(U	i—1 - Ui+1	,	(33)
+β-	=12 (Ui-	2Ui+1 +	Ui+2	+	4(U	i - 4Ui+1 + 3Ui+2	.	(34)
+(35)
+The right-reconstructed WENO5 scheme has the u+1 given similarly to u— ι but with all coef-
+i- 2	i+ 2
+ficients flipped since the reconstruction is done from the other side (from right to left). The right
+reconstruction on three different stencils are given by
++(1) U. ɪ 二 i-2	1	7	11 二 ÷3Ui+2 - 6Ui+1 + ɪUi ,	(36)
+U+? 二	1	51 二 — 6Ui+1 ÷ 6Ui ÷ 3 Ui—,	(37)
+U+(3) = i-2	15	1 二 ÷3 Ui ÷ 6Ui-I - 6Ui-2 ,	(38)
+and the right smoothness indicators βk+ are given by
+β1+	=12 (u+	-2ui+1 ÷ Ui) ÷ 4 (ui+2		- 4Ui+1 ÷ 3Ui ) ,	(39)
+β2+	=12(ui+1	2 - 2Ui ÷ Ui-1	÷ 4 (ui+1	- Ui-1) ,	(40)
+β3+	=12 (Ui-	2Ui-1 ÷ Ui-2)	÷4 (ui -	4Ui-1 ÷ 3Ui-2)2 .	(41)
+					(42)
+Both U- and u+ are needed for full flux reconstruction as explained in the next section.
+C.2 Flux reconstruction
+We consider flux reconstruction Via Godunov. For Godunov flux,九十 ɪ
+from U++ι and u^ɪ via:
+f (ui+1) is reconstructed
+f(ui+1)
+u
+i+2
+u
+i+2
+min ≤u≤u+ 	i+2	f (U),	if U-H 2	≤	u++ 2
+max ≤u≤u+ —i+2	f (U),	if U-H 2	>	u++ 2
+(43)
+O
+
+C.3 Comparing WENO scheme to analytical solutions
+First analytical case. An analytical solvable case for Burgers equation arises for the boundary
+conditions
+u(t, 0) = u(t, 2π) ,
+and the initial conditions
+仆 ∂	∂ ∂φ∕∂x t
+u(0, x) = —2ν  -----+ 4 ,
+φ
+(44)
+16
+Published as a conference paper at ICLR 2022
+where
+φ
+∂φ
+∂x
+(45)
+(46)
+(47)
+The analytical solutions for this specific set of boundary and initial conditions gives
+,	、	∂φ∕∂x
+u(t, x) = -2ν---------+ 4 ,	(48)
+φ
+where
+φ = exp
+(-(X — 4t)2
+(4ν(t +1)
++ exp
+-(X — 4t — 2π)2
+4ν (t + 1)
+∂φ	2(x — 4t)	( -(X — 4t)2 ∖	2(x — 4t — 2π)	-(X — 4t — 2π)2
+∂x	4ν(t + 1) exp ( 4ν(t + 1) J	4ν(t + 1)	+ exp	4ν(t + 1)
+0.5(X — 4t)	—(X — 4t)2	0.5(X — 4t — 2π)	—(X — 4t — 2π)2
+=- ^Wexp lVFW - -ν(t + 1)	exp	4ν(t + 1)
+(49)
+(50)
+(51)
+For this first analytical solveable case, the analytical solution, the WENO scheme and the fourth
+order finite difference scheme (FDM) are compared in Fig. 6 for a diffusion term of ν = 0.005. The
+WENO scheme models the analytical solution perfectly, whereas the FDM scheme fails to capture
+the shock accurately. For lower values of ν the effect gets even stronger.
+Second analytical case. Another analytical solvable case for the Burgers equation arises for the
+boundary condition:
+u(t, ±1) =0,	(52)
+and the initial condition
+u(0, X) = — sin(πX) .	(53)
+Solutions are (Basdevant et al., 1986)
+— f∞∞ Sinπ(χ — η)f (X — η) exp(-η2∕4νt)dη
+u(t，x)	R∞∞ f (x — η)eχp(-η2∕4νt)dη
+(54)
+with f (y) = exp(- cos(枭).Using Hermite integration allows the computation of accurate results
+up to t = 3∕π .
+For this second analytical solveable case, the analytical solution, and the WENO scheme are com-
+pared in Fig. 7 for a diffusion term ofν = 0.002. The WENO scheme models the analytical solution
+perfectly. Modeling via the FDM scheme fails completely.
+17
+Published as a conference paper at ICLR 2022
+O
+2 1
+Analytical solution, ID rollout
+7 6 5 4 3
+(S∕E) n
+2	4	6
+x
+----t=0.0s
+----t=0.1s
+一 t=0.1s
+t=0.2s
+t=0.2s
+t=0.3s
+t=0.4s
+一 t=0.4s
+----t=0.5s
+0.5
+Analytical solution, 2D rollout
+7
+6
+5
+4
+3
+2
+1
+WENO solution, ID rollout
+7
+O
+6 5 4 3 2 1
+(S∕E) n
+----t=0.0s
+----t=0.1s
+一 t=0.1s
+t=0.2s
+t=0.2s
+t=0.3s
+t=0.4s
+一 t=0.4s
+----t=0.5s
+-2
+0.5
+0.4
+W 0.3
+O
+U
+①
+∞ 0.2
+0.1
+0.0
+WENO solution, 2D rollout
+0	2	4	6
+
+— 4
+FDM solution, ID rollout
+O
+8 6 4 2
+(S∕E) n
+----t=0.0s
+----t=0.1s
+一 t=0.1s
+t=0.2s
+t=0.2s
+t=0.3s
+t=0.4s
+一 t=0.4s
+----t=0.5s
+-2
+0.5
+0.4
+*0.3
+o
+u
+①
+50.2
+0.1
+0.0
+FDM solution, 2D rollout
+0	2	4	6
+10
+8
+— 4
+I
+Figure 6: 1D and 2D rollouts for the first analytical case setting the diffusion term ν = 0.005.
+Analytical solution (top), WENO scheme (middle) and Finite Difference scheme (FDM, bottom).
+The WENO scheme models the analytical solution perfectly, whereas the FDM scheme fails to
+capture the shock accurately.
+18
+Published as a conference paper at ICLR 2022
+fs、IU) n 济、IU) ɔ
+Analytical solution, ID rollout
+-----t=O.Os
+-----t=O.ls
+一 t=0.2s
+t=O.4s
+t=0.5s
+t=0.6s
+t=0.7s
+-----t=0.8s
+-t=l.Os
+-1.0	-0.5	0.0	0.5	1.0
+WENO solution, ID rollout
+-----t=0.0s
+-----t=0.1s
+一 t=0.2s
+t=0.4s
+t=0.5s
+t=0.6s
+t=0.7s
+-----t=0.8s
+-----t=1.0s
+-1.0	-0.5	0.0	0.5	1.0
+Figure 7: 1D and 2D rollouts for the second analytical case setting the diffusion term ν = 0.005.
+Analytical solution (top), and WENO scheme solution(bottom).The WENO scheme models the an-
+alytical solution perfectly.
+19
+Published as a conference paper at ICLR 2022
+D Pseudospectral methods for wave propagation on irregular
+GRIDS
+We consider Dirichlet B [u] = u = 0 and Neumann B [u] = ∂xu = 0 boundary conditions. Numeri-
+cal groundtruth is generated using FVM and Chebyshev spectral derivatives, integrated in time with
+an implicit Runge-Kutta method of Radau IIA family, order 5 (Hairer et al., 1993). To properly ful-
+fill the boundary conditions, wave packages have to travel between the boundaries and are bounced
+back with same and different sign for Neumann and Dirichlet boundary condition, respectively.
+Exemplary wave propagation for both boundary conditions is shown in Figure 8.
+Figure 8:	Exemplary wave propagation data for Dirichlet boundary conditions (left) and Neumann
+boundary conditions (right). Solutions are obtained on irregular grids using pseudospectral solvers.
+20
+Published as a conference paper at ICLR 2022
+E	Explicit Runge- Kutta methods
+The family of Runge-Kutta methods (Butcher, 1987) is given by:
+s
+utn+1 = utn + ∆t	biki ,	(55)
+i=1
+where
+k1 = f(tn, utn) ,	(56)
+k2 = f(tn + c2∆t, utn + h(a21k1)) ,	(57)
+k3 = f(tn + c3∆t, utn + h(a31k1 + a32k2)) ,	(58)
+.
+..	(59)
+ks = f(tn +cs∆t,utn + h(as1k1 +as2k2,. . . as,s-1ks-1)) .	(60)
+For a particular Runge-Kutta method one needs to provide the number of stages s, and the coef-
+ficients aij (1 ≤ j < i ≤ s), bi(i = 1, 2, . . . , s) and ci(i = 1, 2, . . . , s). These data are usually
+arranged in so-called Butcher tableaux (Butcher, 1963).
+21
+Published as a conference paper at ICLR 2022
+F Experiments
+Flux terms of equations that we study—the Heat, Burgers, Korteweg-de-Vries (KdV), and
+Kuromoto-Shivashinsky (KS) equation—are summarized in Table 3.
+Table 3: 1D flux terms J(u) of the Heat, Burgers, Korteweg-de-Vries (KdV), and Kuramoto-
+Shivashinsky (KS) equation.
+Heat
+Burgers
+KdV
+KS
+J(U)	-η∂χU~~2u2 3 - η∂χU~~3u2 + ∂χχU* ~~1 u2 + ∂χU + ∂χχχU
+Pushforward trick and temporal bundling. Pseudocode for one training step using the pushfor-
+ward trick and temporal bundling is sketch in Algorithm 1.
+Algorithm 1 Pushforward trick and temporal bundling. For a given batched input data trajectory
+and a model, we draw a random timepoint t, get our input data trajectory, perform N forward passes,
+and finally perform the supervised learning task with the according labels. K is the number of steps
+we predict into the future using the temporal bundling trick, N is number of unrolling steps in order
+to apply the pushforward trick, T is the number of available timesteps in the training set.
+Require: data, model, N, K, T	. data is the complete PDE trajectory
+t J DraWRandomNUmber t ∈{1,…，T}	. We draw a random starting point
+input J data(t 一 K:t)	. We input the last K timesteps
+for n ∈ {1, . . . , N} do
+input J model(input)
+end for	. Here we cut the gradients
+target J data(t + NK:t + N(K + 1))	. Actual labels after the pushforward operation
+output J model(input)
+loss J criterion(output, target)
+Implementation details. MP-PDE architectures, consist of three parts (sequentially applied):
+1. Encoder: Input → {fully-connected layer → activation → fully-connected layer → activa-
+tion }, where fully connected layers are applied node-wise
+2. Processor: 6 message passing layers as described in Sec. 3.2. Each layer consists of a 2-
+layer edge update network φ following Equation (8), and a 2-layer node update network ψ
+following Equation (9).
+3. Decoder: 1D convolutional network with shard weights across spatial locations → {1D
+CNN layer → activation → 1D CNN layer }
+We optimize models using the AdamW optimizer (Loshchilov & Hutter, 2017) with learning rate
+1e-4, weight decay 1e-8 for 20 epochs and minimize the root mean squared error (RMSE). We use
+batch size 16 for experiments E1-E3 and WE1-WE3 and batch size of 4 for 2D experiments. For
+experiments E1-E3 we use a hidden size of 164, and for experiments WE1-WE3 we use a hidden
+size of 128. In order to enforce zero-stability during training we unroll the solver for a maximum of
+2 steps (see Sec. 3.1).
+Message and update network in the processor consist of → {fully-connected layer → activation →
+fully-connected layer → activation }. We use skip-connections in the message passing layers and
+apply instance normalization (Ulyanov et al., 2016) for experiments E1-E3 and WE1-WE3, and
+batch normalization (Ioffe & Szegedy, 2015) for the 2D experiments. For the decoder, we use 8
+channels between the two CNN layers (1 input channel, 1 output channel) across all experiments.
+We use Swish (Ramachandran et al., 2017) activation functions for experiments E1-E3 and WE1-
+WE3 and ReLU activation for the 2D experiments. ReLU activation proved most effective for 2D
+experiments since a characteristic of the smoke inflow dynamics we studied is that values are zero
+for all positions which are untouched by smoke buoyancy at a given timepoint.
+Training details. The overall used architectures consist of roughly 1 million parameters and train-
+ing for the different experiments takes between 12 and 24 hours on average on a GeForceRTX 2080
+22
+Published as a conference paper at ICLR 2022
+Ti GPU. 6 message passing layers and a hidden size of 128 for the 2-layer edge update network and
+the 2-layer node update network is a robust choice. A hidden size of 64 shows signs of underfitting,
+whereas a hidden size of 256 is not improve performance significantly. For the overall performance,
+more important than the number of parameters is the choice of the output 1D CNN, the choice of in-
+puts to the edge update network φ following Equation (8) and the node update network ψ following
+Equation (9). We ablate these choices in Appendix G.
+Another interesting hyperparameter is the number of neighbors used for message passing. We con-
+struct our graphs by restricting the neighbors (edges) via a cutoff radius based on positional coor-
+dinates for experiments E1-E3 and the 2D experiments. We effectively use 6 neighbors for exper-
+iments E1-E3 and 8 neighbors for the 2D experiments. For experiments WE1-WE3, cutoff radii
+for selecting neighbors are not a robust choice since the grids are irregular and relative distances
+are much lower close to the boundaries. We therefore construct our graphs via a k-NN criterion,
+and effectively use between 20 neighbors (highest spatial resolution) and 6 neighbors (lowest spatial
+resolution).
+F.1 Experiments E1, E2, E3
+Figure 9 displays exemplary 1D rollouts at different resolution for the Burgers’ equation with differ-
+ent diffusion terms. Lower diffusion coefficients result in faster shock formation. Figure 10 displays
+exemplary 1D rollouts for different parameter sets. Large α parameters result in fast and large shock
+formations. The wiggles arising due to the dispersive term γ and cannot be captured by numerical
+solvers at low resolution. Our MP-PDE solver is able to capture these wiggles and reproduce them
+even at very low resolution.
+0
+Exemplary ID rollout of Burgers1 equation (r) = 0.14) at different resolutions
+2
+1
+ʒ O
+n
+8
+0
+8
+0
+8
+0
+8
+Exemplary ID rollout of Burgers1 equation (η = Q.Q8) at different resolutions
+2
+1
+ɔ 0
+8
+0
+8
+8
+0
+8
+O
+X
+t=0.0s
+t=0.3s
+t=0.6s
+t=1.0s
+t=1.3s
+t=1.6s
+t=1.9s
+t=2.2s
+t=2.6s
+t=2.9s
+t=3.2s
+t=3.5s
+t=3.9s
+0
+t=0.0s
+t=0.3s
+t=0.6s
+t=1.0s
+t=1.3s
+t=1.6s
+t=1.9s
+t=2.2s
+t=2.6s
+t=2.9s
+t=3.2s
+t=3.5s
+t=3.9s
+Figure 9:	Exemplary 1D rollout of the Burgers’ equation at different resolutions. The different
+colors represent PDE solutions at different timepoints. Diffusion coefficients of η = 0.14 (top) and
+η = 0.08 (bottom) are compared for the same initial conditions. Lower diffusion coefficients result
+in faster shock formation.
+23
+Published as a conference paper at ICLR 2022
+EXemPIary ID rollout of an IJnSeen equation (α = 2.90,。= 0.20, y= 0.15)
+1.5-
+t=o.os
+t=0.2s
+t=0.3s
+t=O.5s
+t=0.6s
+t=0.8s
+t=l.θs
+t=l.lS
+t=1.3S
+t=1.4s
+t=1.6S
+t=1.8s
+t=1.9s
+1.0
+0.5
+-0.5-
+n
+0.0
+8
+O
+8
+8
+O
+X
+nx=200
+ground trυth
+nx=100
+num baseline
+nx=50
+num baseline
+O
+8
+X=40
+num baseline
+---t=0.0s
+——t=0.2s
+—t=0.3s
+t=0.5s
+t=0.6s
+t=0.8s
+t=1.0s
+t=l.ls
+t=1.3s
+t=1.4s
+t=1.6s
+t=1.8s
+t=1.9s
+O
+X
+t=0.0s
+t=0.2s
+t=0.3s
+t=0.5s
+t=0.6s
+t=0.8s
+t=1.0s
+t=l.ls
+t=1.3s
+t=1.4s
+t=1.6s
+t=1.8s
+t=1.9s
+
+Figure 10:	Exemplary 1D rollout an unseen equation with different equation parameters. The differ-
+ent colors represent PDE solutions at different timepoints. Low α parameters (top) result in diffusion
+like behavior. Large α parameters (middle, bottom) result in fast and large shock formations. The
+wiggles arising due to the dispersive term γ. Numerical solvers cannot capture the wiggles at low
+resolution (middle), MP-PDE solvers can reconstruct them much better (bottom).
+24
+Published as a conference paper at ICLR 2022
+F.2 Experiments WE1, WE2, WE3
+Figure 11	displays exemplary 2D rollouts at different resolutions for the wave equation with Dirich-
+let and Neumann boundary conditions. Waves bounce back and forth between boundaries. MP-PDE
+solvers give accurate solutions on the irregular grids and are stable over time.
+ιoo
+2D rollout of the wave equation with Dirichlet boundary conditions
+80
+60
+40
+20
+(SPUOUωs)a
+nx=20
+prediction
+0
+nx=100
+prediction
+0
+nx=40
+prediction
+0	∙
+nx=50
+prediction
+0	-8
+X
+(SPUoUωs)4j
+Figure 11: Exemplary 2D rollouts for the wave equation with Dirichlet boundary conditions (top)
+and Neumann boundary conditions (bottom). The different colors for the Dirichlet boundary condi-
+tion comes from the fact that wave propagation changes the sign at each boundary.
+Figure 12: Exemplary 2D smoke inflow simulation. Ground truth data (top) are compared to MP-
+PDE solvers (bottom). Simulations run for 100 timesteps corresponding to 100 seconds. The MP-
+PDE solver is able to capture the smoke inflow acccurately over the given time period.
+
+25
+Published as a conference paper at ICLR 2022
+G	Architecture ablation and comparis on to CNNs
+A schematic sketch of our MP-PDE solver is displayed in Figure 13 (sketch taken from the main pa-
+per). A GNN based architecture was chosen since GNNs have the potential to offer flexibility when
+generalizing across spatial resolution, timescale, domain sampling regularity, domain topology and
+geometry, boundary conditions, dimensionality, and solution space smoothness. The chosen archi-
+tecture representationally contains classical methods, such as FDM, FVM, and WENO schemes.
+The architectures follows the Encode-Process-Decode framework of Battaglia et al. (2018), with
+adjustments. Most notably, PDE coefficients and other attributes such as boundary conditions de-
+noted with θPDE are included in the processor. For the decoder, a shallow 2-layer 1D convolutional
+network with shared weights across spatial locations is applied, motivated by linear multistep meth-
+ods (Butcher, 1987).
+For ablating the architecture, three design choices are verified:
+1.	Does a GNN have the representational power of a vanilla convolutional network on a reg-
+ular grid? We test against 1D and 2D baseline CNN architectures.
+2.	For the decoder part, how much does a 1D convolutional network with shared weights
+across spatial locations approve upon a standard MLP decoder?
+3.	How much does the inclusion of PDE coefficients θPDE help to generalize over e.g. different
+equations or different boundary conditions?
+Figure 13: Schematic sketch of our MP-PDE Solver, sketch taken from the main paper.
+Table 4 shows the three ablation (MP-PDEjfeDg, MP-PDE-ID-CNN, Baseline CNN) tested on
+shock wave formation modeling and generalization to unseen experiments (experiments E1, E2,
+and E3), as described in Section 4.1 in the main paper. For the training of the different architectures
+the optimized training strategy consisting of temporal bundling and pushforward trick is used.
+The MP-PDE-feθPfeDfeE ablation results are the same as reported in the main paper. The effect gets
+more prominent if more equation specific parameters are available (θPDE features), as it is the case
+for experiment E3. We also refer the reader to the experiments presented in Table 2, where MP-
+PDE solvers are shown to be able to generalize over different boundary conditions, which gets much
+stronger pronounced if boundary conditions are injected into the equation via θPDE features.
+The MP-PDE-N1DN-CNNNN ablation replaces the shallow 2-layer 1D convolutional network with in the
+decoder with a standard 2-layer MLP. Performance slightly degrades for the MLP decoder which is
+most likely due to the better temporal modeling introduced by the shared weights of the 1D CNN
+network.
+A Baseline 1D-CNN is built up of 8 1D-CNN layers, where the input consists of the spatial resolu-
+tion (nx). The K previous timesteps used for temporal bundling are treated as K input channels. The
+output consequently predicts the next K timesteps for the same spatial resolution (K output chan-
+nels). Using this format, again both temporal bundling and the pushforward trick can be effectively
+applied. The implemented 1D-CNN layers are:
+•	Input layer with K input channel, 40 output channels, kernel of size 3.
+•	3 layers with 40 input channels, 40 output channels, kernel of size 5.
+•	3 layers with 40 input channels, 40 output channels, kernel of size 7.
+•	1 output layer with 40 input channels, K output channel, kernel of size 7.
+26
+Published as a conference paper at ICLR 2022
+Residual connections are used between the layers, and ELU (Clevert et al., 2016) non-linearities are
+applied. Circular padding is implemented to reflect the periodic boundary conditions. The CNN
+output is a new vector di = (di1, di2, ..., diK) with each element dik corresponding to a different
+point in time. Analogously to the MP-PDE solver, we use the output to update the solution as
+uk+' = Uk + (tk+' - tk )d' ,	1 ≤ ' ≤ K,	(61)
+where K is the output (and input) dimension. This baseline 1D-CNN is conceptually very similar to
+our MP-PDE solver.
+A Baseline 2D-CNN is built up of 6 2D-CNN layers, where the input consists of the spatial res-
+olution (nx) and the K previous timesteps used for temporal bundling. The output consequently
+predicts the next K timesteps for the same spatial resolution. Using this format, both temporal
+bundling and the pushforward trick can be effectively applied. The implemented 2D-CNN layers
+are:
+•	Input layer with 1 input channel, 16 output channels, 3 × 3 kernel.
+•	4 intermediate layers with 16 input channels, 16 output channels, 5 × 5 kernel.
+•	1 output layer with 16 input channels, 1 output channel, 7 × 7 kernel.
+Residual connections are used between the layers, and ELU (Clevert et al., 2016) non-linearities are
+applied. For the spatial dimension, circular padding is implemented to reflect the periodic boundary
+conditions, for the temporal dimension zero padding is used. The CNN output is a new vector
+di = (di1, di2, ..., diK) with each element dik corresponding to a different point in time. Analogously
+to the MP-PDE solver and analogously to the 1D-CNN, we use the output to update the solution as
+shown in Equation (61).
+The 1D-CNN baseline which is conceptually very close to our MP-PDE solver performs much better
+than the 2D-CNN. However, we see already when looking at the results of E3 that generalization
+for the 1D-CNN across different PDEs becomes harder.
+Table 4: Ablation study comparing MP-PDE results on experiments on shock wave formation mod-
+eling and generaliziation to unseen equations (E1, E3, and E3) to an MP-PDE:ΘpDe ablation, an
+MP-PDE-ID-CNTN ablation, a baseline 1D-CNN and a baseline 2D-CNN architecture. Runtimes
+are for one full unrolling over 250 timesteps on a GeForce RTX 2080 Ti GPU. Accumulated error is
+nix Pχ,tMSE.
+Accumulated Error J	∣ Runtime [s] J
+(nt, nχ)	I MP-PDE MP-PDE-^PIDE MP-PDEdDCjNN 1D-CNN 2D-CNN ∣ MP-PDE 1D-CNN 2D-CNN
+E1	(250, 100)	1.55	-	2.41	3.45	25.70	0.09	0.02	0.16
+E1	(250, 50)	1.67	-	2.69	3.88	32.42	0.08	0.02	0.15
+E1	(250, 40)	1.47	-	2.50	3.07	37.13	0.008	0.02	0.14
+E2	(250, 100)	1.58	1.62	2.59	3.32	30.09	0.09	0.02	0.16
+E2	(250, 50)	1.63	1.71	2.31	2.89	30.87	0.08	0.02	0.15
+E2	(250, 40)	1.45	1.49	2.80	2.98	35.93	0.08	0.02	0.15
+E3	(250, 100)	4.26	4.71	6.26	9.15	42.37	0.09	0.02	0.16
+E3	(250, 50)	3.74	10.90	5.15	7.69	45.41	0.09	0.02	0.15
+E3	(250, 40)	3.70	7.78	7.27	6.77	53.87	0.09	0.02	0.15
+27

@@ -1,0 +1,759 @@
+Published as a conference paper at ICLR 2021
+Fast and Complete:	Enabling Complete Neu-
+ral Network Verification with Rapid and
+Massively Parallel Incomplete Verifiers
+Kaidi Xu*, 1	Huan Zhang*, 2	Shiqi Wang3	Yihan Wang2
+Suman Jana3	Xue Lin1	Cho-Jui Hsieh2
+1 Northeastern University 2UCLA 3Columbia University
+xu.kaid@northeastern.edu, huan@huan-zhang.com, tcwangshiqi@cs.columbia.edu,
+wangyihan617@gmail.com, suman@cs.columbia.edu, xue.lin@northeastern.edu,
+chohsieh@cs.ucla.edu
+Ab stract
+Formal verification of neural networks (NNs) is a challenging and important prob-
+lem. Existing efficient complete solvers typically require the branch-and-bound
+(BaB) process, which splits the problem domain into sub-domains and solves each
+sub-domain using faster but weaker incomplete verifiers, such as Linear Program-
+ming (LP) on linearly relaxed sub-domains. In this paper, we propose to use the
+backward mode linear relaxation based perturbation analysis (LiRPA) to replace
+LP during the BaB process, which can be efficiently implemented on the typi-
+cal machine learning accelerators such as GPUs and TPUs. However, unlike LP,
+LiRPA when applied naively can produce much weaker bounds and even cannot
+check certain conflicts of sub-domains during splitting, making the entire proce-
+dure incomplete after BaB. To address these challenges, we apply a fast gradient
+based bound tightening procedure combined with batch splits and the design of
+minimal usage of LP bound procedure, enabling us to effectively use LiRPA on
+the accelerator hardware for the challenging complete NN verification problem
+and significantly outperform LP-based approaches. On a single GPU, we demon-
+strate an order of magnitude speedup compared to existing LP-based approaches.
+1	Introduction
+Although neural networks (NNs) have achieved great success on various complicated tasks, they
+remain susceptible to adversarial examples (Szegedy et al., 2013): imperceptible perturbations of
+test samples might unexpectedly change the NN predictions. Therefore, it is crucial to conduct
+formal verification for NNs such that they can be adopted in safety or security-critical settings.
+Formally, the neural network verification problem can be cast into the following decision problem:
+Given a neural network f (∙), an input domain C, and a property P. ∀x ∈ C, does f (x) satisfy P ?
+The property P is typically a set of desirable outputs of the NN conditioned on the inputs. Typically,
+consider a binary classifier f(x) and a positive example x0 (f(x0) ≥ 0), we can set P to be non-
+negative numbers R+ and x is bounded within an l∞ norm ball C = {x|kx - x0k∞ ≤ }. The
+success of verification guarantees that the label of x0 cannot flip for any perturbed inputs within C .
+In this paper we study the complete verification setting, where given sufficient time, the verifier
+should give a definite “yes/no” answer for a property under verification. In the above setting, it
+must solve the non-convex optimization problem minx∈C f(x) to a global minimum. Complete NN
+verification is generally a challenging NP-Hard problem (Katz et al., 2017) which usually requires
+expensive formal verification methods such as SMT (Katz et al., 2017) or MILP solvers (Tjeng
+et al., 2019b). On the other hand, incomplete solvers such as convex relaxations of NNs (Salman
+et al., 2019) can only provide a sound analysis, i.e., they can only approximate the lower bound of
+minx∈c f (x) as f and verify the property when f ≥ 0. No conclusion can be drawn when f < 0.
+Recently, a Branch and Bound (BaB) style framework (Bunel et al., 2018; 2020b) has been adopted
+for efficient complete verification. BaB solves the optimization problem minx∈C f(x) to a global
+1
+Published as a conference paper at ICLR 2021
+minimum by branching into multiple sub-domains recursively and bounding the solution for each
+sub-domain using incomplete verifiers. BaB typically uses a Linear Programming (LP) bounding
+procedure as an incomplete verifier to provide feasibility checking and relatively tight bounds for
+each sub-domain. However, the relatively high solving cost of LPs and incapability of paralleliza-
+tion (especially on massively parallel hardware accelerators like GPUs or TPUs) greatly limit the
+performance and scalability of the existing complete BaB based verifiers.
+In this paper, we aim to use fast and typically weak incomplete verifiers for complete verification.
+Specifically, we focus on a class of incomplete verifiers using efficient bound propagation oper-
+ations, referred to as linear relaxation based perturbation analysis (LiRPA) algorithms (Xu et al.,
+2020). Representative algorithms in this class include convex outer adversarial polytope (Wong
+& Kolter, 2018), CROWN (Zhang et al., 2018) and DeepPoly (Singh et al., 2019b). LiRPA algo-
+rithms exhibit high parallelism as the bound propagation process is similar to forward or backward
+propagation of NNs, which can fully exploit machine learning accelerators (e.g., GPUs and TPUs).
+Although LiRPA bounds are very efficient for incomplete verification, especially in training certified
+adversarial defenses (Wong et al., 2018; Mirman et al., 2018; Wang et al., 2018a; Zhang et al., 2020),
+they are generally considered too loose to be useful compared to LPs in the complete verification
+settings with BaB. As we will demonstrate later, using LiRPA bounds naively in BaB cannot even
+guarantee the completeness when splitting ReLU nodes, and thus we need additional measures to
+make them useful for complete verification. In fact, LiRPA methods have been used to get upper and
+lower bounds for each ReLU neuron in constructing tighter LPs (Bunel et al., 2018; Lu & Kumar,
+2020). It was also used in (Wang et al., 2018c) for verifying small-scale problems with relatively low
+dimensional input domains using input splits, but splitting the input space can be quite ineffective
+(Bunel et al., 2018) and is unable to scale to high dimensional input case like CIFAR-10. Except
+one concurrent work (Bunel et al., 2020a), most complete verifiers are based on relatively expensive
+solvers like LP and cannot fully take benefit from massively parallel hardware (e.g., GPUs) to obtain
+tight bounds for accelerating large-scale complete verification problems. Our main contributions are:
+•	We show that LiRPA bounds, when improved with fast gradient optimizers, can potentially out-
+perform bounds obtained by LP verifiers. This is because LiRPA allows joint optimization of both
+intermediate layer bounds of ReLU neurons (which determine the tightness of relaxation) and output
+bounds, while LP can only optimize output bounds with fixed relaxations on ReLU neurons.
+•	We show that BaB purely using LiRPA bounds is insufficient for complete verification due to the
+lack of feasibility checking for ReLU node splits. To address this issue, we design our algorithm to
+only invoke LP when absolutely necessary and exploits hardware parallelism when possible.
+•	To fully exploit the hardware parallelism on the machine learning accelerators, we use a batch
+splitting approach that splits on multiple neurons simultaneously, further improving our efficiency.
+•	On a few standard and representative benchmarks, our proposed NN verification framework
+can outperform previous baselines significantly, with a speedup of around 30X compared to basic
+BaB+LP baselines, and up to 3X compared to recent state-of-the-art complete verifiers.
+2 Background
+2.1	Formal definition of Neural network (NN) verification
+Notations of NN. For illustration, we define an L-layer feedforward NN f : R|x| → R with L
+weights W(i) (i ∈ {1,…，L}) recursively as h(i)(x) = W(i)g(i-1)(x), hidden layer g(i)(x)=
+ReLU(h(i)(x)), input layer g(0) (x) = x, and final output f(x) = h(L) (x). For simplicity we ignore
+biases. We sometimes omit x and use h(ji) to represent the pre-activation of the j-th ReLU neuron
+in i-th layer for x ∈ C, and we use gj(i) to represent the post-activation value. We focus on verifying
+ReLU based NNs, but our method is generalizable to other activation functions supported by LiRPA.
+NN Verification Problem. Given an input x, its bounded input domain C , and a feedforward NN
+f (∙),the aim of formal verification is to prove or disprove certain properties P ofNN outputs. Since
+most properties studied in previous works can be expressed as a Boolean expression over a linear
+equation of network output, where the linear property can be merged into the last layer weights of a
+NN, the ultimate goal of complete verification reduces to prove or disprove:
+∀x ∈ C, f(x) ≥ 0	(1)
+2
+Published as a conference paper at ICLR 2021
+One way to prove Eq. 1 is to solve minx∈C f (x). Due to the non-convexity of NNs, finding the
+exact minimum of f(x) over x ∈ C is challenging as the optimization process is generally NP-
+complete (Katz et al., 2017). However, in practice, a sound approximation of the lower bound for
+f (x), denoted as f, can be more easily obtained and is sufficient to verify the property. Thus, a good
+verification strategy to get a tight approximation f can save significant time cost. Note that f must
+be sound, i.e., ∀χ ∈ C, f ≤ f (x), proving f ≥ 0 is sufficient to prove the property f (x) ≥ 0.
+2.2	The Branch and Bound (BaB) framework for Neural Network Verification
+Branch and Bound (BaB), an effective strategy in solving traditional combinatorial optimization
+problems, has been customized and widely adopted for NN verification (Bunel et al., 2018; 2020b).
+Specifically, BaB based verification framework is a recursive process, consisting of two main steps:
+branching and bounding. For branching, BaB based methods will divide the bounded input domain
+C into sub-domains {Ci|C = i Ci}, each defined as a new independent verification problem. For
+instance, it can split a ReLU unit gj(k) = ReLU(h(jk) ) to be negative and positive cases as C0 =
+C ∩ h(jk) ≥ 0 and C1 = C ∩ h(jk) < 0 for a ReLU-based network; for each sub-domain Ci ,
+BaB based methods perform bounding to obtain a
+relaxed but sound lower bound f C . A tightened
+global lower bound over C can then be obtained by taking the minimum values of the sub-domain
+lower bounds from all the sub-domains: f = mini f C . Branching and bounding will be performed
+recursively to tighten the approximated global lower bound over C until either (1) the global lower
+bound f becomes larger than 0 and prove the property or (2) a violation (e.g., adversarial example)
+is located in a sub-domain to disprove the property. Essentially, We build a search tree where each
+leaf is a sub-domain, and the property P can be proven only when it is valid on all leaves.
+Soundness of BaB We say the verification process is sound if we can always trust the “yes” (P
+is verified) answer given by the verifier. It is straightforward to see that the whole BaB based
+verification process is sound as long as the bounding method used for each sub-domain Ci is sound.
+Completeness of BaB The completeness of the BaB-based NN verification process, which was
+usually assumed true in some previous works (Bunel et al., 2020b; 2018), in fact, is not always
+true even if all possible sub-domains are considered with a sound bounding method. Additional
+requirements for the bounding method are required - we point out that a key factor for completeness
+involves feasibility checking in the bounding method which we will discuss in Section 3.2.
+Branching in BaB Since branching step determines the shape of the search tree, the main chal-
+lenge is to efficiently choose a good leaf to split, which can significantly reduce the total number of
+branches and running time. In this work we focus on branching on activation (ReLU) nodes. BaBSR
+(Bunel et al., 2018) includes a simple branching heuristic which assigns each ReLU node a score to
+estimate the improvement for tightening f by splitting it, and splits the node with the highest score.
+Bounding with Linear Programming (LP) A typical bounding method used in BaB based veri-
+fication is the Linear Programming bounding procedure (sometimes simply referred to as “LP” or
+“LP verifier” in our paper). Specifically, we transform the original verification problem into a linear
+programming problem by relaxing every activation unit as a convex (linear) domain (Ehlers, 2017)
+and then get the lower bound fC with a linear solver given domain Ci. For instance, as shown in
+Figure 1a, gj(i) = ReLU(h(ji)) can be linearly relaxed with the following 3 constraints: (1) gj(i) ≥ h(ji);
+(i)
+(2)g(i) ≥ 0; (3) g(i) ≤(；j a) (h(i) - l(i)). Note that the lower bound Ij) and upper bound uj) for
+ul
+jj
+each activation node h(ji) are required in the LP construction given Ci . They are typically computed
+by the existing cheap bounding methods like LiRPA variants (Wong & Kolter, 2018) with low cost.
+The tighter the intermediate bounds (lji), Uji)) are, the tighter f approximated by LP is.
+2.3 Linear Relaxation based Perturbation Analysis (LiRPA)
+Bound propagation in LiRPA We used Linear Relaxation based Perturbation Analysis (LiRPA)1
+as bound procedure in BaB to get linear upper and lower bounds of NN output w.r.t input x ∈ C:
+Ax + b ≤ f (x) ≤ Ax + b, x ∈ C	(2)
+1We only use the backward mode LiRPA bounds (e.g., CROWN and DeepPoly) in this paper.
+3
+Published as a conference paper at ICLR 2021
+Figure 1: Relaxations of a ReLU: (a) “triangle” relaxation in LP; (b)(c) No relaxation when u(i) ≤ 0 (always
+inactive) or lji) ≥ 0 (always active); (d) linear relaxation in LiRPA when l(i) < 0, uji) > 0 (unstable).
+A lower bound f can then be simply obtained by taking the lower bound of the linear equation
+Ax + b w.r.t input X ∈ C, which can be obtained via Holder,s inequality when C is a 'p norm ball.
+To get the coefficients A, A, b, b, LiRPA propagates bounds of f (x) as a linear function to the
+output of each layer, in a backward manner. At the output layer h(L) (x) we simply have:
+Ih(L)(X) ≤ f(x) ≤ Ih(L) (x), X ∈ C	(3)
+Then, the next step is to backward propagate the identity linear relationship through a linear layer
+h(L)(x) = W(L)g(L-1) (x) to get the linear bounds of f(x) w.r.t g(L-1):
+W(L)g(L-1) (X) ≤ f(X) ≤ W(L)g(L-1) (X), X ∈ C	(4)
+To get the linear relationship of h(L-1) w.r.t f (x), we need to backward propagate through ReLU
+layer g(L-1) (x) = ReLU(h(L-1) (x)). Since it is nonlinear, we perform linear relaxations. For
+illustration, considering the j-th ReLU neuron at i-th layer, gj(i) (x) = ReLU(h(ji) (x)), we can
+linearly upper and lower bound it by	aji)hji)(x)	+	bji)	≤	gji) (x)	≤	aji)hji)(x) +	bji),	where
+aji),aji),bji),bji) are:
+aji) =Mi	=。虏=律>	=0	u(ji) ≤ 0	(always inactive for X ∈ C)
+ajji) = ɑjji)	= 1,bji)	= bji)	= 0	lji) ≥ 0	(always active for X ∈ C)	⑸
+.	.	(i)	.	...	(i)dit	` '
+aji) = αji), aji)	=	(j(i)	,bji)	= 0,bj	= -	Uj	j(i)	lji)	<	0, Ui)	> 0 (unstable for X ∈ C)
+u -l	u -l
+jj	jj
+Here l(ji) ≤ h(ji)(x) ≤ u(ji) are intermediate pre-activation bounds for x ∈ C, and αj(i) is an arbitrary
+value between 0 and 1. The pre-activation bounds l(ji) and u(ji) can be computed by treating h(ji) (x)
+as the output neuron with LiRPA. Figure 1(b,c,d) illustrate the relaxation for each state of ReLU
+neuron. With these linear relaxations, we can get the linear equation of h(L-1) w.r.t output f (x):
+W(L)DaLT)h(LT)(X)+ b(L) ≤ f(χ) ≤ W(L)DaLT)h(LT)(X)+ b(L), χ ∈ C
+D(L)	=
+Da,(j,j)=]
+≥ 0 ,	b(L)	= b0(L)TW(L),	where b0(L)	= (bjL),	WjL)	≥0	⑹
+< 0 ,—	—	~j [bjL),	WjL)	< 0
+The diagonal matrices DOL-1), DaL 1) and biases reflects the linear relaxations and also considers
+the signs in W(L) to maintain the lower and upper bounds. The definitions forj-th diagonal element
+DaLj j) and bias b(L) are similar, with the conditions for checking the signs of WjL) swapped.
+Importantly, DaL-I) has free variables aji) ∈ [0,1] which do not affect correctness of the bounds.
+We can continue backward propagating these bounds layer by layer (e.g., g(L-2) (x), h(L-2) (x),
+etc) until reaching g(0)(x) = x, getting the eventual linear equations of f(x) in terms of input x:
+L(X, α) ≤ f(X) ≤ U(X, α), ∀X ∈ C, where
+L(x, α) = W(L)DaLT)…DaI)W(I)X + b, U(x, α) = W(L)DaLT)…DaI)W(I)X + b ⑺
+Here α denotes αj(i) for all unstable ReLU neurons in NN. The obtained bounds (L(x, α), U(x, α))
+off(x) are linear functions in terms ofx. Beyond the simple feedforward NN presented here, LiRPA
+can support more complicated NN architectures like DenseNet and Transformers by computing L
+and U automatically and efficiently on general computational graphs (Xu et al., 2020).
+Soundness of LiRPA The above backward bound propagation process guarantees that L(x, α) and
+U(x, α) soundly bound f(x) for all x ∈ C. Detailed proofs can be found in (Zhang et al., 2018;
+Singh et al., 2019b) for feedforward NNs and (Xu et al., 2020) for general networks.
+4
+Published as a conference paper at ICLR 2021
+J Prove: /下 ≥ 0,∀% ∈ C
+OAlways Active:
+.≥ 0
+Θ Always Inactive:
+暇≤ 0
+√
+
+
+—ʌ Linear relaxed
+Unst Unstable neuron:
+J针＜0,咪＞0
+Unoptimized LiRPA: lower bound f = -1.94
+Optimized LiRPA: lower bound f = -0.83
+Xi
+0碍)
+Example: Optimized LiRPA for 1 (2)
+∖	tigher Z(2) and u(2) make tighter relaxation
+Example: BaB to find tighter lower bound
+
+√
+Figure 2: Illustration of our optimized LiRPA bounds and the BaB process. Given a two-layer neural network,
+We aim to verify output f (x) ≥ 0. Optimized LiRPA chooses optimized slopes for ReLU lower bounds,
+allowing tightening the intermediate layer bounds l(i) and uji) and also the output layer lower bound f. BaB
+splits two unstable neurons 虑2 and h，) to improve f and verify all sub-domains (f ≥ 0 for all cases).
+3 Proposed Algorithm
+Overview In this section, we will first introduce our proposed efficient optimization of LiRPA
+bounds on GPUs that can allow us to achieve tight approximation on par with LP or even tighter for
+some cases but in a much faster manner. In Fig. 2, we provide a two-layer NN example to illustrate
+how our optimized LiRPA can improve the performance of BaB verification. In Section 3.2, we
+then show that feasibility checking is important to guarantee the completeness of BaB, and BaB
+using LiRPA without feasibility checking will end up to be incomplete. To ensure completeness,
+we design our algorithm with minimal usage of LP for checking feasibility of splits. Finally, we
+propose a batch split design by solving a batch of sub-domains in a massively parallel manner on
+GPUs to fully leverage the benefits of cheap and parallelizable LiRPA. We further improve BaBSR
+in a parallel fashion for branching and we summarize the detailed proposed algorithm in Section 3.4.
+3.1	Optimized LiRPA for Complete Verification
+Concrete outer bounds with optimizable parameters We propose to use LiRPA as the bounding
+step in BaB. A pair of sound and concrete lower bound and upper bound (f, f) to f (x) can be
+obtained according to Eq. 7 given fixed α = ɑ0:
+f (α0) = minL(x, α0), f (α0) = maxU(x, α0)	(8)
+一x∈C	x∈C
+Because L, U are linear functions w.r.t X when α° is fixed, it is easy to solve Eq. 8 using Holder's
+inequality when C is a `p norm ball (Xu et al., 2020). In incomplete verification settings, α can be
+set via certain heuristics (Zhang et al., 2018). Salman et al. (2019) showed that, the variable α is
+equivalent to dual variables in the LP relaxed verification problem (Wong & Kolter, 2018). Thus, an
+(i)	(i)
+optimal selection of α given the same pre-activation bounds lj and uj can in fact, lead to the the
+same optimal solution for f and f as in LP.
+Previous complete verifiers typically use LiRPA variants to obtain intermediate layer bounds to
+construct an LP problem (Bunel et al. (2018); Lu & Kumar (2020)) and solve the LP to obtain
+bounds at output layer. The main reason for using LP is that it typically produces much tighter
+bounds than LiRPA when α is not optimized. We use optimized LiRPA, which is fast, accelerator-
+friendly, and can produce tighter bounds, well outperforming LP for complete verification:
+f = min min L(x, α), f = max max U(x, α), α(i) ∈ [0,1]	(9)
+一 α x∈C	α x∈C
+The inner minimization or maximization has closed form solutions (Xu et al., 2020) based on
+Holder,s inequality, so we only need to optimize on a. Since we use a differentiable framework (XU
+et al., 2020) to compute the LiRPA bound functions L and U, the gradients ∂L and ∂α can be
+obtained easily. optimization over α can be done via projected gradient descent (each coordinate of
+α is constrained in [0, 1]). Since the gradient computation and optimization are done on GPUs, the
+bounding process is still very fast and can be one or two magnitudes faster than solving an LP.
+Optimized LiRPA bounds can be tighter than LP Solving Eq. 9 using gradient descent cannot
+guarantee to converge to the global optima, so it seems the bounds must be looser than LP. Counter-
+intuitively, by optimizing α, we can potentially obtain tighter bounds than LP. When a “triangle”
+5
+Published as a conference paper at ICLR 2021
+relaxation is constructed for LP, intermediate pre-activation bounds l(ji) , u(ji) must be fixed for the
+j -th ReLU in layer i. During the LP optimization process, only the output bounds are optimized;
+intermediate bounds stay unchanged. However, in the LiRPA formulation, L(x, α) and U(x, α) are
+complex functions of α: since intermediate bounds are also computed by LiRPA, they depend on all
+a(i )(0 < i0 < i) in previous layers. Thus, the gradients ∂∂L and 罢 Can tighten output layer bounds
+f and f indirectly by tightening intermediate layer bounds, forming a tighter convex relaxation for
+the next iteration. An LP solver cannot achieve this because adding l(ji) and u(ji) as optimization
+variables makes the problem non-linear. This is the key to our success of applying LiRPA based
+bounds for the complete verification setting, where tighter bounds are essential.
+In Figure 3, we illustrate our optimized LiRPA bounds and
+the LP solution. Initially, we use LiRPA with α set via a fast
+heuristic to compute intermediate layer bounds l(ji) and u(ji),
+and then use them to build a relaxed LP problem. The solution
+to this initial LP problem (red line) is much tighter than the
+LiRPA solution with the heuristically set α (the left-most point
+of the blue line). Then, we optimize α with gradient decent,
+and LiRPA quickly outperforms this initial LP solution due to
+optimized tighter intermediate layer bounds. We can create a
+new LP with optimized intermediate bounds (light blue line),
+producing a slightly tighter bound than LiRPA with optimized
+α. The LP bounds in most existing complete verifiers all use
+Figure 3: Optimized LiRPA bound (0
+to 200 iterations) vs LP bounds.
+intermediate layer bounds obtained from unoptimized LiRPA bounds or even weaker methods like
+interval arithmetic, ending up to the solution close to or lower than the red line in Figure 3. In-
+stead, our optimized LiRPA bounds can produce tight bounds, and also exploit parallel acceleration
+from machine learning accelerators, leading to huge improvements in verification time compared to
+existing baselines.
+ReLU Split Constraints In the BaB process, when a ReLU h(ji) is split into two sub-domains
+(hj(i) ≥ 0 and h(ji) < 0), we simply set lj(i) ≥ 0 and uj(i) < 0 in bounding step. It tighten the
+LiRPA bounds by forcing the split ReLU linear, reducing relaxation errors. However, when splits
+(i) (i)
+are added, LiRPA and LP are not equivalent even under fixed lj , uj and optimal α. After splits,
+LiRPA cannot check certain constraints where LP is capable to, as we will discuss in the next section.
+3.2	Completeness with Minimal Usage of LP Bounding Procedure
+Even though our optimized LiRPA can bring us huge speed improvement over LP for BaB based
+verification, we observe that it may end up tobe incomplete due to the lack of feasibility checking: it
+cannot detect some conflicting settings of ReLU splits. We state such an observation in Theorem 3.1:
+Theorem 3.1 (Incompleteness without feasibility checking) When using LiRPA variants de-
+scribed in Section 2.3 as the bounding procedure, BaB based verification is incomplete.
+We prove the theorem by giving a counter-example in Appendix A.1 where all ReLU neurons are
+split and thus LiRPA runs on a linear network for each sub-domain. As a result, LiRPA can still
+be indecisive for the verification problem. The main reason is that LiRPA variants will lose the
+feasibility information encoded by the sub-domain constraints. For illustration, consider a sub-
+domain Ci = C ∩ (h(ji1) < 0) ∩ (h(ji2) ≥ 0), LiRPA will force gj(i1)(x) = 0 (inactive ReLU, a zero
+function) and gj(i2) (x) = h(ji2) (x) (active ReLU, an identity function) respectively and propagate
+these bounds to get the approximated lower bound f C . However, the split feasibility constraint
+(h(ji1) < 0) ∩ (h(ji2) ≥ 0) is ignored, so two conflict splits may be conducted (e.g., when h(ji1) < 0,
+h(ji2 ) cannot be ≥ 0). On the contrary, LP can fully preserve such feasibility information due to the
+linear solver involved and detect the infeasible sub-domains. Then, in Theorem 3.2 we show that the
+minimal usage of feasibility checking with LP can guarantee the completeness of BaB with LiRPA.
+6
+Published as a conference paper at ICLR 2021
+Algorithm 1 Parallel BaB with optimized LiRPA bounding (we highlight the differences between
+our algorithm and regular BaB (Bunel et al., 2018) in blue. Comments are in brown.)
+1:
+2:
+3:
+4:
+5:
+6:
+7:
+8:
+9:
+10:
+11:
+12:
+Inputs: f, C, n (batch size), η (threshold to switch to LP)
+(f,f) - optimized-LiRPA(f, [C])
+P — [(f,f, C)] _
+while f < 0 and f ≥ 0 do
+(Ci,..., Cn) — batch_pick_out(P,n)
+. P is the set of all unverified sub-domains
+. Pick sub-domains to split and removed them from P
+Ci, Cu,..., Cn, CnU] — batch_SPlit(CI,..., Cn) . Each Ci splits into two sub-domains Ci and Cu
+hfC 1 ,fC1 ,fC u ,f Cu,..., f Cl, f Cn, f Cu ,fCui J OPtimiZed-LiRPA (f, [Cl, Cu,..., Cnl, Cn]).
+Compute lower and upper bounds using LiRPA for each sub-domain on GPUs in a batch
+P J P U DOmain-Filter ([fC∣ ,fC1 , Ci], [fCU ,fCu (/],...,[£/,fCn, Cln], [fCu ,fCu , Cn])	.
+Filter out verified sub-domains, insert the left domains back to P
+f — min{fc | (f. ,Ci) ∈ P}, i = 1,...,n
+Ci	Ci
+f - min{fCi | (fCi,Ci) ∈ P}, i = 1,...,n
+if length(P) > η then
+. To ease notation, Ci here indicates both Ciu and Cil
+fC11,fCι,fCu ,fCu,...,fCn ,f Cn ,f Cu ,fCu,]
+. Fall back to LP for completeness
+—ComPute_bound_LP(f, [Ci, Cu,..., Cnll, Cu])
+13:	P J P U DOmain-Filter (fC∣ ,fC1 , Cl], [fC, ,fCu , Cf],...,% ,fCn, Cnt], [fC„ ,fC„ , Cn])
+14:	Outputs: f, f
+Theorem 3.2 (Minimal feasibility checking for completeness) When using LiRPA variants de-
+scribed in Section 2.3 as the bounding procedure, BaB based verification is complete if all infeasible
+leaf sub-domains (i.e., sub-domains cannot be further split) are detected by linear programming.
+We prove the theorem in Appendix A.2, where we show that by checking the feasibility of splits
+with LP, we can eliminate the cases where incompatible splits are chosen in the LiRPA BaB process.
+Since LP is slow while LiRPA is highly efficient, we propose to only use LP when the LiRPA based
+bounding process is stuck, either (1) when partitioning and bounding new sub-domains with LiRPA
+cannot further improve the bounds, or (2) when all unstable neurons have been split. In this way, the
+infeasible sub-domains can be eventually detected by occasional usage of LP while the advantage of
+massive parallel LiRPA on GPUs is fully enjoyed. We will describe our full algorithm in Sec. 3.4.
+3.3	Batch Splits
+SOTA BaB methods (Bunel et al., 2020b; Lu & Kumar, 2020) only split one sub-domain during
+each branching step. Since we use cheap and GPU-friendly LiRPA bounds, we can select a batch of
+sub-domains to split and propagate their LiRPA bounds in a batch. Such a batch splitting design can
+greatly improve hardware efficiency on GPUs. Given a batch size n that allows us to fully use the
+GPU memory available, we can obtain n bounds simultaneously. It grows the search tree on a single
+leaf by a depth of log2 n, or split n/2 leaf nodes at the same time, accelerating by up to n times.
+3.4	Our Complete Verification Framework
+Our LiRPA based complete verification framework is presented in Alg. 1. The algorithm takes a
+target NN function f and a domain C as inputs. We run optimized LiRPA to get initial bounds
+(f, f) for X ∈ C (Line 2). Then we utilize the power of GPUs to split in parallel and maintain
+a^global set P storing all the sub-domains which cannot be verified with optimized LiRPA (Line
+5-10). Specifically, batch_pick_out improves BaBSR (Bunel et al., 2018) in a parallel manner to
+select n sub-domains in P and determine the corresponding ReLU neuron to split for each of them. If
+the length of P is less than n, then we reduce n to the length of P. batch_split splits each selected
+Ci to two sub-domains Cil and Ciu by forcing the selected unstable ReLU neuron to be positive and
+negative, respectively. OPtimize_LiRPA runs optimized LiRPA in parallel as a batch and returns
+the lower and upper bounds for n selected sub-domains simultaneously. Domain-Filter filters out
+verified sub-domains (proved with f C ≥ 0) and we insert the remaining ones to P. The loop breaks
+if the property is proved (f ≥ 0) ora counter-example is found in any sub-domain (f < 0).
+To avoid excessive splits, we set the maximum length of the sub-domains to η (Line 12). Once the
+length of P reaches this threshold, compute_bound_LP will be called. It solves these η sub-domains
+by LP (one by one in a loop, or in parallel if using multiple CPUs is allowed) with optimized LiRPA
+7
+Published as a conference paper at ICLR 2021
+computed intermediate layer bounds. If a sub-domain Ci ∈ P (which previously cannot be verified
+by LiRPA) is proved or detected to be infeasible by LP, as an effective heuristic, we will backtrack
+and prioritize to check its parent node with LP. If the parent sub-domain is also proved or infeasible,
+we can prune all its child nodes to greatly reduce the size of the search tree.
+Completeness of our framework Our algorithm is complete, because we follow Theorem 3.2 and
+check feasibility of all split sub-domains that have deep BaB search tree depth (length of P reaches
+threshold η), forming a superset of the worst case where all ReLU neurons are split.
+4	Experiments
+In this section, we compare our verifier against the state-of-the-art ones to illustrate the effectiveness
+of our proposed framework. Overall, our verifier is about 10X, 4X and 20X faster than the best
+LP-based verifier (Lu & Kumar, 2020) on the Base, Wide and Deep models, respectively.
+Setup We follow the most challenging experimental setup used in the state-of-the-art verifiers
+GNN-online (Lu & Kumar, 2020) and BaBSR (Bunel et al., 2020b). Specifically, we evalu-
+ate on CIFAR10 dataset on three NNs: Base, Wide and Deep. The dataset is categorized into
+three difficulty levels: Easy, Medium, and Hard, which is generated according to the performance
+of BaBSR. The verification task is defined as given a l∞ norm perturbation less than , the clas-
+sifier will not predict a specific (predefined) wrong label for each image x (see Appendix B).
+We set batch size n = 400, 200, 200 for Base, Wide and Deep model respectively and threshold
+η = 12000. More details on experimental setup are provided in Appendix B. Our code is available
+at https://github.com/kaidixu/LiRPA_Verify.
+Comparisons against state-of-the-art verifiers We include five different methods for comparison:
+(1) BaBSR (Bunel et al., 2020b), a BaB and LP based verifier using a simple ReLU split heuristic;
+(2) MIPPlanet (Ehlers, 2017), a customized MIP solver for NN verification where unstable ReLU
+neurons are randomly selected for split; (3) GNN (Lu & Kumar, 2020) and (4) GNN-Online (Lu
+& Kumar, 2020) are BaB and LP based verifiers using a learned graph neural network (GNN) to
+guide the ReLU split. (5) Proximal BaBSR (Bunel et al., 2020a) is a very recently proposed
+verification framework based on Lagrangian decomposition which also supports GPU acceleration
+without solving LPs. All methods use 1 CPU with 1 GPU. The timeout threshold is 3,600 seconds.
+For the Base model in different difficulty levels, Easy, Medium and Hard, Table 1 shows that we are
+around 5 〜40X faster than baseline BaBSR and around 2 〜20X faster than GNN split baselines.
+The accumulative solved properties with increasing runtime are shown in Figure 4. In all our exper-
+iments, we use the basic heuristic in BaBSR for branching and do not use GNNs, so our speedup
+comes purely from the faster LiRPA based bounding procedure. We are also competitive against
+Lagrangian decomposition on GPUs.
+Table 1: Performance of various methods on different models. We compare each method’s avg. solving time,
+the avg. number of branches required, and the percentage of timed out (TO) properties.
+	Base - Easy			Base - Medium			Base - Hard				Wide		Deep		
+Method	time(s)	branches	%TO	time(s)	branches	%TO	time(s)	branches	%TO	time(s)	branches	%TO	time(s)	branches	%TO
+BABSR	522.48	585	0.0	1335.40	1471	0.0	2875.16	1843	35.2	3325.65	455	50.3	2855.19	365	54.0
+MIPplanet	1462.24		16.5	1912.25		43.5	2172.23		46.2	3088.40		79.4	2842.54		73.6
+GNN	312.93	301	0.0	624.12	63-5	0.9	1468.75	931	15.6	1791.52	375	19.0	1870.63	198	18.4
+GNN-online	207.43	269	0.0	638.15	546	0.4	1255.35	968	15.6	1642.03	389	19.0	1845.71	196	18.4
+Proximal BaBSR	15.68	1371	0.0	51.88	6482	0.4	627.96	91880	13.4	510.55	45855	11.4	230.06	6721	4.4
+Ours	11.86	2589	0.0	42.04	9233	0.0	633.85	96755	13.0	375.23	53481	8.5	81.55	1439	1.6
+——BaBSR
+MIPpIanet
+GNN
+——GNN-OnIine
+Prox. BaBSR
+---Ours
+(a) Base-Easy
+Figure 4: Cactus plots for our method and other baselines in Base (Easy, Medium and Hard ), Wide and Deep
+models. We plot the percentage of solved properties with growing running time.
+Performance on Larger Models In Table 1, we show that our verifier is more scalable on larger
+(wider or deeper) NNs compared to other state-of-the-art verifiers. Our method enjoys efficient
+GPU acceleration particularly on Deep model and can achieve 30X speedup compared to BaBSR,
+8
+Published as a conference paper at ICLR 2021
+and we are also significantly faster than Lagrangian decomposition based GPU verifier (Proximal
+BaB SR). When compared to the state-of-the-art LP based BaB, GNN-Online, our method can
+save 20X running time on Deep model. In Appendix C, we analyze the effectiveness of optimized
+LiRPA and batch splits separately, and find that optimized LiRPA is crucial for NN verification.
+Performance comparisons of our proposed framework on CPU cores without GPU acceleration are
+included in Appendix D.
+5	Related Work
+Complete verifiers Early complete verifiers rely on satisfiability modulo theory (SMT) (Katz et al.,
+2017; Huang et al., 2017; Ehlers, 2017) and mixed integer linear programming (MILP) (Tjeng et al.,
+2019a; Dutta et al., 2018), and they typically do not scale well. Higher order logic provers such
+as proof assistant (Bentkamp et al., 2018) can also be potentially used for NN verification, but
+their scalability to the NN setting has not been demonstrated. Recently, Bunel et al. (2018) unified
+many approaches used in various complete verifiers into a BaB framework. An LP based bounding
+procedure is used in most of the existing BaB framework (Bunel et al., 2018; Wang et al., 2018c;
+Royo et al., 2019; Lu & Kumar, 2020). For branching, two categories of branching strategies were
+proposed: (1) input node branching (Wang et al., 2018c; Bunel et al., 2020b; Royo et al., 2019;
+Anderson et al., 2019) where input features are divided into sub-domains, and (2) activation node
+(especially, ReLU) branching (Katz et al., 2017; Bunel et al., 2018; Wang et al., 2018b; Ehlers, 2017;
+Lu & Kumar, 2020) where hidden layer activations are split into sub-domains. Bunel et al. (2018)
+found that input node branching cost is exponential to input dimension. Thus, many state-of-the-art
+verifiers use activation node branching instead, focusing on heuristics to select good nodes to split.
+BaBSR (Bunel et al., 2018) prioritizes ReLUs for splitting based on their pre-activation bounds; Lu
+& Kumar (2020) used a graph neural network (GNN) to learn good splitting heuristics. Our work
+focuses on improving bounding and can use better branching heuristics to achieve further speedup.
+Two mostly relevant concurrent works using GPUs for accelerating NN verification are: (1)
+GPUPoly (Muller et al., 2020), an extension of DeepPoly on CUDA, is still an incomplete verifier.
+Also, it is implemented in CUDA C++, requiring manual effort for customization and gradient com-
+putation, so it is not easy to get the gradients for optimizing bounds as we have done in Section 3.1.
+(2) Lagrangian Decomposition (Bunel et al., 2020a) is a GPU-accelerated BaB based complete ver-
+ifier that iteratively tightens the bounds based on a Lagrangian decomposition optimization formu-
+lation and does not reply on LP. However, it solves a much more complicated optimization problem
+than LiRPA, and typically requires hundreds of iterations to converge for a single sub-domain.
+Incomplete verifiers Many incomplete verification methods rely on convex relaxations of NN,
+replacing nonlinear activations like ReLUs with linear constraints (Wong & Kolter, 2018; Wang
+et al., 2018b; Zhang et al., 2018; Weng et al., 2018; Gehr et al., 2018; Singh et al., 2018a;b; 2019b;a)
+or semidefinite constraints (Raghunathan et al., 2018; Dvijotham et al., 2020; Dathathri et al., 2020).
+Tightening the relaxation for incomplete verification was discussed in (Dvijotham et al., 2018; Singh
+et al., 2019a; Lyu et al., 2019; Tjandraatmadja et al., 2020). Typically, tight relaxations require
+more computation and memory in general. We refer the readers to (Salman et al., 2019) for a
+comprehensive survey. Recently, Xu et al. (2020) categorized the family of linear relaxation based
+incomplete verifiers into LiRPA framework, allowing efficient implementation on machine learning
+accelerators. Our work uses LiRPA as the bounding procedure for complete verification and exploits
+its computational efficiency to accelerate, and our main contribution is to show that we can use fast
+but weak incomplete verifiers as the main driver for complete verification when strategically applied.
+6	Conclusion
+We use a LiRPA based incomplete NN verifier to accelerate the bounding procedure in branch and
+bound (BaB) for complete NN verification on massively parallel accelerators. We use a fast gradient
+based procedure to tighten LiRPA bounds. We study the completeness of BaB with LiRPA, and
+show up to 5X speedup compared to state-of-the-art verifiers across multiple models and properties.
+Acknowledgments
+This work is supported by NSF grant CNS18-01426; an ARL Young Investigator (YIP) award; an
+NSF CAREER award; a Google Faculty Fellowship; a Capital One Research Grant; and a J.P. Mor-
+9
+Published as a conference paper at ICLR 2021
+gan Faculty Award; Air Force Research Laboratory under FA8750-18-2-0058; NSF IIS-1901527
+and NSF IIS-2008173.
+References
+Greg Anderson, Shankara Pailoor, Isil Dillig, and Swarat Chaudhuri. Optimization and abstraction:
+A synergistic approach for analyzing neural network robustness. In Proceedings of the 40th
+ACM SIGPLAN Conference on Programming Language Design and Implementation, pp. 731-
+744, 2019.
+Alexander Bentkamp, Jasmin Christian Blanchette, Simon Cruanes, and Uwe Waldmann. Super-
+position for lambda-free higher-order logic. In International Joint Conference on Automated
+Reasoning, pp. 28-46. Springer, 2018.
+Rudy Bunel, Alessandro De Palma, Alban Desmaison, Krishnamurthy Dvijotham, Pushmeet Kohli,
+Philip H. S. Torr, and M. Pawan Kumar. Lagrangian decomposition for neural network verifica-
+tion. Conference on Uncertainty in Artificial Intelligence (UAI) 2020, 2020a.
+Rudy Bunel, Jingyue Lu, Ilker Turkaslan, P Kohli, P Torr, and P Mudigonda. Branch and bound for
+piecewise linear neural network verification. Journal of Machine Learning Research, 21(2020),
+2020b.
+Rudy R Bunel, Ilker Turkaslan, Philip Torr, Pushmeet Kohli, and Pawan K Mudigonda. A unified
+view of piecewise linear neural network verification. In Advances in Neural Information Process-
+ing Systems, pp. 4790-4799, 2018.
+Sumanth Dathathri, Krishnamurthy Dvijotham, Alexey Kurakin, Aditi Raghunathan, Jonathan Ue-
+sato, Rudy R Bunel, Shreya Shankar, Jacob Steinhardt, Ian Goodfellow, Percy S Liang, et al.
+Enabling certification of verification-agnostic networks via memory-efficient semidefinite pro-
+gramming. Advances in Neural Information Processing Systems, 33, 2020.
+Souradeep Dutta, Susmit Jha, Sriram Sankaranarayanan, and Ashish Tiwari. Output range analy-
+sis for deep feedforward neural networks. In NASA Formal Methods Symposium, pp. 121-138.
+Springer, 2018.
+Krishnamurthy Dvijotham, Sven Gowal, Robert Stanforth, Relja Arandjelovic, Brendan
+O’Donoghue, Jonathan Uesato, and Pushmeet Kohli. Training verified learners with learned ver-
+ifiers. arXiv preprint arXiv:1805.10265, 2018.
+Krishnamurthy Dj Dvijotham, Robert Stanforth, Sven Gowal, Chongli Qin, Soham De, and Push-
+meet Kohli. Efficient neural network verification with exactness characterization. In Uncertainty
+in Artificial Intelligence, pp. 497-507. PMLR, 2020.
+Ruediger Ehlers. Formal verification of piece-wise linear feed-forward neural networks. In Interna-
+tional Symposium on Automated Technology for Verification and Analysis, pp. 269-286. Springer,
+2017.
+Timon Gehr, Matthew Mirman, Dana Drachsler-Cohen, Petar Tsankov, Swarat Chaudhuri, and Mar-
+tin Vechev. Ai2: Safety and robustness certification of neural networks with abstract interpreta-
+tion. In 2018 IEEE Symposium on Security and Privacy (SP), pp. 3-18. IEEE, 2018.
+Xiaowei Huang, Marta Kwiatkowska, Sen Wang, and Min Wu. Safety verification of deep neural
+networks. In International Conference on Computer Aided Verification, pp. 3-29. Springer, 2017.
+Guy Katz, Clark Barrett, David L Dill, Kyle Julian, and Mykel J Kochenderfer. Reluplex: An
+efficient smt solver for verifying deep neural networks. In International Conference on Computer
+Aided Verification, pp. 97-117. Springer, 2017.
+Jingyue Lu and M Pawan Kumar. Neural network branching for neural network verification. Inter-
+national Conference on Learning Representation (ICLR), 2020.
+Zhaoyang Lyu, Ching-Yun Ko, Zhifeng Kong, Ngai Wong, Dahua Lin, and Luca Daniel. Fastened
+crown: Tightened neural network robustness certificates. arXiv preprint arXiv:1912.00574, 2019.
+10
+Published as a conference paper at ICLR 2021
+Matthew Mirman, Timon Gehr, and Martin Vechev. Differentiable abstract interpretation for prov-
+ably robust neural networks. In International Conference on Machine Learning, pp. 3575-3583,
+2018.
+Christoph Muller, GagandeeP Singh, Markus Puschel, and Martin Vechev. Neural network robust-
+ness verification on gpus. arXiv preprint arXiv:2007.10868, 2020.
+Aditi Raghunathan, Jacob Steinhardt, and Percy S Liang. Semidefinite relaxations for certifying
+robustness to adversarial examples. In Advances in Neural Information Processing Systems, pp.
+10877-10887, 2018.
+Vicenc Rubies Royo, Roberto Calandra, Dusan M Stipanovic, and Claire Tomlin. Fast neural net-
+work verification via shadow prices. arXiv preprint arXiv:1902.07247, 2019.
+Hadi Salman, Greg Yang, Huan Zhang, Cho-Jui Hsieh, and Pengchuan Zhang. A convex relaxation
+barrier to tight robustness verification of neural networks. In Advances in Neural Information
+Processing Systems 32, pp. 9832-9842, 2019.
+Gagandeep Singh, Timon Gehr, Matthew Mirman, Markus Puschel, and Martin Vechev. Fast and
+effective robustness certification. In Advances in Neural Information Processing Systems, pp.
+10825-10836, 2018a.
+Gagandeep Singh, Timon Gehr, Markus Puschel, and Martin Vechev. Boosting robustness certifica-
+tion of neural networks. In International Conference on Learning Representations, 2018b.
+Gagandeep Singh, Rupanshu Ganvir, Markus Puschel, and Martin Vechev. Beyond the single neuron
+convex barrier for neural network certification. In Advances in Neural Information Processing
+Systems, pp. 15072-15083, 2019a.
+Gagandeep Singh, Timon Gehr, Markus Puschel, and Martin Vechev. An abstract domain for cer-
+tifying neural networks. Proceedings of the ACM on Programming Languages, 3(POPL):41,
+2019b.
+Christian Szegedy, Wojciech Zaremba, Ilya Sutskever, Joan Bruna, Dumitru Erhan, Ian Goodfellow,
+and Rob Fergus. Intriguing properties of neural networks. In ICLR, 2013.
+Christian Tjandraatmadja, Ross Anderson, Joey Huchette, Will Ma, Krunal Patel, and Juan Pablo
+Vielma. The convex relaxation barrier, revisited: Tightened single-neuron relaxations for neural
+network verification. arXiv preprint arXiv:2006.14076, 2020.
+Vincent Tjeng, Kai Xiao, and Russ Tedrake. Evaluating robustness of neural networks with mixed
+integer programming. ICLR, 2019a.
+Vincent Tjeng, Kai Y. Xiao, and Russ Tedrake. Evaluating robustness of neural networks with
+mixed integer programming. In 7th International Conference on Learning Representations,
+ICLR 2019, New Orleans, LA, USA, May 6-9, 2019. OpenReview.net, 2019b. URL https:
+//openreview.net/forum?id=HyGIdiRqtm.
+Shiqi Wang, Yizheng Chen, Ahmed Abdou, and Suman Jana. Mixtrain: Scalable training of formally
+robust neural networks. arXiv preprint arXiv:1811.02625, 2018a.
+Shiqi Wang, Kexin Pei, Justin Whitehouse, Junfeng Yang, and Suman Jana. Efficient formal safety
+analysis of neural networks. In Advances in Neural Information Processing Systems, pp. 6367-
+6377, 2018b.
+Shiqi Wang, Kexin Pei, Justin Whitehouse, Junfeng Yang, and Suman Jana. Formal security analysis
+of neural networks using symbolic intervals. In 27th {USENIX} Security Symposium ({USENIX}
+Security 18), pp. 1599-1614, 2018c.
+Tsui-Wei Weng, Huan Zhang, Hongge Chen, Zhao Song, Cho-Jui Hsieh, Luca Daniel, Duane Bon-
+ing, and Inderjit Dhillon. Towards fast computation of certified robustness for relu networks. In
+International Conference on Machine Learning, pp. 5273-5282, 2018.
+11
+Published as a conference paper at ICLR 2021
+Eric Wong and Zico Kolter. Provable defenses against adversarial examples via the convex outer
+adversarial polytope. In International Conference on Machine Learning, pp. 5283-5292, 2018.
+Eric Wong, Frank Schmidt, Jan Hendrik Metzen, and J Zico Kolter. Scaling provable adversarial
+defenses. In NIPS, 2018.
+Kaidi Xu, Zhouxing Shi, Huan Zhang, Yihan Wang, Kai-Wei Chang, Minlie Huang, Bhavya
+Kailkhura, Xue Lin, and Cho-Jui Hsieh. Automatic perturbation analysis for scalable certified
+robustness and beyond. Advances in Neural Information Processing Systems, 33, 2020.
+Huan Zhang, Tsui-Wei Weng, Pin-Yu Chen, Cho-Jui Hsieh, and Luca Daniel. Efficient neural net-
+work robustness certification with general activation functions. In Advances in neural information
+processing systems, pp. 4939-4948, 2018.
+Huan Zhang, Hongge Chen, Chaowei Xiao, Bo Li, Duane Boning, and Cho-Jui Hsieh. Towards
+stable and efficient training of verifiably robust neural networks. In International Conference on
+Learning Representations, 2020.
+12
+Published as a conference paper at ICLR 2021
+A Proofs
+A.1 Proof of Theorem 3.1
+We prove Theorem 3.1 by providing a simple counterexample, and we illustrate the necessity of
+feasibility checking for the completeness of BaB based verification. Consider an NN with only two
+ReLU units g1(2) = ReLU(h(12)) and g2(2) = ReLU(h(22)) where they share the same one dimension
+input h(12) = h(22) = x. The final output function of NN is defined as f = g1(2) - g2(2) . As a
+verification problem, we want to verify the property f ≥ 0 where x = [-1, 1]. Since hidden nodes
+hi and h2 are exactly the same, the ground-truth output range is f *(x) ∈ [0,0]. A complete BaB
+based verifier is expected to obtain that optimal bound and prove the property after splitting h1 and
+h2 together while BaB with only LiPRA cannot guarantee that completeness. Specifically, BaB with
+only LiRPA will split the original domain x ∈ [-1, 1] into four sub-domains and approximate the
+bound with LiRPA respectively:
+(1)	(feasible) sub-domain x ∈ [-1, 1], h(12) ≥ 0, h(22) ≥ 0 with output f = [x, x] - [x, x] ∈ [0, 0]
+(2)	(feasible) sub-domain x ∈ [-1, 1], h(12) < 0, h(22) < 0 with output f = [0, 0] - [0, 0] ∈ [0, 0]
+(3)	(infeasible) sub-domain x ∈ [-1, 1], h(12) < 0, h(22) ≥ 0 with output f = [0, 0] - [x, x] ∈ [-1, 1]
+(4)	(infeasible) sub-domain x ∈ [-1, 1], h(12) ≥ 0, h(22) < 0 with output f = [x, x] - [0, 0] ∈ [-1, 1]
+Only the first two split sub-domains are feasible and therefore the ground-truth lower bound 0 can be
+obtained by taking the minimum of the estimated bounds from sub-domains (1) and (2). However,
+pure LiRPA is not able to tell the infeasibility of sub-domains (3) and (4) and thus BaB with pure
+LiRPA will report the minimum -1 got from all these four sub-domains as the global lower bound
+for the original input domain, ending up not being able to verify the property, i.e., incomplete.
+A.2 Proof of Theorem 3.2
+We prove Theorem 3.2 by considering the worst case where all unstable ReLU neurons are split.
+Given a neural network function f with input domain C, assume there are N unstable ReLU neurons
+{gi = ReLU(hi)∣i = 1,…，N} in total. In the worst case, We have 2N leaf sub-domains S =
+{Ci∣i = 1,…，2N}, where each Ci corresponds to one assignment of unstable ReLU neuron splits.
+For example, we can have
+Ci = C ∩ (hi	≥ 0) ∩ &	≥ 0) ∩∙∙∙∩	(hN	≥	0)
+C2 = C ∩ (hi	< 0) ∩ (h2	≥ 0) ∩∙∙∙∩	(hN	≥	0)
+C3 = C ∩ (hi	≥ 0) ∩ (h2	< 0) ∩∙∙∙∩	(hN	≥	0)
+C4 = C ∩ (hi	< 0) ∩ (h2	< 0) ∩∙∙∙∩	(hN	≥	0)
+Note that by definition the original input domain C = ∪C0 ∈SC0; in other words, all the 2N split
+sub-domains combined will be the same as the original input domain.
+Not all of the sub-domains are actually feasible, due to the consistency requirements between neu-
+rons. For example, in our proof in Section A.1, h(i2) and h(22) cannot be both ≥ 0 or both < 0.
+We can divide the sub-domains S into two mutually exclusive sub-sets, Sfeas for all the feasible
+sub-domains, and Sinfeas for all the infeasible sub-domains. We have C = ∪C0 ∈SfeasC0 since these
+infeasible sub-domains are empty sets.
+We first show that linear programming (LP) can be used to effectively detect these infeasible sub-
+domains. For some C0 ∈ Sinfeas, because all the ReLU neurons are fixed to be positive or negative,
+no relaxation is needed and the network is essentially linear; thus, the input value of every hidden
+neuron hi can be written as a linear equation w.r.t. input x. We add all the Boolean predicates on hi
+to a LP problem as linear constraints w.r.t x. If this LP is feasible, then we can find some input x0
+that assigns compatible values to all hi ; otherwise, the LP is infeasible.
+Due to the lack of feasibility checking in LiRPA, the computed global lower (or upper) bounds
+from LiRPA is f LiRPA = mine，∈s f °0 = min (minco∈sfeas f °, minco∈sinfeas f °0). With feasibility
+13
+Published as a conference paper at ICLR 2021
+checking from LP, we can remove all infeasible sub-domains from this min such that they do not
+contribute to the global lower bound: f = minco∈sfeas f °0.
+To prove the whole BaB verification is complete, it is sufficient to prove this lower bound f is the
+exact minimum of f bounded in C . Since any sub-domain C0 ∈ Sfeas is a leaf sub-domain with
+no unstable ReLU neurons, the neural network bounded within C0 is a linear function. LiRPA can
+give an exact minimum of f within sub-domain C0 . Since C = ∪C0∈Sfeas C0 (in other words, Sfeas
+covers all the feasible sub-domains within C), the minimal value for all of them f = minco∈sfeas f °0
+forms the exact minimum of f within the input domain C. Thus, BaB with LiRPA based bounding
+procedure is complete when feasibility checking is applied.
+B Experimental Setup
+We use the same set of models and benchmark examples used in the state-of-the-art verifiers GNN-
+online (Lu & Kumar, 2020) and BaBSR (Bunel et al., 2020b). Specifically, we evaluate on the
+most challenging CIFAR-10 dataset with the same standard robustly trained convolutional neural
+networks: Base, Wide, and Deep. These model structures are also used in (Lu & Kumar, 2020;
+Bunel et al., 2020a). The Base model contains 2 convolution layers with 8 and 16 filters as well
+as two linear layers with 100 and 10 hidden units, respectively. In total, the Base model has 3,172
+ReLU activation units. The Wide model contains 2 convolution layers with 16 and 32 filters and
+two linear layers with 100 and 10 hidden units, respectively, which contains 6,244 ReLU activation
+units in total. The Deep model contains 4 convolution layers and all of them have 8 filters and
+two linear layers with 100 and 10 hidden units, respectively, with 3,756 ReLU activation units in
+total. The source code of BaBSR, MIPplanet, GNN and GNN-Online are available at https:
+//github.com/oval-group/GNN_branching. The source code of Proximal BaBSR is
+available at https://github.com/verivital/vnn-comp by replacing the dataset to the
+same one we used here.
+Given an correctly classified image x with label yc, and another wrong label yc0 6= yc (pre-defined
+in this benchmark) and , the verifier needs to prove:
+(e(c) - e(c0))T f(x0) > 0	s.t ∀x0 kx - x0k∞ ≤	(10)
+where f (∙) is the logit-layer output of a multi-class classifier, e(c) and e(c0) are one-hot encoding
+vectors for labels yc and yc0 . We want to verify that for a given , the trained classifier will not
+predict wrong label yc0 for image x. All properties including x, , and c0 are provided by (Lu &
+Kumar, 2020). Specifically, they categorize verification properties solved by BaBSR within 800s
+as easy, between 800s and 2400s as medium and more than 2400s as hard.
+Our experiments are conducted on one Intel I7-7700K CPU and one Nvidia GTX 1080 Ti GPU. The
+parallel batch size n is set to 400, 200 and 200 for base, wide and deep model respectively and the
+η is set to 12,000 due to GPU memory constraint. To make a fair comparison, we use one CPU core
+for all methods. Also, we use one GPU for GNN, GNN-Online, Proximal-BaBSR and our
+method. When optimizing the LiRPA bounds, we apply 100 steps gradient decent for obtaining the
+initial f (Line 2 in Algorithm 1). After that, we use 10 steps gradient decent (Line 7) and early stop
+once f> 0 or f has no improvement.
+C Ablation study
+Our efficient framework leverages two powerful components: (1) optimized LiRPA bounds and
+(2) batch splits on GPUs. In this section, we conduct breakdown experiments to show how each
+individual technique can help with complete verification. As we can see in Table 2, using batched
+split with unoptimized LiRPA is not very successful and cannot beat BaBSR. We observe that,
+without optimized LiRPA, the bounds are very loose and cannot quickly improve the global lower
+bound. In contrast, using optimized LiRPA bounds without batch splits (splitting a single node at
+a time and running a batch size of 1 on GPU) can still significantly speed up complete verification,
+around 2 〜10X compared to BaBSR. Finally, combining batch splits and optimized LiRPA allows
+us to gain up to 44X speedup compared to BaBSR.
+14
+Published as a conference paper at ICLR 2021
+Table 2: Ablation study for different components of our algorithm. The speedup rate is computed based on
+running time of BABSR baseline: speedup = Time of BaBSR/Time of our method.
+Easy	Medium	Hard	Wide	Deep
+Method	time(s)	speedup	time(s)	speedup	time(s)	speedup	time(s)	speedup	time(s)	speedup
+BABSR baseline	522.48	-	1335.40	-	2875.16	-	3325.65	-	2855.19	-
+Batch Splits (unoptimized LiRPA)	587.10	0.89	1470.02	0.91	3013.57	0.95	3457.30	0.96	2998.50	0.95
+Optimized LiRPA (no batch splits)	94.08	5.58	361.53	3.70	1384.22	2.07	736.56	4.51	287.33	9.94
+Optimized LiRPA & Batch Splits	11.86	44.05	42.04	31.80	633.85	4.53	375.23	8.86	81.55	35.01
+D Complete verification with LiRPA on CPU vs GPU
+For a fair comparison, we only use one CPU core and one GPU (the same as GNN and GNN-
+Online) in our experimental results in Section 4. In this section, we investigate the performance of
+our algorithm for the cases where one or multiple CPU cores are available without GPU accelera-
+tion. Note that existing baselines such as BaBSR and MIPplanet can only effectively utilize one
+CPU core subject to the Gurobi solver. GNN and GNN-Online can utilize one GPU to run the
+GNN during branching while the rest of the verification processes all perform on one CPU core. In
+contrast, our method is much more flexible, and we are not limited by the number of CPU cores or
+GPUs. When running on multi-core CPUs, LiRPA can be automatically accelerated by the underly-
+ing linear algebra library (e.g., Intel MKL or OpenBLAS) since the main computation of LiRPA is
+just matrix multiplications.
+In Figure 5, we show the performance of our algorithm on a single CPU core and multiple CPU
+cores (in blue), and compare it to our main results with one CPU core plus one GPU (in red). As
+we can see, the running time decreases when the number of CPU cores increases, but the speedup
+is not linear due to the limitation of the underlying linear algebra library and hardware. There is
+a big gap between the running time on 8 CPU cores and the time on one CPU core + one GPU,
+and the performance gap is more obvious on Wide and Deep models. Thus, the speedup of LiRPA
+computation on GPUs is significant. However, surprisingly, even when using only one CPU core,
+we are still significantly faster than baseline BaBSR and also get very competitive performance
+when compared to GNN-Online which needs one GPU additionally. This shows the efficiency of
+LiRPA based verification algorithms.
+Base Model (easy instances)
+(BABSR: 522.48s)
+Wide Model
+(BABSR: 3325.65s)
+Deep Model
+(BABSR: 2855.19s)
+Figure 5: Running time of our method on the Base, Wide, and Deep networks when using 1, 2, 4
+and 8 CPU cores without a GPU (blue), and our method using 1 CPU core + 1 GPU (red) and a
+strong baseline method, GNN-Online (green). We report the baseline BaBSR verification time in
+captions because they are out of range on the figures.
+15

@@ -1,0 +1,3369 @@
+Under review as a conference paper at ICLR 2020
+Moniqua: Modulo Quantized Communication
+in Decentralized SGD
+Anonymous authors
+Paper under double-blind review
+Ab stract
+Decentralized stochastic gradient descent (SGD), where parallel workers are con-
+nected to form a graph and communicate adjacently, has shown promising results
+both theoretically and empirically. In this paper we propose Moniqua, a technique
+that allows decentralized SGD to use quantized communication. We prove in
+theory that Moniqua communicates a provably bounded number of bits per itera-
+tion, while converging at the same asymptotic rate as the original algorithm does
+with full-precision communication. Moniqua improves upon prior works in that it
+(1) requires no additional memory, (2) applies to non-convex objectives, and (3)
+supports biased or linear quantizers. We demonstrate empirically that Moniqua
+converges faster with respect to wall clock time than other quantized decentralized
+algorithms. We also show that Moniqua is robust to very low bit-budgets, allowing
+less than 4-bits-per-parameter communication without affecting convergence when
+training VGG16 on CIFAR10.
+1	Introduction
+Stochastic gradient descent (SGD), as a widely adopted optimization algorithm for machine learning,
+has shown promising performance when running at large scale (Zhang, 2004; Bottou, 2010; Dean
+et al., 2012; Goyal et al., 2017). However, the communication bottleneck among workers1 when
+running distributed SGD presents a non-trivial challenge (Alistarh, 2018). State-of-the-art frameworks
+such as TensorFlow (Abadi et al., 2016), CNTK (Seide and Agarwal, 2016) and MXNet (Chen et al.,
+2015) are built in a centralized fashion, where workers exchange gradients either via a centralized
+parameter server (Li et al., 2014a;b) or the MPI AllReduce operation (Gropp et al., 1999). Such a
+design, however, puts heavy pressure on the central server and strict requirements on the underlying
+network. In other words, when the underlying network is poorly constructed, i.e. high latency or low
+bandwidth, it can easily cause degradation of training performance due to communication congestion
+in the central server or stragglers (slow workers) in the system.
+There are two general approaches to deal with these problems: (1) decentralized training (Lian
+et al., 2017a;b; Tang et al., 2018a; Hendrikx et al., 2018) and (2) quantized communication2 (Zhang
+et al., 2017; Alistarh et al., 2017; Wen et al., 2017). In decentralized training, all the workers are
+connected to form a graph and each worker communicates only with adjacent workers by averaging
+model parameters. This balances load and is robust to scenarios where workers can only be partially
+connected or the communication latency is high. On the other hand, quantized communication
+reduces the amount of data exchanged among workers, which leads to faster convergence with respect
+to wall clock time (Alistarh et al., 2017; Seide et al., 2014; Doan et al., 2018; Zhang et al., 2017;
+Wang et al., 2018). This is especially useful when the communication bandwidth is restricted.
+At this point, a natural question is: Can we apply quantized communication to decentralized training,
+and thus benefit from both of them? Unfortunately, directly combining them together negatively affects
+the convergence rate (Tang et al., 2018b). This happens because existing quantization techniques
+are mostly designed for centralized SGD, where workers communicate via exchanging gradients
+(Alistarh et al., 2017; Seide et al., 2014; Wangni et al., 2018). Gradients are robust to quantization
+since they get smaller in magnitude near local optimum and in some sense carry less information,
+causing quantization error to approach zero (De Sa et al., 2018). In contrast, decentralized workers
+are communicating model parameters, which do not necessarily approach zero, and so quantization
+error does not diminish unless precision is explicitly increased (Tang et al., 2018c). Previous work
+1A worker could refer to any computing unit that is capable of computing, communicating and has local
+memory such as CPU, GPU, or even a single thread, etc.
+2These approaches include low-precision, sparsification, and compression techniques more generally.
+1
+Under review as a conference paper at ICLR 2020
+solved this problem by adding an error tracker to compensate quantization errors (Tang et al., 2019)
+or adding replicas of neighboring models and focusing on quantizing model difference which does
+approach zero (Koloskova et al., 2019; Tang et al., 2018b). However, these methods suffer from
+trade-offs and limitations in that: (1) the extra replicas or error tracking incurs substantial memory
+overhead that is proportional to model size (more details in Section 2); and (2) these methods are
+statistically restricted, in the sense that they are either limited to convex problems (Koloskova et al.,
+2019) or require unbiased or non-linear quantizers (Koloskova et al., 2019; Tang et al., 2018b; 2019).
+To address these problems, in this paper we propose Moniqua, an extra-memory-free (details in
+Section 2) method for decentralized training to use quantized communication. Moniqua supports
+both biased and linear quantizers, as well as non-convex objectives.
+Intuition behind Moniqua. In a communication step of decentralized training, a worker w1 updates
+its model parameter mi by averaging with a neighboring worker w2's model parameter m2： mi J
+1 (mi + m2). Note that 2(mi + m2) = mi + ɪ(m2 — mi), so averaging is equivalent to letting wi
+obtain m2 - mi (same logic for w2). Since mi and m2 will approach the same local optimum as the
+algorithm converges, we can expect the higher-order bits of mi and m2 to get close. Then we can
+save communication by having w2 not communicate those higher-order bits to wi. More explicitly, if
+we know that kmi - m2 k∞ ≤ θ for some known parameter θ (later we will show it can be derived in
+theory), then instead of sending the entire model m2 which might cause overhead, w2 can just send
+its j-th coordinate (m2)j as (m2) mod θ (∀j ∈ [d]). Note that given ∣∣mi 一 m2 k∞ ≤ θ:
+(m2)j mod θ - (mi)j mod θ = ((m2)j - (m2)j) mod θ = (m2)j - (m2)j
+so wi can obtain the j-th coordinate of m2 一 mi by locally computing (m2)j mod θ 一 (mi)j mod θ
+with (m2)j mod θ received from w2. Since (m2)j mod θ is generally a smaller number than (m2)j,
+w2 can send fewer bits with the same level of absolute error.
+In this paper, we make the following contributions.
+•	We show by example that directly quantizing communication in decentralized training, even
+with an unbiased quantizer, can fail to converge asymptotically. (Section 3)
+•	We propose Moniqua, a general algorithm that uses modular arithmetic for communication
+quantization in decentralized training. We prove applying Moniqua achieves the same
+asymptotic convergence rate as the baseline full-precision algorithm (D-PSGD) while
+requiring at most O(log log n) number of bits per parameter communicated, where n is the
+number of parallel workers. (Section 4)
+•	We apply Moniqua to decentralized algorithms with variance reduction and asynchronous
+communication (D2 and AD-PSGD) and prove Moniqua enjoys the same asymptotic rate as
+with full-precision communication when applied to these cases. (Section 5)
+•	We empirically evaluate Moniqua and show it outperforms all the related algorithms given
+an identical quantizer. We also show Moniqua is scalable and robust to very low bit-
+budgets, and we introduce techniques we found empirically useful to run Moniqua even
+more efficiently. (Section 6)
+2 Related Work
+Decentralized Stochastic Gradient Descent (SGD) Decentralized algorithms (Mokhtari and
+Ribeiro, 2015; Sirb and Ye, 2016; Lan et al., 2017; Wu et al., 2018a) have been widely studied
+with consideration of communication efficiency, privacy and scalability. In the domain of large-
+scale machine learning, D-PSGD was the first Decentralized SGD algorithm that enjoys the same
+asymptotic convergence rate OQZKn) (where K is the number of total iterations and n is the
+number of workers) as centralized algorithms (Lian et al., 2017a). After D-PSGD came D2, which
+improves D-PSGD and is applicable to the case where workers are not sampling from identical data
+sources (Tang et al., 2018a). Another extension was AD-PSGD, which lets workers communicate
+asynchronously and has a convergence rate of O(1∕√K) (Lian et al., 2017b). In this paper we
+prove that Moniqua is applicable to all of these three algorithms. Other relevant work includes： He
+et al. (2018), which investigates decentralized learning on linear models; Nazari et al. (2019), which
+introduces decentralized algorithms with online learning; Zhang and You (2019), which analyzes
+the case when workers cannot mutually communicate; and Assran et al. (2018), which investigates
+Decentralized SGD specifically for deep learning.
+2
+Under review as a conference paper at ICLR 2020
+Quantized Communication in Centralized SGD Prior research on quantized communication is
+often focused on centralized algorithms, such as randomized quantization (Doan et al., 2018; Suresh
+et al., 2017; Zhang et al., 2017) and randomized sparsification (Wangni et al., 2018; Stich et al., 2018;
+Wang et al., 2018; Alistarh et al., 2018). Many examples of prior work focus on studying quantization
+in the communication of deep learning tasks specifically (Han et al., 2015; Wen et al., 2017; Grubic
+et al., 2018). Alistarh et al. (2017) proposes QSGD, which uses an encoding-efficient scheme, and
+discusses its communication complexity. Another method, 1bitSGD, quantizes exchanged gradients
+with one bit and shows great empirical success on speech recognition (Seide et al., 2014). Other work
+discusses the convergence rate under sparsified or quantized communication (Jiang and Agrawal,
+2018; Stich et al., 2018). Acharya et al. (2019) theoretically analyzes sublinear communication for
+distributed training.
+Quantized Communication in Decentralized SGD Quantized communication for decentralized
+algorithms is a rising topic in the optimization community. Previous work has proposed decentralized
+algorithms with quantized communication for strongly convex objectives (Reisizadeh et al., 2018;
+Koloskova et al., 2019). Following that, Tang et al. (2018b) proposes DCD/ECD-PSGD, which
+quantizes communication via estimating model difference. Furthermore, Tang et al. (2019) proposes
+DeepSqueeze, which applies an error-compensation method (Wu et al., 2018b) to decentralized
+setting. From a systems perspective, Koloskova et al. (2019) and Tang et al.(2018b) require O(d ∙ l)
+and Tang et al. (2019) requires O(d) extra memory compared to D-PSGD to implement quantized
+communication, where d denotes the dimension of the model and l denotes the number of connections
+in the network. In comparison, Moniqua is extra-memory-free.
+3 Setting and Notation
+In this section, we introduce our notation and the general assumptions we will make about the
+quantizers for our results to hold. Then we describe D-PSGD (Lian et al., 2017a), the basic algorithm
+for Decentralized SGD, and we show how naive quantization can fail in decentralized training.
+Quantizers. Throughout this paper, we assume that we use a quantizer Qδ that has bounded error
+kQδ(x)-xk∞ ≤δ, ∀x∈ [-1, 1]d	(1)
+where δ is some constant. In general, a smaller δ denotes more fine-grained quantization requiring
+more bits. For example, a biased linear quantizer can achieve (1) by rounding x to the nearest number
+in the set {2δn | n ∈ Z}; this will require about δ-1 quantization points to cover the interval [-1, 1],
+so such a linear quantizer can satisfy (1) using only「log2 (1 + 1)] bits (Li et al., 2017; Gupta et al.,
+2015). Note that (1) can be satisfied (for appropriate values of δ) by both linear (Gupta et al., 2015;
+De Sa et al., 2017) and non-linear (Stich, 2018; Alistarh et al., 2017) quantizers, and thus it is more
+general than assumptions used in previous works where only non-linear quantizers are considered
+(Koloskova et al., 2019; Tang et al., 2018c; 2019).
+Decentralized parallel SGD (D-PSGD). D-PSGD (Lian et al., 2017a) is the first and most basic
+Decentralized SGD algorithm. In D-PSGD, n workers are connected to form a graph. Each worker i
+stores a copy of model x ∈ Rd and a local dataset Di and collaborates to optimize
+1n
+m∈Rd f (X) = n EEξ~Difi(X； ξ)
+x 8	1=ι------—
+fi(x)
+(2)
+where ξis data sample from Di . In each iteration of D-PSGD, worker i computes a local gradient
+sample using Di . Then it averages its model parameters with its neighbors according to a symmetric
+and doubly stochastic matrix W, where Wij denotes the ratio worker j averages from worker i.
+Formally: Let Xk,i and gek,i denote local model and sampled gradient on worker i at k-th iteration,
+respectively. Let α denote the step size. The update rule of D-PSGD can be expressed as:
+Xn
+Xk,j Wji - αgek,i = Xk,i -
+j=1
+Xk,i - Xk,j )Wji -αgek,i
+(3)
+|~~~. t f {z	TT ' gradient step
+communicate to reduce difference
+From (3) we can see the update of a single local model contains two parts: communication to reduce
+model difference and a gradient step. Lian et al. (2017a) shows that all local models in D-PSGD are
+able to reach the same stationary point.
+3
+Under review as a conference paper at ICLR 2020
+Failure with direct quantization. Here, we illustrate why directly quantizing communication in
+decentralized training —naively quantizing the exchanged data—can fail to converge asymptotically
+even on a simple problem. This naive approach with quantizer Qδ can be represented by
+xk+1,i = xk,iWii +	Qδ(xk,j)Wji - αgek,i	(4)
+Based on Equation 4, we obtain the following theorem.
+Theorem 1 For some constant δ, suppose that we use an unbiased linear quantizer Q with repre-
+Sentablepoints {δn | n ∈ Z} to learn on the quadratic objective function f (x) = (X — δ∕2)>(x —
+δ∕2)∕2 with the direct quantization approach (4). Let φ denote the smallest value of a non-zero
+entry in W. Regardless of what step size we adopt, it will always hold for all iterations k and local
+model indices i that E kVf (xk,i)k2 ≥ 8(142). That is, the local iterates will fail to asymptotically
+converge to a region of small gradient magnitude in expectation.
+4 Moniqua
+Theorem 1 shows that when directly quantizing communication in decentralized SGD, even with
+an unbiased quantizer, any local model can fail to converge on a simple quadratic objective. In
+this seciton, we propose a technique, Moniqua, that solves this problem. Moniqua works under the
+following common assumptions for analyzing decentralized optimization algorithms (Lian et al.,
+2017a; Tang et al., 2018b; Koloskova et al., 2019).
+(A1) Lipschitzian gradient. All the functions fi have L-Lipschitzian gradients.
+kVfi(x) — Vfi(y)k ≤ Lkx — yk,∀x,y ∈ Rd
+(A2) Spectral gap. The communication matrix W is a symmetric doubly stochastic matrix and
+max{∣λ2(W)|, ∣λn(W)|} = ρ < 1, where λi(W) denotes the ith eigenvalue of W.
+(A3) Bounded variance. There exist non-negative σ and ς such that
+Ea 〜DjVfi (x; ξi) — Vfi(x)∣∣* 1 2 3 4 5 6 ≤ σ2,	Eiγι,…,n}kVfi(x)-Vf(x)k2 ≤ ς2
+where Vfi(x; ξi) denotes gradient sample on worker i computed via data sample ξi.
+(A4) Initialization. All the local models are initialized by the same weight: x0,i = x0, for all i
+and without loss of generality x0 = 0.
+(A5) Bounded gradient magnitude. The norm of a sampled gradient is bounded by kgek,i k∞ ≤
+G∞, for all i and k with some constant G∞.
+In Section 1, we described how a modulo operation can be used to avoid sending redundant bits if a
+bound θ on model difference is known. Here we outline how we can obtain such a bound. We do so
+by leveraging the following insight: in decentralized training, all the workers initialize local models
+at same point and average with each other periodically. The only difference among their models is
+caused by the sampled gradients (updated with the step size), and this difference is reduced each time
+they communicate. Since we have an upper bound on the magnitude of the gradients (A5) as well as
+a bound characterizing how quickly the communication process converges (A2), we can combine
+these to get an a priori bound θ on how much the models can differ. We can then pass this bound θ
+as a parameter to the algorithm, which can proceed to modulo-quantize the communication via the
+process described in Section 1. We formalize this approach as Moniqua (Algorithm 1).
+Algorithm 1 Pseudo-code of Moniqua on worker i
+Input: initial point x0,i = x0, step size a, the priori bound θ, communication matrix W, number of
+iterations K, quantizer Qδ, neighbor list Ni
+1: for k = 0,1, 2, ∙∙∙ ,K — 1 do
+2:	Compute a local stochastic gradient gek,i with data sample ξk,i and current weight xk,i
+3:	Compute modulo-ed model: qk,i J θ ∙ Qδ (xθi mod 1)(element-wise division and mod)
+4:	Average with neighboring workers: Xk+1 ,i J Xk,i + Pj∈Ni ®,j — qk,i)Wji
+5:	Update the local weight with local gradient: Xk+ι,i J Xk+1,i — agk,i
+6: end fθr	_
+Output: Averaged model XK = 1 PZi xκ,i
+4
+Under review as a conference paper at ICLR 2020
+In line 3 we rescale each coordinate so that the number to be quantized falls in the region of [-1, 1],
+which is required for (1) to apply. Note that with quantization, the priori bound θ could increase since
+local models may move further apart due to quantization error. However, with appropriately chosen
+δ, we can still obtain a bound θ and apply modulo-quantized communication that allows Moniqua to
+converge. We present these parameter choices in Theorem 2, along with the resulting convergence
+rate for Moniqua.
+Theorem 2 If we run Algorithm 1 in a setting where
+θ _ 2log(16n)αG∞	1 - P	_	1
+=1-P, g = 4log(16n),	α = ς2/3K1/3 + σpK∕n +2L
+then the output of Algorithm 1 converges at the asymptotic rate
+1 KT	1	2
+κ X EUVf(X k 升% κ + √nκ+K +
+k=0
+σ2n
+σ2κ + n
++ G∞dn
+σ2K + n.
+where P, f (0) — f * and L are omitted as constants.
+Consistent with D-PSGD. Note that D-PSGD converges at the asymptotic rate of O(σ∕√nK +
+2 τ-r2
+ς3 /K3 + n/K), and thus MOniquahaS the same asymptotic rate as D-PSGD (Lian et al., 2017a). In
+other words, the asymptotic convergence rate is not negatively impacted by the quantization.
+Robust to large d. In Assumptions (A3) and (A5), we use l2-norm and l∞-norm to bound sample
+variance and gradient magnitude, respectively. Note that, when d gets larger, the variance σ2 will
+also grow proportionally. So, the last term will tend to remain n/K asymptotically with large d.
+How many bits does Moniqua need? The specific number of bits required by Moniqua depends on
+the underlying quantizer (Qδ). If we use nearest rounding (Gupta et al., 2015) as Qδ in Theorem 2, it
+suffices to use at each step a number of bits B for each parameter sent, where
+B =「log2(δ + 1)] = llog2 (4⅛⅛6n) + 1)]
+Note that this bound is independent of model dimension d. When the system scales up, the number
+of required bits grows at a rate of O (log log n).
+5 S calable Moniqua
+Previous work has extended D-PSGD to D2 (Tang et al., 2018a) (to make Decentralized SGD
+applicable to workers sampling from different data sources) and AD-PSGD (Lian et al., 2017b) (an
+asynchronous version of D-PSGD). In this section, we theoretically prove Moniqua is applicable to
+both of these algorithms.
+Moniqua with Decentralized Data Decentralized data refers to the case where all the local
+datasets Di are not identically distributed (Tang et al., 2018a). More explicitly, the outer variance
+Ei〜{i, ∙ ,n} ∣∣Vfi(x) - Vf (x)k2 is no longer bounded by ς2 as assumed in D-PSGD (ASSumP-
+tion (A3)). This update rule presented can be explicitly expressed in two steps3:
+Xk +1 = 2Xk - Xk-1 - αGk + αGk-l
+Xk+1 = Xk+1W + (Qk- Xk+ 2 )(W - I)
+where Xk , Gek and Qk are matrix in the shape of Rd×n, where their i-th column are xk,i , gek,i and
+qk,i respectively. And X-1 and Ge-1 are 0d×n by convention. Based on this, we obtain the following
+convergence theorem.
+Theorem 3	If we run D2 with Monqiua in a setting where
+1
+θ = (6D1n + 8)αG∞,
+δ = ɪ-, and
+6nD2
+α = --/	----,
+σ/ K/n + 2L
+where D1 and D2 are two constants that only depend on the eigenvalues of W (definition can be
+found in supplementary material), the output has the following asymptotic convergence rate:
+K-1
+K X Ewf(X k )『.κ + √nκ +
+σ2n	G2∞dn
+σ2K + n+σ2 K + n
+3Detailed pseudo-code in the supplementary material.
+5
+Under review as a conference paper at ICLR 2020
+Note that D2 (Tang et al., 2018a) with full-precision communication has the asymptotic convergence
+rate of O(1/K + σ∕√nK + n/K), MoniqUa on D2 has the same asymptotic rate.
+Moniqua with Asychronous Communication. Both D-PSGD and D2 are synchronous algorithms
+as they reqUire global synchronization at the end of each iteration, which can become a bottleneck
+when sUch synchronization is not cheap. Another algorithm, AD-PSGD, avoids this overhead by
+letting workers commUnicate asynchronoUsly (Lian et al., 2017b). In the analysis of AD-PSGD, an it-
+eration represents a single gradient Update on one randomly-chosen worker, rather than a synchronoUs
+bUlk Update of all the workers. This single-worker-Update analysis models the asynchronoUs natUre
+of the algorithm. We apply MoniqUa to AD-PSGD and obtain the following Update rUle4:
+Xk+1 = XkWk + (Qk - Xk)(Wk -I) - αGk-τk
+where Wk describes the commUnication behavioUr between the kth and (k + 1)th gradient Update,
+and τk denotes the delay (measUred as a nUmber of iterations) between when the gradient is compUted
+and Updated to the model. Note that Unlike D-PSGD, here Wk can be different at each Update step
+and UsUally each individUally has ρ = 1, so we can’t expect to get a boUnd in terms of a boUnd on the
+spectral gap, as we did in Theorems 2 and 3. Instead, we reqUire the following condition, which is
+inspired by the literatUre on Markov chain Monte Carlo methods: for some constant tmix,
+∀μ ∈ Rn, ∀k ∈ N, if μi ≥ 0 and l>μ = 1, it must hold that ∣∣ ^Qtmiχ Wk+) μ - n∣∣ ≤ 1.
+We call this constant tmix becaUse it is effectively the mixing time of the time-inhomogeneoUs Markov
+chain with transition probability matrix Wk at time k (Levin and Peres, 2017). Note that this condition
+is more general than those used in previous work on AD-PSGD because it does not require that
+the Wk are sampled independently or in an unbiased manner. Using this, we obtain the following
+convergence theorem.
+Theorem 4	If we run AD-PSGD with Moniqua in a setting where
+θ = 16tmixαG∞,	δ = 32t '-, and α
+n
+2L + PK (σ2 +6ς2))
+the output has the following asymptotic convergence rate:
+⅛ X EWf(X k )∣∣2. ⅛+√σ√K6ς2
+k=0
++ 92+6ς 2)tmixn2 + n2tmixG∞d
++ (σ2 + 6ς 2)K + 1 + (σ2 + 6ς 2)K + 1
+Note that AD-PSGD (Lian et al., 2017b) with full-precision communication has the asymptotic
+convergence rate of O(1/K + √σ2 + 6ς2/√K + n2/K), Moniqua converges at the same rate.
+6 Experiments
+In this section, we evaluate Moniqua empirically. First, we compare Moniqua and other quantized
+decentralized training algorithms’ convergence under different network configurations. Second, we
+evaluate Moniqua’s scalability on D2 and AD-PSGD. Third, we introduce two additional techniques
+to run Moniqua more efficiently and empirically investigate the limits of Moniqua.
+Configuration. All the models and training scripts in this section are implemented in PyTorch and
+run on Google Cloud Platform. We launch an instance as one worker, each configured with a 2-core
+CPU with 4 GB memory and an NVIDIA Tesla P100 GPU. We use MPICH as the communication
+backend. All the instances are running Ubuntu 16.04, and latency and bandwidth on the underlying
+network are configured using the tc command in Linux. In all the experiments, we use the following
+hyperparameters by default: batch size = 128, weight decay = 1e -4, and momentum = 0.9, which
+are default values adopted in previous works (Lian et al., 2017b; Grubic et al., 2018). We tune the
+step size from set {0.5, 0.1, 0.05, 0.01} for each algorithm. Throughout our experiments, we adopt
+the commonly used (Gupta et al., 2015; Li et al., 2017) stochastic rounding5 with quantization step δ.
+4Details in the supplementary material.
+5Since several baselines are not applicable to biased quantizers, for fair comparison we consistently use
+stochastic rounding (unbiased). More experiments using different quantizers including biased and non-linear
+quantizers on Moniqua can be found in supplementary material.
+6
+Under review as a conference paper at ICLR 2020
+O
+2.0
+Γ∙5
+B
+≡1.0
+Tlme(S)
+] ]
+∙Mη 6ξu-u1
+CwEKd
+B-PSBD
+KD-PSCD
+DCB-PSCD
+OkkoSCD
+BMpS(∣U∙∙x∙
+Monlqu∙
+Tlme(sj
+2.00
+铲75
+al.50
+Z 1.25
+^1.00
+0.0
+Epoch
+(a) Training Loss vs Epoch (b) Bandwidth=100Mbps, (c) Bandwidth=20Mbps, (d) Bandwidth=100Mbps,
+Latency=0.15ms	Latency=0.15ms	Latency=10ms
+Figure 1: Performance of different algorithms under different network configurations
+∣-∙- B-PSCD
+ECB-PS6∣X3Wt>
+→- DCB-PSβl⅞3Ht>
+→- Cħo<oSeD{3Mt>
+→- B∙∙∣>S(∣UMx∙(3l)lt>
+—MMiiquXJHt)
+2
+0	50	100	150
+Epoch
+(a) 3-Bit Training Loss
+o∙
+2
+B-PSCD
+一 KB-PS6B{2Wt>
+^δ gð lðθ 150^
+Epoch
+0	50	100	150
+Epoch
+(b) 2-Bit Training Loss (c) 3-Bit Test Accuracy (d) 2-Bit Test Accuracy
+Figure 2: Performance of Moniqua and other quantization algorithms under extreme bit-budget.
+Wall-clock Time Evaluation. We start by evaluating the performance of Moniqua and other
+baseline algorithms under different network configurations. We launch 8 workers connected in a ring
+topology and train a ResNet110 (He et al., 2016) model on CIFAR10 (Krizhevsky et al., 2014). We
+compare Moniqua with the following baselines:6 Centralized (implemented as a standard AllReduce
+operation), D-PSGD (Lian et al., 2017a) with full-precision communication, DCD/ECD-PSGD (Tang
+et al., 2018b), ChocoSGD (Koloskova et al., 2019) and DeepSqueeze (Tang et al., 2019). We set
+δ = 0.01 for stochastic rounding across all algorithms that use quantization. To prevent overflow, we
+use 16-bit integers7 torch.int16 as the floored output on the sender side. For Moniqua, we set
+θ=3.0.
+We plot our results in Figure 1. As can be seen in Figure 1(a), with respect to epochs, All the
+algorithms have similar convergence curve while DCD/ECD-PSGD have slightly slower convergence
+curves. We can see from Figures 1(b) and 1(c) that when the network bandwidth decreases, the
+curves begin to separate. AllReduce and full-precision D-PSGD suffer the most, since they require
+a large volume of high-precision exchanged data. And from Figure 1(b) to Figure 1(d), when the
+network latency increases, we observe similar behavior. On the other hand, from Figure 1(b) to
+Figure 1(c) and Figure 1(d), curves of all the quantized baselines (DCD/ECD-PSGD, ChocoSGD
+and DeepSqueeze) are getting closer to Moniqua. This is because, as shown in Figure 1(b), the
+extra updating of the replicas in DCD/ECD-PSGD and ChocoSGD as well as the error tracking in
+DeepSqueeze counteract the benefits from accelerated communication. However, when network
+bandwidth decreases or latency increases, communication becomes the bottleneck and allow these
+algorithms obtain acceleration compared to centralized SGD and D-PSGD. Delay between Moniqua
+and quantized baselines does not vary with the network since that only depends on the their extra local
+computation (error tracking and replica update). We observe that compared to Moniqua, DCD/ECD-
+PSGD is approximately 13 seconds slower while ChocoSGD and DeepSqueeze being 10 and 8
+seconds slower repectively. From Figure 1 we can see that Moniqua outperforms all these other
+algorithms.
+Aggressive Quantization. Now we investigate how Moniqua and baselines behave under aggressive
+quantization. We enforce two strict bit-budget: 2bit and 3bit (per parameter). We plot the results
+in Figure 2. We can see that DCD-PSGD fails to converge in both cases and ECD-PSGD fails to
+converge with 2bit. This is consistent with results in previous work (Tang et al., 2018c; 2019). On the
+other hand, Moniqua converges faster than any other baselines. We observe at the end of 150 epoch,
+6Other algorithms are not applicable to non-convex DNN problems, so we are not comparing them here.
+7Since we are measuring the system performance, the specific number of bits is not the focus here. In later
+section we will discuss statistical performance with small number of bits.
+7
+Under review as a conference paper at ICLR 2020
+(a) Training Loss
+(Decentralized Data)
+(b) Training Loss
+(Asynchronous Communi-
+cation)
+O 25	50	75 IOO 125
+Epoch
+(a) Training Loss
+(VGG16)
+D-PSGD
+MonIqua(S=O.I)
+MonIqua(B=O.OS)
+Monlqua(θ=0.04)
+-MOnlqUa(9=0.02]
+(b) Training Loss
+(ResNet110)
+Figure 4: Performance of Moniqua on VGG16 and
+ResNet110 under different θ
+Figure 3: Performance of applying Moniqua on
+D2 and AD-PSGD
+with 3-bit communication Moniqua achieves 85% training accuracy while other baselines are below
+70% (full precision achieves 97%). Compared to the theoretical results in Section 4, we show that
+Moniqua is much more robust to low-bits budget in practice.
+Scalability of Moniqua. We evaluate how Moniqua can be applied to D2 (Tang et al., 2018a) and
+AD-PSGD (Lian et al., 2017b). First, we demonstrate how applying Moniqua to D2 can handle
+decentralized data. We launch 10 workers, collaborating to train a VGG16 (Simonyan and Zisserman,
+2014) model on CIFAR10. Similar to the setting of D2 (Tang et al., 2018a), we let each worker have
+exclusive access to 1 labels (of the 10 labels total in CIFAR10). In this way, the data variance among
+workers is maximized. We plot the results in Figure 3(a). We observe that applying Moniqua on
+D2 does not affect the convergence rate while D-PSGD can no longer converge because of the outer
+variance. Here we omit the wall clock time comparison since the communication volume is the same
+in comparison of Moniqua and Centralized algorithm in Figure 1.
+Next, we evaluate Moniqua on AD-PSGD. We launch 6 workers organized in a ring topology,
+collaborating to train a ResNet110 model on CIFAR10. We set the network bandwidth to be 20Mbps
+and latency to be 0.15ms. We plot the results in Figure 3(b). We can see that both AD-PSGD and
+asynchronous Moniqua outperform D-PSGD. Besides, Moniqua outperforms AD-PSGD in that
+communication is reduced, which is aligned with the intuition and theory.
+Efficient Moniqua. There are two techniques we have observed to improve the performance of
+MoniqUa when using stochastic rounding: Qδ (x) = δ[χδ + Uc (where U is uniformly sampled from
+[0, 1]), ∀x ∈ Rd. The first is to use shared randomness, in which the same random seed is used
+for stochastic rounding on all the workers. That is, if two workers are exchanging tensors x and y
+respectively, then the floored tensors [ X + Uc and [ δ + Uc they send use the same randomly sampled
+value U. This provably reduces the error due to quantization (more details are in the supplementary
+material). The second technique is to use a standard entropy compressor like bzip to further
+compress the communicated tensors. This can help further reduce the number of bits because the
+modulo operation in Moniqua can introduce some redundancy in the higher-order bits, which a
+traditional compression algorithm can easily remove.
+To evaluate these methods, we train both ResNet110 and VGG16 on CIFAR10 using 8 ring-connected
+workers. We plot the training loss under different θ in Figure 4 (with δ = 0.01 for stochastic rounding).
+Note that for VGG16, it can tolerate small θ = 0.08 while still preserving the convergence rate. On
+the other hand, for ResNet110, it begins to diverge when θ decreases to 0.5. This is because VGG16
+has more fully connected layers than ResNet110, and these layers are less sensitive to quantization,
+as claimed in (Grubic et al., 2018). We observed that the fewest number of bits per number needed
+to communicate by Moniqua for VGG16 and ResNet110 to guarantee convergence (accuracy loss
+< 0.3%, criterion adopted by (Grubic et al., 2018)) are 3.64 and 5.67, respectively (details in the
+supplementary material).
+7	Conclusions
+In this paper we propose Moniqua, a simple unified method of quantizing the communication in
+decentralized training algorithms. Theoretically, Moniqua supports biased quantizer and non-convex
+problems, while enjoying the same asymptotic convergence rate as full-precision-communication
+algorithms without incurring storage or computation overhead. Empirically, we observe Moniqua
+8
+Under review as a conference paper at ICLR 2020
+converges faster than other related algorithms with respect to wall clock time. Additionally, Moniqua
+is robust to very low bits-budget.
+References
+Tong Zhang. Solving large scale linear prediction problems using stochastic gradient descent
+algorithms. In Proceedings of the twenty-first international conference on Machine learning, page
+116. ACM, 2004.
+Leon Bottou. Large-scale machine learning with stochastic gradient descent. In Proceedings of
+COMPSTAT,2010, pages 177-186. Springer, 2010.
+Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Andrew Senior,
+Paul Tucker, Ke Yang, Quoc V Le, et al. Large scale distributed deep networks. In Advances in
+neural information processing systems, pages 1223-1231, 2012.
+Priya Goyal, Piotr Dollar, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, AaPo Kyrola,
+Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet
+in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Dan Alistarh. A brief tutorial on distributed and concurrent machine learning. In Proceedings of the
+2018 ACM Symposium on Principles of Distributed Computing, pages 487-488. ACM, 2018.
+Mart´n Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis, Jeffrey Dean, Matthieu Devin,
+Sanjay Ghemawat, Geoffrey Irving, Michael Isard, et al. Tensorflow: a system for large-scale
+machine learning. In OSDI, volume 16, pages 265-283, 2016.
+Frank Seide and Amit Agarwal. Cntk: Microsoft’s open-source deep-learning toolkit. In Proceedings
+of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining,
+pages 2135-2135. ACM, 2016.
+Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang, Minjie Wang, Tianjun Xiao, Bing Xu,
+Chiyuan Zhang, and Zheng Zhang. Mxnet: A flexible and efficient machine learning library for
+heterogeneous distributed systems. arXiv preprint arXiv:1512.01274, 2015.
+Mu Li, David G Andersen, Jun Woo Park, Alexander J Smola, Amr Ahmed, Vanja Josifovski, James
+Long, Eugene J Shekita, and Bor-Yiing Su. Scaling distributed machine learning with the parameter
+server. In OSDI, volume 14, pages 583-598, 2014a.
+Mu Li, David G Andersen, Alexander J Smola, and Kai Yu. Communication efficient distributed
+machine learning with the parameter server. In Advances in Neural Information Processing Systems,
+pages 19-27, 2014b.
+William Gropp, Rajeev Thakur, and Ewing Lusk. Using MPI-2: Advanced features of the message
+passing interface. MIT press, 1999.
+Xiangru Lian, Ce Zhang, Huan Zhang, Cho-Jui Hsieh, Wei Zhang, and Ji Liu. Can decentralized
+algorithms outperform centralized algorithms? a case study for decentralized parallel stochastic
+gradient descent. In Advances in Neural Information Processing Systems, pages 5330-5340, 2017a.
+Xiangru Lian, Wei Zhang, Ce Zhang, and Ji Liu. Asynchronous decentralized parallel stochastic
+gradient descent. arXiv preprint arXiv:1710.06952, 2017b.
+Hanlin Tang, Xiangru Lian, Ming Yan, Ce Zhang, and Ji Liu. D2: Decentralized training over
+decentralized data. arXiv preprint arXiv:1803.07068, 2018a.
+Hadrien Hendrikx, Laurent Massoulie, and Francis Bach. Accelerated decentralized optimization
+with local updates for smooth and strongly convex objectives. arXiv preprint arXiv:1810.02660,
+2018.
+Hantian Zhang, Jerry Li, Kaan Kara, Dan Alistarh, Ji Liu, and Ce Zhang. Zipml: Training linear
+models with end-to-end low precision, and a little bit of deep learning. In International Conference
+on Machine Learning, pages 4035-4043, 2017.
+9
+Under review as a conference paper at ICLR 2020
+Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan Vojnovic. Qsgd: Communication-
+efficient sgd via gradient quantization and encoding. In Advances in Neural Information Processing
+Systems, pages 1709-1720, 2017.
+Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai Li. Terngrad:
+Ternary gradients to reduce communication in distributed deep learning. In Advances in neural
+information processing systems, pages 1509-1519, 2017.
+Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and its
+application to data-parallel distributed training of speech dnns. In Fifteenth Annual Conference of
+the International Speech Communication Association, 2014.
+Thinh T Doan, Siva Theja Maguluri, and Justin Romberg. On the convergence of distributed subgra-
+dient methods under quantization. In 2018 56th Annual Allerton Conference on Communication,
+Control, and Computing (Allerton), pages 567-574. IEEE, 2018.
+Hongyi Wang, Scott Sievert, Shengchao Liu, Zachary Charles, Dimitris Papailiopoulos, and Stephen
+Wright. Atomo: Communication-efficient learning via atomic sparsification. In Advances in
+Neural Information Processing Systems, pages 9850-9861, 2018.
+Hanlin Tang, Shaoduo Gan, Ce Zhang, Tong Zhang, and Ji Liu. Communication compression for
+decentralized training. In Advances in Neural Information Processing Systems, pages 7663-7673,
+2018b.
+Jianqiao Wangni, Jialei Wang, Ji Liu, and Tong Zhang. Gradient sparsification for communication-
+efficient distributed optimization. In Advances in Neural Information Processing Systems, pages
+1306-1316, 2018.
+Christopher De Sa, Megan Leszczynski, Jian Zhang, Alana Marzoev, Christopher R Aberger,
+KUnle Olukotun, and Christopher Re. High-accuracy low-precision training. arXiv preprint
+arXiv:1803.03383, 2018.
+Hanlin Tang, Chen Yu, Cedric Renggli, Simon Kassing, Ankit Singla, Dan Alistarh, Ji Liu, and
+Ce Zhang. Distributed learning over unreliable networks. arXiv preprint arXiv:1810.07766, 2018c.
+Hanlin Tang, Xiangru Lian, Shuang Qiu, Lei Yuan, Ce Zhang, Tong Zhang, and Ji Liu. Deepsqueeze:
+Parallel stochastic gradient descent with double-pass error-compensated compression. arXiv
+preprint arXiv:1907.07346, 2019.
+Anastasia Koloskova, Sebastian U Stich, and Martin Jaggi. Decentralized stochastic optimization
+and gossip algorithms with compressed communication. arXiv preprint arXiv:1902.00340, 2019.
+Aryan Mokhtari and Alejandro Ribeiro. Decentralized double stochastic averaging gradient. In
+Signals, Systems and Computers, 2015 49th Asilomar Conference on, pages 406-410. IEEE, 2015.
+Benjamin Sirb and Xiaojing Ye. Consensus optimization with delayed and stochastic gradients on
+decentralized networks. In Big Data (Big Data), 2016 IEEE International Conference on, pages
+76-85. IEEE, 2016.
+Guanghui Lan, Soomin Lee, and Yi Zhou. Communication-efficient algorithms for decentralized and
+stochastic optimization. arXiv preprint arXiv:1701.03961, 2017.
+Tianyu Wu, Kun Yuan, Qing Ling, Wotao Yin, and Ali H Sayed. Decentralized consensus optimization
+with asynchrony and delays. IEEE Transactions on Signal and Information Processing over
+Networks, 4(2):293-307, 2018a.
+Lie He, An Bian, and Martin Jaggi. Cola: Decentralized linear learning. In Advances in Neural
+Information Processing Systems, pages 4541-4551, 2018.
+Parvin Nazari, Davoud Ataee Tarzanagh, and George Michailidis. Dadam: A consensus-based
+distributed adaptive gradient method for online optimization. arXiv preprint arXiv:1901.09109,
+2019.
+10
+Under review as a conference paper at ICLR 2020
+Jiaqi Zhang and Keyou You. Asynchronous decentralized optimization in directed networks. arXiv
+preprint arXiv:1901.08215, 2019.
+Mahmoud Assran, Nicolas Loizou, Nicolas Ballas, and Michael Rabbat. Stochastic gradient push for
+distributed deep learning. arXiv preprint arXiv:1811.10792, 2018.
+Ananda Theertha Suresh, Felix X Yu, Sanjiv Kumar, and H Brendan McMahan. Distributed mean
+estimation with limited communication. In Proceedings of the 34th International Conference on
+Machine Learning-Volume 70, pages 3329-3337. JMLR. org, 2017.
+Sebastian U Stich, Jean-Baptiste Cordonnier, and Martin Jaggi. Sparsified sgd with memory. In
+Advances in Neural Information Processing Systems, pages 4452-4463, 2018.
+Dan Alistarh, Torsten Hoefler, Mikael Johansson, Nikola Konstantinov, Sarit Khirirat, and Cedric
+Renggli. The convergence of sparsified gradient methods. In Advances in Neural Information
+Processing Systems, pages 5973-5983, 2018.
+Song Han, Huizi Mao, and William J Dally. Deep compression: Compressing deep neural networks
+with pruning, trained quantization and huffman coding. arXiv preprint arXiv:1510.00149, 2015.
+D Grubic, L Tam, Dan Alistarh, and Ce Zhang. Synchronous multi-gpu deep learning with low-
+precision communication: An experimental study. Proceedings of the EDBT 2018, 2018.
+Peng Jiang and Gagan Agrawal. A linear speedup analysis of distributed deep learning with sparse
+and quantized communication. In Advances in Neural Information Processing Systems, pages
+2525-2536, 2018.
+Jayadev Acharya, Christopher De Sa, Dylan J Foster, and Karthik Sridharan. Distributed learning
+with sublinear communication. arXiv preprint arXiv:1902.11259, 2019.
+Amirhossein Reisizadeh, Aryan Mokhtari, S. Hamed Hassani, and Ramtin Pedarsani. Quantized
+decentralized consensus optimization. CoRR, abs/1806.11536, 2018. URL http://arxiv.
+org/abs/1806.11536.
+Jiaxiang Wu, Weidong Huang, Junzhou Huang, and Tong Zhang. Error compensated quantized
+sgd and its applications to large-scale distributed optimization. arXiv preprint arXiv:1806.08054,
+2018b.
+Hao Li, Soham De, Zheng Xu, Christoph Studer, Hanan Samet, and Tom Goldstein. Training
+quantized nets: A deeper understanding. In Advances in Neural Information Processing Systems,
+pages 5811-5821, 2017.
+Suyog Gupta, Ankur Agrawal, Kailash Gopalakrishnan, and Pritish Narayanan. Deep learning with
+limited numerical precision. In International Conference on Machine Learning, pages 1737-1746,
+2015.
+Christopher De Sa, Matthew Feldman, Christopher Re, and Kunle Olukotun. Understanding and
+optimizing asynchronous low-precision stochastic gradient descent. In ACM SIGARCH Computer
+Architecture News, volume 45, pages 561-574. ACM, 2017.
+Sebastian U Stich. Local sgd converges fast and communicates little. arXiv preprint arXiv:1805.09767,
+2018.
+David A Levin and Yuval Peres. Markov chains and mixing times, volume 107. American Mathemat-
+ical Soc., 2017.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+pages 770-778, 2016.
+Alex Krizhevsky, Vinod Nair, and Geoffrey Hinton. The cifar-10 dataset. online: http://www. cs.
+toronto. edu/kriz/cifar. html, 2014.
+Karen Simonyan and Andrew Zisserman. Very deep convolutional networks for large-scale image
+recognition. arXiv preprint arXiv:1409.1556, 2014.
+11
+Under review as a conference paper at ICLR 2020
+Supplementary Material
+A Overview
+This supplementary material contains proofs of all the theoretical results and extra experimental
+results of Moniqua. It is organized as follows: In Section B, we provably explain why using shared
+randomness in communication with stochastic rounding can improve performance (theoretical expla-
+nation for technique 1 in Experiment Efficient Moniqua). Then we demonstrate more experimental
+results in Section C. In Section D, we illustrate why naively quantizing communication in D-PSGD
+fails to converge asymptotically, as a proof to Theorem 1. In Section E, we introduce some useful
+tools of modeling communication as a Markov Chain for the rest of the proof (part of the intuition is
+illustrated in the paper). We recommend to go through this before getting into Section F to H. Finally
+we will provide proof to Theorem 2, 3 and 4 from Section F to H, with corollaries contained in the
+corresponding sections. Detailed algorithm statements for applying Moniqua on D2 and AD-PSGD
+can be found in Section G Algorithm 2 and Section H Algorithm 3, respectively.
+B S HARED RANDOMNESS (EXPERIMENT OF Efficient Moniqua)
+In this section, we provide a theoretical explanation why using shared randomness in the stochastic
+rounding is able to improve the performance. Without the loss of generality, in the following analysis,
+we let the quantization step associated with stochastic rounding quantizer Q be δ = 1. For any z
+quantized using Q, let zf = z - bzc, the variance of quantization error can be expressed as
+EkQ(z) -zk2 = (1 - zf)(-zf)2 +zf(1 -zf)2 = zf(1 - zf)	(5)
+Note that in Moniqua, the term asssociate with quantization error is
+E k(qk,j - xk,j ) - (qk,i - xk,i)k
+We now show for ∀x, y ∈ Rd
+E k(Q(x) -x) - (Q(y) - y)k2 =EkQ(y-x) - (y - x)k2
+With out the loss of generality, let x - bxc ≤ y - byc. Let xf = x - bxc and yf = y - byc, then
+bX + uc =	bXc	and	by+uc =	byc, with probability	dye - y
+bX + uc =	dXe	and	by+uc =	dye, with probability	X - bXc
+bX + uc =	bXc	and	by+uc =	dye, with probability	(dXe - X) - (dye - y)
+Then we have
+Ek(Q(x)-x)-(Q(y)-y)k2
+=E IG j X+Uk-X)-G j δ+〃k-y)『
+=(dye - y)((bxc -x) - (byc - y))2 + (x- bxc)((dxe -x) - (dye - y))2
++((dXe - X) - (dye - y))((bXc - X) - (dye - y))2
+=(1 - yf)(Xf -yf)2 + (Xf)(Xf -yf) + (yf - Xf)(yf -Xf - 1)2
+=(1 - yf + Xf)(yf - Xf)2 + (yf - Xf)(yf - Xf - 1)2
+=(1 - yf + Xf)(yf - Xf)
+=E kQ(y -X) - (y - X)k2
+The last equality holds due to equation 5. Next, let
+∆=y-X
+r = Q(∆) - ∆
+And let rh denote h-th entry of r, let ∆h denote h-th entry of ∆. We obtain
+rh =Q(∆h) - ∆h
+12
+Under review as a conference paper at ICLR 2020
+=δ ∫-等 + 母J +1, Pt ≤ ?-母J
+I- ∆h + L∆hJ , otherwise
+=δ -q+ 1, pt ≤ q
+-q, otherwise
+where
+∆h
+T
+∆h
+T
+,q∈[0,1]
+Based on that, we have
+q
+—
+E rh2 ≤δ2((-q+ 1)2q + (-q)2(1 -q))
+=δ2q(1 - q)
+≤δ2 min{q, 1 - q}
+Since min{q, 1 - q} ≤ ∖ Xh ∣, we have
+E 同]≤ δ2 ∆h ≤ δ ∣∆h∣
+Summing over the index h yields,
+Ekrk2 ≤ δE∣∣∆∣∣ι ≤√dδE k∆k2
+Pushing back x and r, we have
+E kQ(y — x) — (y — x)∣∣2 ≤ √dδE ky — Xk = √dδE kx — y∣∣
+Putting it back we have
+Ek(Q(X)- χ) — (Q(y) — y)k2 ≤ √dδE∣∣x - yk
+Now we can see that the error term is bounded by the distance of two quantized tensor, which, in
+decentralized training, refers to the distance between two models on adjacent workers. In such a way,
+the error bound can be reduced since the workers are getting close to each other.
+C More Experimental Results
+C.1 Compute Number of Bits
+In Experiment of Efficient Moniqua, we calculate the number of bits in the following way: First,
+We calculate the total number of bits each worker send out, SUm them UP and divided by number of
+epochs, and we get the average bandwidth consumption BW of the whole system in each epoch.
+Then we comPute the number of bits required for each number in the following way (note that every
+worker has 2 neighbors in a ring topology):
+BW
+#bits = ----------------------------------
+#neighbors ∙ #workers ∙ #ParamS of model
+In our experiments, #neighbors=2, #workers=8. For VGG16, #params of model= 15,245,130 while
+for ResNet110, #params of model=1,146,842. We formalize the results in Table C.1 8.
+C.2 Various Quantizers
+In this section, we will verify Moniqua is applicable to other quantizers aside from linear quantizer as
+shown in the paper. We test it on two more quantizers:
+1.	Nearest Rounding (Biased)
+Q(X) = δ jδ + 0.5]
+where δ is the quantization step as defined in the linear quantizer. In this experiment, we set
+δ = 0.01, the same value as we used in the paper with stochastic rounding.
+8 Note that we only put results that’s ’close to the limit of Moniqua’ here
+13
+Under review as a conference paper at ICLR 2020
+Table 1: Wall Clock Time consumption (Seconds)/Epoch in average under different network in
+Experiment of Evaluation of Moniqua.
+	100mbps/0.15ms	20mbps∕0.15ms	100mbps/10ms	Extra Memory
+Centralized	38.92	206.14	343.28	N/A
+D-PSGD	36.25	189.48	310.98	N/A
+DCD-PSGD	32.99	105.40	202.42	20.4 MB
+ECD-PSGD	31.96	105.26	202.04	20.4 MB
+ChocoSGD	32.03	105.18	201.18	20.4 MB
+DeepSqueeze	30.01	103.67	193.92	13.6 MB
+Moniqua	22.42	95.08	184.86	0B
+Table 2: Bandwidth consumption under different θ and δ when applying linear quantizer in Moniqua
+Model	MOD PARAM θ	Quant Step	B ytes/Epoch	Avg Bits
+	None	None	45594MB	32
+VGG16	1.0	0.01	5206MB	3.65
+	0.08	0.01	5192MB	3.64
+	None	None	3430MB	32
+ResNet110	2.0	0.01	609MB	5.67
+	1.3	0.01	608MB	5.67
+2.	Randomized Gossip (Non-linear)
+Q(x) = 0x,,
+with probability p
+with probability 1 - p
+In this experiment, we set p = 0.7.
+We train ResNet110 on CIFAR10, and plot the results in Figure 5(c). We can see that the training
+curves of using three quantizers are all aligned with D-PSGD with full-precision communication.
+Note that in the paper we show that previous work cannot perserve the aligned curve even with
+stochastic rounding (unbiased), thus we are not comparing them here.
+C.3 More results on different hyperparameters
+In this experiment, we plot more result of training ResNet110 and VGG16 on CIFAR10 under
+different δ and θ in the experiment of aggressive quantization. And we plot the results in Figure 5(a)
+and Figure 5(b).
+O
+SSol 6--eJ∙
+O	50 IOO 150
+Epoch
+(a) Performance of Moniqua on (b) Performance of Moniqua on (c) Performance of algorithms un-
+VGG16 under different θ and δ ResNet110 under different θ and der different quantizer
+δ
+14
+Under review as a conference paper at ICLR 2020
+C.4 Performance on the testset under aggressive quantization
+We report the results in experiment of ”Aggressive Quantization” and report the test error and test
+accuracy in the Figure 5 and Figure 6.
+Epoch
+0.015
+0.010
+0.005
+0	50	100	150
+Epoch
+(d) Training Accuracy under differ- (e) Test Accuracy under different (f) Test Loss under different algo-
+ent algorithms with 3-bit communi- algorithms with 3-bit communica- rithms with 3-bit communication
+cation	tion
+Figure 5:	More statistics from Experiment of Aggressive Quantization under 3-bit communication
+(a) Training Accuracy under differ- (b) Test Accuracy under different (c) Test Loss under different algo-
+ent algorithms with 2-bit communi- algorithms with 2-bit communica- rithms with 2-bit communication
+cation	tion
+Figure 6:	More statistics from Experiment of Aggressive Quantization under 2-bit communication
+C.5 Decreasing Step Size and Consensus Error
+In this subsection, we provide more experimental results with decreasing step size. We also provide
+and discuss results on consensus error in this experiment. We run the experiments in the following
+setting:
+Models, Datasets and Hyperparameters. We launch 8 workers connected using a ring network.
+We train ResNet110 and ResNet18 on CIFAR10. The hyperparameters of Moniqua are: ResNet110
+(Initial step size = 0.05, θ = 3.0, batch size = 128, weight decay = 3e - 4, and momentum = 0.9)
+and ResNet18 (Initial step size = 0.1, θ = 2.5, batch size = 128, weight decay = 1e - 4, and
+momentum = 0.9). Step size is decreased (times a 0.1 factor) every 30 epochs. To be consistent with
+the original paper, we use the stochastic rounding to quantize each number.
+Results of Decreasing Step Size We plot the results of test accuracy in Figure 7. We can see from
+Figure 7(a) that Moniqua requires at least 6 bits to achieve the comparable (accuracy drop < 0.3%)
+test accuracy as the baseline (D-PSGD with 32 bits). Once the numeber bits decrease to 5, there
+is a accuracy gap between Moniqua and D-PSGD. On the other hand, other baselines including
+DeepSqueeze, ChocoSGD and DCD/ECD-PSGD are not able to achieve comparable test accuracy
+with 6 bits. Similarily, we can see from Figure 7(b) that when training ResNet18 with 4 bits, Moniqua
+is able to achieve comparable test accuracy after 120 epochs, while other baselines suffer a certain
+accuracy gap.
+We also plot the test accuracy of different algorithms under different bit-level communication in
+Figure 8 (ResNet110). We can see that compared to the baselines, Moniqua is generally robust to low
+15
+Under review as a conference paper at ICLR 2020
+O
+40
+Ooooo
+9 8 7 6 5
+>UE3UU< %vk
+D-PSGD(32bit)
+Moniqua(Sbit)
+τ- Moniqua(6bit)
+→- Moniqua(5bit)
+-→- ChocoSGD(6bit)
+→- DeepSqueeze(Sbit)
+-⅛- ECD-PSGD(6bit)
+-→- DCD-PSGD(6bit)
+Vooo
+W 7 6 5
+>UE3UU< %vk
+*∙*Fdr品
+D-PSGD(32bit)
+-→- Moniqua(8bit)
+^∙***-⅛- Moniqua(6bit)
+→- Moπiqua(4bit)
+→- ChocoSGD(4bit)
+T- DeepSqueeze(4bit)
+I- ECD-PSGD(4bit)
+DCD-PSGD(4bit)
+50
+5
+2
+75 IOO 125 150
+Epoch
+(a)	ResNet110 on CIFAR10
+0	25	50	75	100 125 150
+Epoch
+(b)	ResNet18on CIFAR10
+Ooo
+8 6 4
+>US3UU< ⅞ΦH
+Figure 7: Test Accuracy and Consensus Error of Moniqua under decreasing step size.
+S DCD-PSGD
+• ECD-PSGD
+• ChocoSGD
+♦ DeepSqueeze
+・ Moniqua
+2	3	4	5	6	7	8
+Number of Bits/Parameter
+Figure 8:	Test Accuracy of different algorithms on training ResNet110 on CIFAR10.
+bits-budget. (Some of the dots are missing for some algorithms, that means they do not converge
+under the corresponding bits-budget.)
+Results of Consensus Error. To better measure the behaviour of workers reaching consensus, we
+define the consensus error at iteration k: Ck as follows (Notations are the same as in the original
+paper):
+k-1 n
+Ck 二 一 XX
+k nk 士 白
+1n
+n E Xtj- χt,i
+j=1
+2
+(6)
+Note that Ck is essentially the running average of distance among workers and the averaged model.
+Trivially, a decreasing Ck indicates the workers are reaching consensus. We measure the consensus
+error in three aspects. We first provide the results of the original paper in Figure 9(a), where constant
+step size is adopted. We can see that even with extremely small number of bits as used in ”Aggressive
+Quantization”, all the workers are able to reach consensus. We further plot consensus error under the
+setting where decreasing step size is adopted as defined in this section. We can see in Figure 9(b) and
+Figure 9(c) that all the workers are able to reach consensus.
+16
+Under review as a conference paper at ICLR 2020
+Epoch
+(a) Consensus Error on ResNet110 (b) Consensus Error on ResNet110 (c) Consensus Error on ResNet18
+with constant step size	with decreasing step size	with decreasing step size
+Figure 9:	Consensus Error of Moniqua with different number of bits.
+D	Why Naive Quantization Fails in D-PSGD (Proof to Theorem 1)
+The update rule of naive quantization on D-PSGD is
+nn
+xk+1,i = xk,i Wii +	Q(xk,j )Wji - αk gek,i = xk,i +	(Q(xk,j ) - xk,i )Wji - αk gek,i
+j=1,j 6=i	j=1,j 6=i
+where αk is allowed to vary with any policy. Let
+Xk = [xk,1, …，xk,n] ∈ Rd×n
+Ωk = X Wjl (Q(Xkj ) - Xk,l),…，X Wjn (Q(Xkj ) - Xk,n) ∈ Rd×n
+j 6=1	j 6=n
+Gk = [ek,ι,∙∙∙ ,ek,n] ∈Rd×n
+by rewritting the update rule, we obtain
+V^ 一 V^ IC 〜方
+Xk+1 = Xk +Ck - akGk
+Let Yk = Xk — X* 1>, and considering the fact that Vf (x) = X - δ∕2 = X - x*, We can rewrite the
+update rule as
+Yk+ιei = Ykei + Ωkei — αkYkei + αk (Gk — Gk) ei
+where Gek - Gk denotes variance in the gradient sampling.
+Suppose that by using the update rule of naive quantization, worker i converges to X*. Then there
+must exist a K such that ∀k ≥ K ,
+E kYk+ιeik2 ≤ EkYkeik2 < 8(^∖	⑺
+Next we show that this assumption lets us derive a contradiction. Firstly, considering the property of
+linear quantizer,
+δ2
+W ≤ EkQ(Xk,i) - X k ≤ 2E kQ(Xk,i) - Xk,ik +2E∣∣Xk,i - X k
+As a result
+EkQ(Xk,i) - Xk，i『≥ δr - 8(Φ+δφ2) = 8(1 + φ2)
+Since Q is unbiased, that means E[Q(X) - X] = 0, then we have
+E ∣∣Ωke∕∣2
+17
+Under review as a conference paper at ICLR 2020
+2
+=E XWji (Q(xk,j) - xk,i)
+j 6=i
+= X	Wj2i E	k(Q(xk,j) - xk,i)k2 +	X E	h(Q(xk,m)	-	xk,i)	Wmi, (Q(xk,n) -	xk,i)	Wnii
+j∈Ni	m6=n6=i
+≥φ2	X E k(Q(xk,j) -	xk,i)k2 +	X E	h(Q(xk,m)	- xk,i)	Wmi,	(Q(xk,n)	-	xk,i)	Wnii
+j ∈Ni	m6=n6=i
+=)φ2 X EkQ(Xkj) -xk,ik2
+j ∈Ni
+≥ φ2δ2
+— 8(1 + φ2)
+where step (*) holds due to unbiased quantizer. Putting it back to the update rule, We obtain
+E kYk+ιeik2 =E KK + Ωk - αkYk + a® (Gk - G,) e』2
+=IEk(I- a®)Ykei∣∣2 + Ekakeik2 + E∣∣ak (Gk- Gk^ ei∣∣
+≥E kΩkeik2
+≥	Φ2δ2
+—8(1 + φ2)
+where cross terms in the (*) step are all 0 due to the unbiased quantizer and unbiased sampling of the
+φ2δ2	2	φ2δ2
+gradient. Her we obtain the contradictory that 8(：+@2)≤ E ∣∣Xk+ι — x*k < 8(：+@2). That being
+said, for ∀k, i
+Ekxk,i -x*k2 = EkVf(Xk,i)k2 ≥ 8(1+φ2)
+Thus we complete the proof.
+E A Markov Chain Analysis on the Communication
+To better understand how the parallel workers reach consensus over a communication matrix, in this
+section we use theory from the analysis of Markov Chains to obtain some useful lemmas for proof of
+Moniqua on D-PSGD and AD-PSGD.
+Since the communication matrix W is doubly stochastic (each row and column sum to 1), it has the
+same structure as the transition matrix of a Markov Chain with 乎 as its the stationary distribution
+(Wɪn = ɪn). Now let tmiχ and d(t) denote the mixing time and maximal distance between initial
+state and stationary distribution as defined in Markov Chain theory.9
+E.1 D-PSGD
+In D-PSGD, the communication matrix is fixed during the training. That makes it perfectly aligned
+with the structure of a Markov Chain. As a result, we obtain the following lemma:
+Lemma 1
+Proof For ∀X ∈ Rd, let u ∈ Rd be such a vector that every entry of u is the positive entry of X and 0
+otherwise. Let v ∈ Rd be such a vector that every entry of v is the absolute value of negative entry of
+X and 0 otherwise. The setting above means X = u - v. For example,
+X= [2, -1]>
+9Here we are using notation from Chapter 4.5 of Markov Chains and Mixing Times (Levin 2009), available
+at https://pages.uoregon.edu/dlevin/MARKOV/markovmixing.pdf
+18
+Under review as a conference paper at ICLR 2020
+And we have
+u= [2, 0]>
+=ι > UIIWt ⅛ - ⅛n∣ + ι>vllWt ⅛- ⅛n∣
+ɪn U n ∣∣1	ɪn V n ∣∣1
+≤2(1 >u + l>v)d(t)
+≤2d(t) kxk1
+Considering the definition of L1-norm, we have
+Wt
+≤ 2d(t)
+According to a well-known results on the theory of Markov Chains,10 d(ltmix) ≤ 2-l holds for any
+non-negative integer l, so we have
+Wt
+2d(t) ≤ 2d
+• tmix
+≤ 2d
+tmix ) ≤ 2 • 2 [tmJ
+That completes the proof.
+Additionally, based on standard results in the theory of reversible Markov Chains, we also have11
+tmix ≤ log ( 1	1 )
+V4 ∙ nJ 1 - P
+≤ log(4n)
+_ 1 - P
+E.2 AD-PSGD
+Note that unlike D-PSGD, here Wk can be different at each update step and usually each individually
+have spectral radius P = 1, so we can’t expect to get a bound in terms of a bound on the spectral gap
+as we did in Theorems 2 and 3. Instead, we require the following condition, which is inspired by the
+literature on Markov chain Monte Carlo methods: for some constant tmix (here tmix is the same as
+tmix in the paper) and for any k and any non-negative vector μ ∈ Rd such that l>μ = 1, it must hold
+that
+tmix
+Y Wk+'μ - nn-
+1
+≤ 2.
+1
+We call this constant tmix because it is effectively the mixing time of the time-inhomogeneous Markov
+chain with transition probability matrix Wk at time k. Note that this condition is more general than
+those used in previous work on AD-PSGD because it does not require that the Wk are sampled
+independently or in an unbiased manner. Based on the above analysis, we can prove the following
+lemma, which is analogous to the lemma used in the synchronous case.
+Lemma 2 For any k ≥ 0 and for any b ≥ a ≥ 0, there exists tmix such that
+YWq(I-U)	≤2• 2-jb-aχιk
+___________________________q=a 、	l ι
+10Again, see Markov Chains and Mixing Times for more details.
+11Detailed analysis and proofs of this result can be found in chapter 12.2 of Markov Chains and Mixing Times.
+19
+Under review as a conference paper at ICLR 2020
+Proof Note that for any x ∈ Rd, and let u and v be two vectors having same definition as in Lemma 1
+with respect to x, then we have for any k
+tmix
+Y Wq+k
+q=1
+x1=tqYm=i1xWq+k	I-
+tmix
+qY=1 Wq+k	I-
+∏ Wq+k (I- 1nn>) V
+q=1
+tmix
+=I>u ∏ Wq+k 六--n
+q=1	n
+≤ 2( 1>u +1>V)
+≤ 2 kχkι
++ l>v
+1
+tmix
+∏ Wq+k⅛
+q=1
+—
+n
+1
+1
+Considering the definition of the induced `1 operator norm, we have
+tmix
+∏ Wq+k
+q=1
+IQ=X Wq+k (I-$)X∣∣1
+kxk1
+1
+≤ —
+-2
+As a result, from the submultiplicativity of the matrix induced norm, we obtain
+b
+∏
+q=a
+tmix
+∏
+q=1
+—j b-a + 1 k
+≤2 L tmix」
+tmix
+…Π W∙∙∙+q (I-
+1
+∏ W→q (I- ⅜n>
+q=1
+q=1
+tr
+)∙ ∏ w∙
+I1 Iq=1
+I - ɪnɪn
+≤
+n
+1
+1
+…+ q
+n
+1
+where tr = (b - a + 1) mod tmix. Note that
+tr
+Wq	I -
+q=1
+1-1 +
+n
+(n - 1)1 = 2 - 2 ≤ 2
+nn
+Putting it back we obtain
+1
+b
+∏ W∙∙∙ + q
+q=a
+—j b-a + 1 k
+2 ∙ 2-L ^m^」
+n
+≤
+That completes the proof.
+Note that in the analysis of Moniqua on AD-PSGD (Section H), we will use this lemma as an
+assumption.
+F Moniqua on D-PSGD (Proof to Theorem 2)
+Consistent with linear and non-linear quantizer Here We briefly explain Why using θ ∙
+Qδ (θ mod 1)instead of Qδ (X mod θ) for theoretical analysis and how it covers both linear and
+non-linear quantizers. Note that typically, a linear quantizer has:
+kQδ(x) -xk∞ ≤ δ, ∀x∈Rd
+20
+Under review as a conference paper at ICLR 2020
+while a non-linear quantizer has
+kQδ(x) -xk∞ ≤ δkxk∞,	∀x ∈Rd
+so that for linear quantizer, with a given x ≤ θ:
+K ∙Qδ
+(X mod 1
+X mod 1
+θ
+X mod 1
+θ
+≤ θδ = θδ
+∞
+And for non-linear quantizer, with a given X ≤ θ:
+卜∙Qδ
+(X mod 1
+-XL=θBQδ (x mod1)-(χ mod 1)∣∣∞≤ θδ ∙ 1=θδ
+As a result, we can use the same bound θδ for quantizers with both of the properties, which we will
+show in the rest of the proof.
+F.1 Proof to Theorem 2
+Proof For convenience, we define the following notation
+Xk =	[Xk,1 ,	)∙ ∙ ∙ , Xk,n] ,	Qk =	[qk,1, ∙ ∙	• , Qk,n]
+Gek =	[gek,1 ,	…，gk,n] ,	Gk =	[gk,1, ∙ ∙	• , gk,n]
+X =	n ɪn X n	, ∀X ∈ Rd×n ,	Ωk	= (Qk	- Xk )(W - I)
+where gk,i denotes gradient computed via the whole dataset Di and Xk,i
+From a local view, the update rule of Algorithm 1 on worker i at iteration k can be written as
+Xk+1,i4-Xk,i +): '∈j∖Λ (qkj - qk,i) ^Wji - agk,i
+which is equivalent to
+nn
+Xk+1,i = Xk,i +	(Xk,j - Xk,i ) Wji - αgek,i + ((qk,j - Xk,j ) - (qk,i - Xk,i )) Wji
+j=1	j=1
+(8)
+From a global view, the update rule can be written as
+Xk+1 = Xk + Qk(W - I) - αGe k = Xk W - αGek + (Qk - Xk)(W - I)
+(9)
+From Lemma 5 we have
+K-1
+K X Ewf (Xk )『
+k=0
+≤4(f(0)- f *) + ZgL 2 , 8α2L2 (σ2 +3ς2)
+一 αΚ	n	(1 - ρ)2
+8L2 K-1
++ n⅛ X EkakkF
+Note that
+K-1	K-1 n
+X E kΩk kF = XX E
+k=0	k=0 i=1
+2
+n
+((qk,j - Xk,j ) - (qk,i - Xk,i )) Wji
+j=1
+K-1 n
+Lemma 3
+≤ 4	δ2θ2d ≤ α2G2∞dnK
+k=0 i=1
+The last step holds because δθ = 2 αG∞. Pushing it back we obtain
+K-1
+K X Ewf(Xk)f ≤
+k=0
+4(f(0)- f *) , 2αL 2 , 8α2L2 (σ2 +3ς2) , 802G∞dL2
+αΚ	n °	(1 - ρ)2	(1 - ρ)2
+21
+Under review as a conference paper at ICLR 2020
+By setting α
+______1______
+ς 3 K 3 +σ√KK +2L
+, we have
+1 K-IW llv-ɪ<8(f(0)- f *)Lq 4σ(f (0)- f * + L/2)	4ς 3(f(0)- f *)
+κ ^EIIVf(X k)l1 ≤ —K― +----------√nκ-------------+ —Kl—
+k=0
+8L2σ2n	24L2ς 3	8L2G2cι dn
++  ----——：------：— +------------+  -一一 ∞----：—
+(1 — ρ)2(σ2K + 4nL2)	(1 - p)2K3	(1 — ρ)2(σ2K + 4nL2)
+.ɪ + σ + 豆 +	σ2n	+ G∞dn
+KK √nK K 3	σ2K + n	σ2K + n
+That completes the proof of Theorem 2.
+F.2 Lemma for Moniqua on D-PSGD
+Lemma 3 If kxt,i - xt,j k∞ ≤ θ, ∀i, j holds at iteration t, then
+n
+((qt,j - xt,j) - (qt,i - xt,i)) Wji
+j=1
+≤ 2δθ
+∞
+Proof
+ln	l
+l	((qt,j - xt,j) - (qt,i - xt,i)) Wji l
+lj=1	l
+n
+≤	Wji k(qt,j - xt,j) - (qt,i - xt,i)k∞
+j=1
+n
+=X Wji ∣∣θQ (-
+j=1
+n|
+=X Wji θq(-
+j=1
+n
+=X Wji ∣∣θQ (-
+j=1
+n
+≤ X Wji ∣∣θQ
+j=1
+n
++XWji∣∣θQ
+j=1
+≤2δθ
+mod 1 一
+mod 1 一
+mod 1 一
+mod 1 一
+mod 1
+θQ
+θQ
+mod 1 - (xt,j - xt,i)ll
+mod 1)一 θ (Xtj - xt,i mod 1)1
+mod 1 - θQ
+mod 1 - θ
+mod 1ll∞
+mod 1ll∞
+一θ (等 mod 1)ll∞
+∞
+θ
+θ
+Lemma 4 In any iteration k ≥ 0, and for any two worker i and j, we have:
+kXk(ei-ej)k∞ ≤ θ = 2l0g(16n) αG∞
+1 一 P
+Proof We use mathematical induction to prove this:
+I. When k = 0, kX0(ei
+II. Suppose for kXk (ei
+∞
+∞
+- ej)k
+- ej)k
+= 0 ≤ θ,∀i,j
+≤ θ, k ≥ 0, ∀i, j, we have
+kXk+1(ei
+-ej)k∞
+W 一 aGek + Ωk) (ei 一 ej) ||
+X0=0
+k
+X	-αGet +
+t=0
+Wk-t(ei-ej)
+∞
+22
+Under review as a conference paper at ICLR 2020
+≤ x ∣∣(-αGet+ω, Wk t(ei - ej)Ii
+t=0	∞
+k
+≤ ∑ll-αGet+ω41∞
+I I W k-t(ei-ej) I I 1
+≤ X (° IIGtII1,∞+Mtkl,∞) nW k-t(ei - ej )II1
+induction hypothesis
+≤	(αG∞ + 2δθ)
+k
+EnW I (ei-ej)IIi
+t=0
+∞
+≤ (°G∞ + 2δθ) ^X IIWt(ei - ej)Hi
+t=0
+For any t ≥ 0, on one hand
+IIWt(ei -	ej)iii ≤ √n HWt(ei	-	ej)i^ ≤	√n	Wtei------n +	√n	Wtej------十 ≤	2√nρt
+where the last step holds due to the diagonalizability of W. On the other hand,
+nWt(ei - ej)Ili ≤ ι>Wtei+ ι>Wtei = ι>ei+ ι>ej =2
+So
+i i Wt(ei - ej) ii 1 ≤ min{2√nρt, 2}
+Let To = ∣"- lθg(√n)], so that nρT0 ≤ 1, then we have
+∞	T0 — 1	∞
+EIIWt(ei -ej)iii = E IIWt(ei -ej)iii + E IIW"e)∣∣ι
+t=0	t=0	t=T0
+T0 — i	∞
+≤ E 2 + E 2√nρt+T0
+≤2 ∣^-bg(√n)
+一	log(ρ)
+∞
++ E 2 (√⅛T0) ρt
+t=0
+≤ 2log( √n) +2+	2
+—	1 - P	1 - P
+log(16n)
+≤ 1 - P
+As a result, we have
+∣∣Xk+i(ei - ej)∣∣∞ ≤ (&G∞ + 2δθ)
+log(16n)
+1 - P
+Since δ = Q；—就,we have
+∣∣Xk+i(ei - ej)∣∣∞ ≤ (αG∞ + 2δθ)-g^	≤ ≤
+1-P
+Combining I and II, we complete the proof.
+Lemma 5 The output of Algorithm 1 has the following bound:
+k—i
+天 E E∣∣v∕(Xk)∣∣2
+k=0
+≤4(f(0)- f *) + 2αL 2 + 8α2L2 (σ2 +3ς2)
+_ αK	n	(1 - ρ)2
+"一θ
++
+8L2
+nK(1 - ρ)2
+K —i
+E EkΩkkF
+k=i
+23
+Under review as a conference paper at ICLR 2020
+Proof From Lemma 8, we have
+1 - αL
+K
+K-1	K-1
+X EUGk『+ K X Ewf(Xk城
+k=0	k=0
+≤2(f(0)- f *)
+一 ɑK
+2 K-1 n
++ αLσ2 + 条 XX ElIXk-xk,i『
+Lemma 62(f(0) — f *)	aL 2	2α2L2
+_ aK n n σ M Mι(1 — ρ)2
+3 K-1
++ 3ς2 + K X E∣∣vf(Xk)∣∣2
+k=0
+where
+2L2	K-1
++ MinK(1 — ρ)2 X Ek°kkF
+M1 = 1 —
+6a2L2
+((I-TF
+Rearrange the terms, we get
+丁 XL 叫 IGk II2+(1 - M6α⅛) K XL EHVf(X k) II2
+k=0	k=0
+Let
+2(f (O)- f *) + 叱σ +
+αK
+2α2L2 (σ2 + 3ς2)
+Mi(1 — ρ)2
+2L2
++ MInK (1 — ρ)2
+K-1
+X E kΩkkF
+k=1
+M2
+6α2L2
+1------------
+Mi(1 — Py
+≤
+n
+we get
+≤
+1 — αL
+K
+K-1
+K-1
+K-1	K-1
+X EIIGkII2+M X EnVf(X k)∣∣
+k=0
+2(f (O)- f *) + 叱σ +
+αK
+k=0
+2α2L2 (σ2 + 3ς2)
+Mi(1 — ρ)2
+2L2
++ MInK (1 — ρ)2
+K-1
+X E kΩkkF
+k=1
+n
+2
+Let Mi, M2 ≥ 2 and rearrange the terms, we have
+K-L
+K X EHVf(Xk)∣∣2
+k=0
+≤ 4(f(0) — f *) ι 2αL 2 ι 8α2L2 (σ2 +3ς2)
+_ aK	n 0	(1 — ρ)2
++
+8L2
+nK (1 — ρ)2
+K-L
+X E kΩkkF
+k=L
+and that completes the proof
+Lemma 6 Let Mi = 1 — 6-L2 > O, we have
+2 K-L n	2 2	K-L
+nKXXEI∣Xk-Xk,iII2≤M20⅛ σ2 + 3ς2 +1XE∣∣Vf(Xk)∣∣2
+k=0 i=i	i	k=0
+2L2	K-i
++ ττ~^~EEkΩkkF
+Mi nK (1 — ρ)2	F
+Proof
+K-i n
+xx E∣∣X k-Xk,i∣∣2
+24
+Under review as a conference paper at ICLR 2020
+K-1
+k=1 i=1
+K-1 n
+X XE
+k-1
+1W - aGek-1 + Ck-1
+In
+ei
+x0,i = °
+K-1 n	k-1	/ II
+XXE X(-αGt + ω)
+i—1	i= 1	t= ∩	、
+K-1
+k=1 i=1
+t=∩
+K-1 n
+k-1
+- W k-t-1ei
+‹2a2
+∑∑E EGt
+k=1 i=1
+t=∩
+±n - Wk-t-1ei
+n
+K-1 n
+k-1
+k=1 i=1
+t=∩
+±n - Wk-t-1ei
+n
+K-1
+k-1
+=202
+EE EGt
+k=1
+t=∩
+-Wk-t-1
+K-1
+k-1
++ 2E E fΩt
+t=∩
+Lemma 1∩ 金
+≤	2α2 X E X P
+k=1	t=∩
+k=1
+K-1
+k-t-1 同 IF	+2 X E
+k=1
+1MIIf
+-Wk-t-1
+n
+XX E lɪk (¥-M
+n
+
++ 2∑ EE 5>
+
+2
+2
+—
+2
+2
+F
+n
+2
+2
+2
+2
+F
+Lemma 9	2α2
+≤	(1 - ρ)2
+K-1	2	2 K-1
+X EUGknF+∏f X EkokkF
+k=1	v P k=1
+K-1 n	K-1
+Lemma 7	2α2	/ c	C v~<■~ll_	ll2	C	<■~ll 一 ll2
+≤ (I- )2 nσ2K + 3L2 £ ^rEllX k - xk,i∖∖ + 3nς 2K + 3n £ E∣∣Vf(X k)『
+(-P)	∖	k=∩ i=1	k=∩
+2	K-1
++(If 与 EMk kF
+Rearrange the terms, we have
+(	6α2L2 ʌ K-1 ι ι —	ι ι 2
+(1 - (1 - ρ)2 j ΣS ΣSe 11 Xk - xk,i l l
+/ 2α2
+≤ (1-7)2
+,	K-1	_	∖	2	K-1
+nσ2K + 3nς 2K + 3n £ E∣∣Vf (X k)∣∣	+	EEkΩk IlF
+、	k=∩	)	( - P) k=1
+Let M1 = 1 -归东 > 0, we have
+nKXIXE∣∣xk -Xk,i∣∣2 ≤m20⅛ (σ2 + 3ς2 + W ∑1 E∣∣Vf(χk)∣∣2)
+k=∩ i=1	k=∩
+2L2	KT
++ MInK(1 - ρ)2 X Eka kF
+Lemma 7
+K-1	2	K-1 n	K-1
+X E∣∣Gk∣∣F ≤ nσ2K + 3L2 XXE∣∣Xk -xk,i∣∣2 + 3nς2K + 3n X E∣∣Vf(Xk)∣∣2
+k=∩	F	k=∩ i=1	k=∩
+Proof From the property of Frobenius norm, we have
+2n
+E∣∣Gk∣∣ = X Ekek,ik2
+F i=1
+25
+Under review as a conference paper at ICLR 2020
+Next, we derive the upper bound of E kgek,ik2
+E kgek,ik2
+=E kgek,i - gk,i + gk,i k
+=E kgek,i - gk,i k2 + E kgk,i k2 + 2E hgek,i - gk,i, gk,ii
+=E kgek,i - gk,ik2 +E kgk,ik2
+≤σ2 + 3E∣∣gk,i - Vfi(X k )∣∣2 + 3E 11 Vfi (X k) - Vf(X k) ∣∣2 + 3E∣∣Vf (X k )∣∣2
+≤σ2 + 3L2E∣∣Xk - xk,i∣∣2 + 3ς2 + 3E∣∣Vf (Xk)∣∣2
+Summing from k = 0 to K - 1, we obtain
+K-1	2
+XE∣∣∣Gek∣∣∣2F
+k=0
+K-1 n
+=XXEkgek,ik2
+k=0 i=1
+K-1 n	K-1 n	K-1 n	K-1 n
+≤XXσ2 + 3L2 XX
+E ∣∣Xk - xk,i ∣∣ + 3XX ς2 + 3 XX EUVf(X k )∣∣2
+k=0 i=1	k=0 i=1	k=0 i=1	k=0 i=1
+K-1 n	K-1
+=nσ2K + 3L2 X XE∣∣Xk - xk,i∣∣2 + 3nς2K + 3n X E∣∣Vf (Xk)∣∣2
+k=0 i=1	k=0
+That completes the proof
+Lemma 8
+1 - αL
+K
+K-1	K-1
+XE∣∣Gk∣∣2 + K XEnVf(Xk)∣∣
+k=0	k=0
+2
+≤ 2(f(0)- f)
+一 ɑK
+2 K-1 n
++αnLσ2+东 xx E∣∣X k-χk,i∣∣2
+Proof Let In denote a n-dimensional vector with all the entries be 1. And we have
+—	~	. Ig —	. .	. Ig —	—
+X k+1 =	(Xk W	- aGek +	ωQ--- = X k	- αGek	+ (Qk - Xk )(W - I)--- = X k	- αGek
+n
+And by Taylor Expansion, we have
+n
+Ef (X k+ι)= Ef ((XkW - aGk+°k )1 n
+n
+_ =、	_ _ =α2L_
+≤ Ef (Xk) - αEhVf (Xk),Gki + FE
+2
+And for the last term, we have
+2
+E∣∣Gek∣∣2 = E
+n
+i=1 gk,i
+n∣
+nn	n
+ɪ^i=1 gk,i	A^i=1 gk,i + A^i=1 gk,i
+n
+nn
+Li=I gk,i - 〃=1 gk,i
+n
+2
++E
+n∣
+∣n
+∣	i=1 gk,i
+E
+E
+2
+n
+2
+26
+Under review as a conference paper at ICLR 2020
+nn	n
++E / ɪ^i=] gk,i	2^i=1 gk,i + 2^i=1 gk,i
+n
+nn
+Li=I gk,i - 〃=1 gk,i
+n
+n
+2
++E
+n
+i=1 gk,i
+n
+Assumption (A3)3 X Ekek,i-gk,ik2+e
+n2
+n
+i=1 gk,i
+i=1
+Assumption (A3) σ2
+≤ 一+ E
+Putting it back, we obtain
+n
+i=1 gk,i
+__:	__:、	____:、w、	-2L 0	—2 L _
+Ef(Xk+ι) ≤ Ef(Xk) - -EhVf(Xk), Gki +^ ~-—σ +—ʒ-E
+2n	2
+=Ef(X k) - α--2-2L EllGk ll2 - 2 EllVf (X k )ll2
++-EllVf (X k) - Gkll2
+where the last step comes from 2ha, bi = kak2 + kbk2 = ka - bk2 And
+,,-	-,,2	1 二
+EllVf(Xk) - Gkll ≤ - EE	Vfi
+n
+工『=1 xk,i0
+i=1
+Assumption (A1) L2 n
+≤£X e
+i=1
+n
+i=1 gk,i
+ln
++ α2Lσ2
+2n
+-Nfi(Xk,i)
+n
+i0=1 xk,i0
+-----n^^——xk,i
+E
+n
+n
+2
+2
+2
+n
+n
+n
+2
+2
+2
+2n
+~ X E i|x k - xk,ill
+i=1
+putting it back, we have
+2	2	2n
+-—L-EllGkll + -EllVf(Xk)ll ≤ Ef(Xk)-Ef(Xk+ι)+^σ2+^L- XEllXk - xki
+2	2	2n	2n
+i=1
+2
+summing over from k = 0 to K - 1 on both sides, we have
+K-1	K-1
+--κααL XE∣∣GkIl2 + KK XE∣∣Vf(Xk)ll2
+k=0
+≤
+2(f(0)-f*) + αLσ2 +
+αK
+n
+That completes the proof.
+Lemma 9 Given two non-negative sequences {at}t∞=1 and {bt }t∞=1 that satisfying
+at
+t
+Xρt-sbs
+s=1
+with 0 ≤ ρ < 1,we have
+k
+Sk =	at
+t=1
+k
+Dk =Xat2
+t=1
+k
+Xbs
+s=1
+k
+≤ (1 - ρ)2
+b2s
+s=1
+1
+≤-----
+一I - P
+1
+27
+Under review as a conference paper at ICLR 2020
+Proof
+k	k t	k k	k k-s	k
+Sk = X at = XX ρt-sbs = XX ρt-sbs = XX Ptbs ≤ L X bs
+t=1	t=1 s=1	s=1 t=s	s=1 t=0	s=1
+Dk
+k	kt	t
+Xat=XXρt-sbsXρt-rbr
+t=1	t=1 s=1	r=1
+kk	ktt
+XXρt-sbs=XXXρ2t-s-rbsbr
+ktt	2	2 ktt
+≤ XXX PjT 中=XXX PjT b* 1 2 3 4 5 6 7 8 9 10 112
+t=1 s=1 r=1	t=1 s=1 r=1
+kt
+ι-ρ XX pF
+t=1 s=1
+k
+Xbs2
+s=1
+Lemma 10 For any Xt ∈ Rd×n, we have
+kT1
+XXt
+t=0
+≤
+1
+(I-TF
+Proof
+kT1
+XXt
+t=0
+- W kTtT1
+2
+2
+That completes the proof.
+G MONIQUA ON D2 (PROOF TO THEOREM 3)
+G.1 Algorithm
+Algorithm 2 Moniqua with Variance Reduction on worker i
+Input: initial point x0,i = x0, step size a, the discrepency bound θ, communication matrix W,
+number of iterations K, neighbor list of worker i: Ni
+1: for k = 0,1, 2,…，K — 1 do
+2:	Randomly sample data ξk,i from local memory
+3:	Compute a local stochastic gradient based on ξk,i and current weight xk,i: gek,i
+4:	if k = 0 then
+5:	Update local weight:工卜十 ι,% J xk,i — αgk,i
+6:	else
+7:	Update local weight: Xk+1,% ― 2xk,% — xk-ι,i — αgk,i + αgk-ι,i
+8:	end if	x
+9:	Compute modulo-ed model: qk,i J θ ∙ Qδ ( k+θ2,i mod 1) (element-wise division and
+mod)
+10:	Average with neighboring workers:: Xk+ι,i J Xk+1,i + Pj∈Ni (qk,j — qk,i)Wji
+11: end for
+Output： XK = n Pn=I XKi
+28
+Under review as a conference paper at ICLR 2020
+G.2 Assumptions
+D2 makes the following assumptions (1-4), and we add the additional assumption (5):
+1.	Lipschitzian Gradient: All the function fi have L-Lipschitzian gradients.
+2.	Communication Matrix: Communication matrix W is a symmetric doubly stochastic
+matrix. Let the eigenvalues of W ∈ Rn×n be λι ≥ ∙∙∙ ≥ λn. We assume λ? < 1,λn > - ɪ.
+3.	Bounded Variance:
+Ea~Di||vfe(Xi； ξi) -Vfi(x) ∣∣2 ≤ σ2, ∀i
+where V∕i(χ; ξi) denotes gradient sample on worker i computed Via data sample ξi.
+4.	Initialization: All the models are initialized by the same parameters: x0,i = x0, ∀i and
+with out the loss of generality x0 = 0.
+5.	Gradient magnitude: The norm of a sampled gradient is bounded by kgek,i k∞ ≤ G∞ for
+some constant G∞ .
+G.3 Proof to Theorem 3
+Proof From a local view, define x-1 = ge-1 = 0, the update rule of Moniqua on D2 on worker i in
+iteration k can be written as
+Xk+1 ,i = 2xk,i - Xk-I,i - agk,i + αgk-i,i
+nn
+xk+1,i = X xk+1 ,j Wji + X ((qk,j -xk+2,j) - (qk,i- xk+2,i)) Wji
+j=1	j=1
+From a global view, the update rule can be written as
+Xk+ 1 = 2Xk - Xk-I- αGk + αGk-1
+Xk+1 = Xk+1W + (Qk- Xk+2)(W -1)
+Define
+Qk = (Qk- Xk+ 2 ) (W - I)
+Since W is symmetric, it can be diagonalized as W = PΛP>, where the i-th column of P and Λ are
+W’s i-th eigenvector and eigenvalue, respectively. And we obtain
+Xk+1 = 2XkPΛP> - Xk-ιPΛP> - αGkPΛP> + aGk-iPΛP> + Ωk
+and
+__ _ __ _ . __ _ . ≈ _ . ≈, _ . _
+Xk+ιP = 2Xk P Λ — Xk-iP Λ — αGek P Λ + αGek-iP Λ + Ωk P
+Denote Yk = XkP, H(Xk; ξk) = GkP, and denote yk,i, hk,i and rk,i as the i-th column of Yk, Hk
+and ΩkP, respectively. Then we have
+yk+1,i = λi(2yk,i - yk-1,i - αhk,i + αhk-1,i) + rk,i
+From Lemma 15 (Constants C1, C2, C3 andn C4 are defined in the Lemma 11. Constants D1 and D2
+are defined in Lemma 15) we get
+(l- 3CCL2) EkVf(0)k +
+K-1	K-1
+1 - aL - 3 Cfα4L4) κ X e ∣∣Gk∣∣2 + κ X EIIVf(X k )∣∣2
+4	k=1	k=0
+≤ 2(f(0)- f *)
+一 ɑK
++ αLσ2 +
+n
+3Cια2L2(σ2 + ς2)
+C4K
++ 6 C2 α2σ2L2 + 3 之 α4σ2L4
+C4	nC4
+29
+Under review as a conference paper at ICLR 2020
++
+C3L2 (3D∖n + 4
+C4	3 3D2n
+2
+α2G∞d
+Let Q = 一尸工-----,we have
+σ,K∕n+2L
+K-1
+N X EIIVf(Xk)∣∣2 *
+k=0
+≤
+2(f(0)—f *)+ αLσ2 +
+αK
+(3D1n + 4
++ V 3D2n
+n
+2 C3L2
+C4
+3C1α2L2(σ2 + ς2)
+G∞dɑ2
+C4 K
++ 6 C2 α2σ2L2 + 3 M α4σ2L4
+C 4	nC 4
+≤
+4(f (0) — f*)L + 2σ(f(0)- f* + L/2)
+ι	3C2nσ2L2	ι
++ C4(σ4K2 + 16n2L4) +
+3Dιn + 4 ∖2
+3D2n )
+3C1L2 (σ2 + ς2 )n	6C2L2σ2n
+C4(σ2K2 +4nL2K) + C4(σ2K + 4nL2)
+C3G∞dL2n
+C4(σ2K + 4nL2)
+K
+√ nK
++
+σ2n
+.ɪ + σ + (σ2 + ς2)n +
+.K + √nK + σ2K2 + nK + σ2K +
+σ2n	G∞dn
+n + σ4K2 + n2 + σ2K + n
+σ
+σ2n
+.K■十 √nκ + σ2κ+
+ + G∞ dn
+n σ2 K + n
+σ
+That completes the proof.
+G.4 LEMMA FOR D2
+Lemma 11 Define
+D1 = max 卜n∣ +
+D2 = max
+2∣λn∣
+T-H,
+2
++⅛)
+2
+1 - ∣vn∣，√1 — λ
+Vn
+—
+—
+Let δ = 6nD2, and we have for ∀i, j
+卜k+1 (ei — ej) Il	≤ θ = (6D1n + 8)aG∞
+Proof We use mathematical induction to prove this:
+I. When k = 0,
+
+
+—αGo(ei - ej) ∣ ∣	≤ α ∣∣Go∣∣ɪ	∣∣ei — ej∣1 ≤ 2αG∞ ≤ (6D1n + 8)&G∞
+II. Supposefor k ≥ 0, Vt ≤ k, we have ∣∣Xt+1 (ei — ej )∣∣ ≤ (6D1n + 8)ɑG∞, thenfor ∀i,j
+IlXk+1(Ci — ej )k∞
+≤ Xk+1
+eiJL+
+Xk+1 I 京
+j∣∣∞
+Xk+1PP τei — Xk+1P
+0-
+0
+0
+—
+I
+0
+0
+0
+0
+0
+0
+0
+0
+—
+0
+0
+0
+0
+∞
+30
+Under review as a conference paper at ICLR 2020
+Xk+ιPP Tej
+-Xk+1P
+「0	0	0	..
+0	1	0	..
+≤ Xk+ιP 0	0	1	..
+•	∙	∙	.
+.	.	.	.
+...	.
+|_0	0	0	..
+「0	0	0
+0	1	0
+≤2√n	Xk+ιP	0	0	1
+...
+...
+...
+0 0 0
+kP TeikI +
+1,∞
+「0
+0
+Xk+ιP 0
+.
+.
+.
+0
+kP Tej kι
++
+0
+0
+1
+0
+0
+0
+1
+1
+0
+0
+From the update rule, we have
+yk + 1,i = λi(2yk,i - yk-1,i - ahk,i + αhk-1,i) + rk,i = λi(2yk,i - yk-1,i) + λiβk,i + rk,i
+whereβk,i = —αhk,i + ahk-ι,i,forall yi with — 3 < λi < 0, from Lemma 13we have
+/ uk + 1 - vk + 1∖	ʌ	uk-s + 1 - vk-s+1
+yk+ι,i = yι,i ( ------- ) + X(λiβs,i+ rs,i)---------------
+∖	Ui - Vi	/ M	Ui - Vi
+where Ui = λi + ,λ2 - λi and Vi = λi — ,λ2 - λi, we obtain
+∣∣yk+1,ik∞ ≤ ∣∣y1,i∣∣∞
+k+1	k+1I	k
+「一 ∣+%ιχ ∣βs,i ∣∞
+k-s+1	k-s+1
+Ui+-Vi十
+Ui - Vi
+k
++ ∑ krs,i∣∞
+s=1
+k-s+1	k-s+1
+Ui	+ - Vi	+
+Ui - Vi
+Since
+n+1	n+1
+ui+	- Vi +
+Ui - Vi
+≤ |Vi|n
+Ui - Vi
+≤ |Vi|n
+We obtain
+kk
+∣yk+1,i∣∞ ≤ ky1,ik∞ ∣Vi∣k + |%| X ∣βs,ik∞ IVilk-S + X ∣rs,i∣∞ IVilk-S
+s=1	s=1
+For βs,i, we have
+∣βs,ik∞ = k-αhk,i + αhk-1,ik∞ ≤ 2α(khk,ik∞ + Mk-1,i∣∞)
+≤2α(∣Gk k1,∞kPei∣1 + ||向-1||12|田加1)
+≤2α√nG∞
+For r§,i, we have
+llrk,i∣∞ = kΩkPeik∞ ≤ l∣Ωkk1,∞ IIPeik1 ≤ 2√nδθ
+when λi < 0, we have
+kk
+∣yk+1,ik∞ ≤ ky1,ik∞ ∣Vi∣k + ∣λi∣ X ∣βs,i∣∞ IVilk-S + X ∣rs,i∣∞ IVilk-S
+s=1	s=1
+31
+Under review as a conference paper at ICLR 2020
+kk
+≤ ∣y1,ik∞ ∣Vn ∣k + ∣λn∣ X 假,ik∞ ∣Vn∣k-s + X 帆,ik∞ ∣Vn∣k-s
+s=1	s=1
+∞	∞
+≤α√nG∞∣Vn∣k + 2α√nG∞∣λn∣ X ∣vn∣k-s + 2√ηδθX ∣vn∣k-s
+s=1	s=1
+,	，2α√nG∞∣λn∣ , 2√nδθ
+≤αVnG∞|Vn| H-；-i i-+ ：；-i F
+1 — ∣Vn∣	1 — ∣Vn∣
+where Vn = λn — √λn — λn.
+On the other hand, when 0 ≤ λi < 1 ,from Lemma 13 we have
+k	k	k
+yk+ι,i sin θi =yι,iλi2 sin[(t + 1)θi] + λi EeS,iλ产 sin[(k + 1 — s)θi]
+s = 1
+k
+k — s
++ ɪ2 rs,iλi 2 sin[(k + 1 — s)θi]
+s=1
+By taking norm, we get
+k
+l∣yk+ι,ik∞ ∣ Sinθi∣ = ∣∣yι,i∣∣∞ λi21 sin[(t + 1)θi]∣ + % X 岷,小匕 ∣λ尸∣∣ sin[(k + 1 — s)θi]∣
+s = 1
+k
+k S
++ El∣r≡,ik∞ ∣λi2 ∣∣sin[(k +1 — s)θi]∣
+s = 1
+∞
+∞
+k	w-S	w-S
+≤ ∣∣yι,i∣∣∞λ2 + 2α√nG∞λ2ɪ2λ22 + 2√nδθɪ2λ22
+s=1
+/ Lc 八一	20√nG∞λ2 + 2√nδθ
+≤ α√nG∞ √λ2 +-------,	------
+V 1 —入2
+Since ∣ sin θi∣ ≥ √1 — λ2, putting it back, we get
+s = 1
+∣∣yk+ι,i∣∣ ≤ α√nG∞
+2a√nG∞λ2 + 2√nδθ
+-⅛ +
+1 一 λ2
+So there exists D1,D2
+D1 = max ∣∣vn∣ +
+D2 = max
+1 - ∣vn∣ √1 — λ2
+2∣λn∣
+1-Kl,
+2
++
+1 — λ2
+2λ2
+)
+2
+such that
+∣∣yk+ι,i∣∣∞ ≤ Dιa∕nG∞ + ∏2√nδθ
+Putting it back we have ∀i, j
+IlXk+ 1(ei — ej)∣∣∞ ≤ DIanG∞ + D2nδθ
+As a result
+∣∣χk+2 (ei—ej)||
+∞
+=∣∣(2Xk
+—Xk-1 — αGk + αGk-I)(ei — ej )
+∞
+≤2 IlXk(ei — ej )∣∣∞ + IlXk-I(ei — ej )∣∣∞ + α ||Gk
+18 Iiei— ej ∣∣1 + α ∣∣ Gk-JI] OOkei— ej ι∣ι
+32
+Under review as a conference paper at ICLR 2020
+<3(D1αnG∞ + D2nδθ) + 4aG∞
+<(6D1n + 8)aG∞
+The last step is because δ = q^d^
+Combining I and II we complete the proof.
+Lemma 12
+n K
+(1 - 12Qα2L2) XXE IIXk - Xk,iII2
+i=1 k=1
+<3C1α2nσ2 + 3C1α2nς2 + 3Qα2nE |尸/(0)∣ + 6Qα2nσ2K + 3Qα4σ2L2K
+K-1
+K-1
++3Qα4nL2 X EIIGkII2 +。3 X E∣ΩkIlF
+k=1
+k=1
+Proof
+n
+EI IX k-xk
+i=1
+i=1
+Xk (I- ɪnɪɪ
+n
+IlXkPPT - XkvIvIIF
+n
+M2 = X Xk
+-ɪr)II2
+2
+F
+Lemma 14
+Xk P
+0H
+1-∣ I I F
+n
+X ∣yk,i∣2
+i=2
+From the update rule, we obtain,
+yk + 1,i = λi(2yk,i - yk-1,i - ahk,i + ahk-1,i) + rk,i
+λi(2yk,i
+-yk-1,i) + λiβk,i + rk,i
+whereβk,i = -ahk,i + ahk-ι,i,forall yi with — ∣ < λi < 0, from Lemma 13we have
+k k+1	k+1
+Ui + - Vi +
+yk+1,i = y1,i I
+Ui - Vi
+k
++ E(λiβs,i + rk,i)
+s = 1
+k-S+1	k-S+1
+Ui + - Vi	+
+Ui - Vi
+where Ui = λi + ,λ2 - λi and Vi = λi — ,λ2 - λi, we obtain
+l∣yk+ι,ik2 ≤ 3 ∣∣yι,ik2
+k+1	k+1
+ui+ - vi +
+Ui - Vi
+2
+Uk-S+1 - Vk-S+1 lʌ
+Ui	Vi	l I
+Ui- Vi	I
+0
+0
+0
+0
+0
+1
+0
+0
+0
+0
+1
+0
++ 3 (X kill
+k-s+1	k-s+1
+Ui + - Vi +
+ui - Vi
+Since
+n+1	n+1
+ui+ - Vi
+ui - Vi
+≤ ∣Vi∣n
+n
+-Vi
+Ui - Vi
+∣Vi∣n
+Ui	ui
+<
+We obtain
+lyk+1,ik2 ≤3用2…3"2 (Xkβs,ik∣ Vi ∣ k-s)2
++ 3 (XkrS,i∣∣∣Vi∣k-s)
+33
+Under review as a conference paper at ICLR 2020
+Summing over from k = 0 to t = K - 1, we obtain
+K
+K-1
+∣yk+1,i ∣2 =	∣yk,i ∣2
+k=0	k=1
+K-1	K-1
+≤3kyι,ik2 X ∣Vi∣2k + 3λ2 X
+≤ 3 ky1,ik
+^1 -∣Vi∣
+k=0
+2
+2+
+3λi2
+k=1
+K-1
+Xk kβs,ik |vi|k-s
+(1 - |vi|)2
+≤ 3 kyι,ik2 ,	3λn
+-1-∣Vn∣2 + (1 -|vn|)2
+kβk,i k +
+k=1
+K-1
+X kβk,ik2 +
+k=1
+3
+(1 -∣Vi∣)2
+2 K-1 k	2
++ 3 X X krs,ik∣Vi∣k-s
+k=1	s=1
+K-1
+X ∣rk,i∣2
+3
+(1 -|Vn|)2
+k=1
+K-1
+X krk,ik2
+k=1
+where Vn = λn — y2λ- - λn.
+On the other hand, when 0 ≤ λi < 1, from Lemma 13 we have
+k	Jl	k-s
+yk+ι,i sin θi =yι,iλi2 sin[(t + 1)θi] + λi £β§,内 2 sin[(k + 1 - s)θi]
+s=1
+k
+k — S
++ ɪ2 rs,iλi 2 sin[(k + 1 - s)θi]
+s=1
+And we have
+kyk+ι,ik2 sin2 θ ≤ 3 ∣∣yι,ik2 λk sin2[(t + 1)θi] + 3λ2 (Xβs,iλpr sin[(k + 1 - s)θi]
++ 3 (X rs,iʌɪ sin[(k + 1 - s)θi])
+2
+≤ 3 kyι,ik2 λk + 3λ2 (X βs,iλik-s!	+3 (X rs,iλT-s!
+Summing from k = 0 to K - 1, we have
+K
+K-1
+kyk+1,i k2 sin2 θi = Σ kyk,ik2 sin2 θi
+k=0
+K-1
+≤3ky1,ik2	λit + 3λi2
+k=1
+K-1
+≤ 3 ky1,ik
+一 1 - λi
+k=0
+2
+3λi2
+k=1
+(I- √λi)2
+(X kβs,ik λi号!2+3 X1 (X rs,iλ尸!2
+s=1	k=1	s=1
+3 K-1
+(1 -√λi)2 X krk,ik2
+K-1
+X ∣βk,i∣2 +
+k=1
++
+Since sin2 θi = 1 - λi, we have
+X ∣,, ,k2 ≤ 3 ky1,ik2 +
+⅛" ,il1 - (1-λi)2	(1 - √λi)2(1 - λi)
+≤ 3 ∣yι,ik2 ι	3λ2
+(1 - λ2)2	(1 - √λ2)2(1 - λ2)
+3λi2
+K-1
+X kβk,ik2 +
+k=1
+K-1
+X kβk,ik2 +
+k=1
+(I - √λi)2(1 - λi)
+K-1
+X krk,ik2
+(I- √λ2)2(1 - λ2)
+k=1
+K-1
+X krk,ik2
+k=1
+3
+3
+34
+Under review as a conference paper at ICLR 2020
+So there exists C1 , C2 , C3
+C1
+max{r÷ψ，
+1- |vn|2
+3
+(1 — λ2)2
+max
+3λn 3λ2
+(I-IvnI)2，(1 — √λ2)2(l — λ2)
+(	3	3
+1(1 -IvnI)2,(1 -√λ2)2(i - λ2)
+K	K-1	K-1
+X kyk,ik2 ≤ C1 ky1,ik2 + C2 X kβk,ik2 + C3 X krk,ik2
+k=1	k=1	k=1
+By taking expectation we have
+K	K-1	K-1
+X E kyk,ik2 ≤ C1E ky1,ik2 + C2 XEkβk,ik2+C3 XEkrk,ik2
+k=1	k=1	k=1
+We next analyze βk,i:
+n
+XE kβk,ik2
+i=2
+n
+α2 X E khk,i - hk-1,ik2
+i=2
+n2
+α2XEGekPei - Gek-1P ei
+i=2
+n2
+≤α2 X E GekP ei - Gek-1P ei
+i=1
+≤α2E GekP - Gek-1P 2
+Lemma 14	2
+≤ α2E Gek - Gek-1
+n2
+=α X E Gek ei - Gek-1ei
+i=1
+n2
+≤3α2 X E Gekei - Gkei	+ 3α2
+i=1
+n
++3α2 XE kGk ei - Gk-1ei k
+i=1
+n2
+X E Gek-1ei - Gk-1ei
+i=1
+n
+≤6α2nσ2 + 3α2 XE kGk ei - Gk-1eik2
+i=1
+n
+≤6α2nσ2 + 3α2L2 X E kxk,i - xk-1,i k
+i=1
+n
+≤6α2nσ2 +3α2L2XE YkP>ei - Yk-1P >ei2
+i=1
+≤6α2nσ2 + 3α2L2E YkP> - Yk-1P >2F
+Lem≤ma 146α2nσ2 + 3α2L2E kYk - Yk-1k2F
+35
+Under review as a conference paper at ICLR 2020
+n
+≤6α2nσ2 + 3α2L2 X E kyk,i - yk-1,i k2
+i=1
+And Putting it back, we have
+nK
+XXEkyk,ik2
+n K-1	K-1 n
+≤C1EkY1k2F +C2 XX
+E kβk,ik2 + C3 XX
+E krk,ik2
+i=2 k=1	k=1 i=2
+K-1	n	K-1 n
+≤C1EkY1k2F	+C2	X	6α2nσ2	+ 3α2L2	X E kyk,i -	yk-1,ik2	+C3	XX
+E krk,ik2
+k=1	i=1	k=1 i=2
+Lemma 14	2
+≤ C1E kY1 k2F + 6C2α2nσ2K + 3C2α2L2
+K-1 n	K-1
+XX
+E kyk,i - yk-1,ik2 + C3 X E∣∣Ωk∣∣F
+k=1 i=1	k=1
+Since
+E ∣yk,1 - yk-1,1 ∣	= E ∣XkPe1 - Xk-1P e1 ∣	= E ∣Xkv1 - Xk-1v1 ∣
+2
+=E
+nE∣∣X k — X k-ι∣∣2
+≤nα2E∣∣Gek — Gk∣∣2 + na2E∣∣Gk∣∣2 ≤ nα2+ nα2E∣∣Gk∣∣2
+=α2σ2 + nɑ2E∣∣Gk∣∣2
+Putting it back, and we obtain
+nK
+XXE∣yk,i∣2
+i=2 k=1
+K-1
+≤C1E∣Y1∣2F + 6C2α2nσ2K + 3C2α4σ2L2K + 3C2α4nL2 X E∣∣Gk ∣∣2
+k=1
+K-1 n	K-1
++3C2α2L2 XX
+E∣yk,i- yk-1,ik2 + C3 X E∣Ωk∣F
+k=1 i=2	k=1
+K-1
+≤C1E∣Y1∣2F + 6C2α2nσ2K + 3C2α4σ2L2K + 3C2α4nL2 X E∣∣Gk ∣∣2
+k=1
+K-1 n	K-1
++6C2α2L2 XXE ∣yk,i∣2 + ∣yk-1,i∣2 +C3 XE∣ΩkkF
+k=1 i=2	k=1
+K-1
+≤C1EkY1k2F + 6C2α2nσ2K + 3C2α4σ2L2K + 3C2α4nL2 X E∣∣Gk ∣∣2
+k=1
+K-1 n	K-1
++12C2α2L2 XX
+E kyk,ik2 + C3 X E ∣ΩkkF
+k=1 i=2	k=1
+Rearrange the terms, we get
+nK
+(1 - 12C2α2L2) X X E kyk,ik2
+i=2 k=1
+36
+Under review as a conference paper at ICLR 2020
+K-1	K-1
+≤C1E kY1∣∣F + 6C2α2nσ2K + 3C2α4σ2L2K + 3C2α4nL2 X叫Gk『 + C3 X E∣∣Ωk∣∣F
+k=1	k = 1
+K-1	K-1
+≤C1E ∣X1 ∣F + 6C2α2nσ2K + 3C2α4σ2L2K + 3C2α4nL2 X叫向『 + C3 X E∣ΩkIlF
+k=1	k=1
+Considering
+EkXIkF = α2E∣∣G0∣∣2
+n	2
+=α2 X E ∣∣G0,i - G0,i + G0,i - Vf(0) + Vf(0)∣∣
+i=1
+n	2	n	n
+≤ 3α2 XE ∣∣G0,i - G0,J∣ + 3α2 XE |鱼,，-Vf (0)∣2 + 3α2 XEkVf (0)∣2
+i=1	i=1	i=1
+≤ 3α2nσ2 + 3α2nς2 + 3α2nE ∣Vf (0)∣
+Wefinally get
+n K
+(1 - i2C2α2L2) XXEkyfc,ik2
+i=2 k = 1
+nK
+=(1 - i2C2α2L2) XXE∣∣Xk - Xk,i∣∣2
+i=1k=1
+≤3C1α2nσ2 + 3C1α2nς∣2 + 3C1α2nE ∣Vf (0)∣ + 6C2α2nσ2K + 3C2α4σ2L2K
+K-1	K-1
++3C2α4nL2 X E∣∣Gk∣∣2 + C3 X E∣ΩkkF
+k=1	k=1
+That completes the proof.
+Lemma 13 Given P ∈ (-3, 0)U (0,1), for any two sequence {at}∞=1, {bt}∞=1 and {ct}∞1 that
+satisfying
+a0 = b0 = 0,
+at+1 = P (2at — at-i) + bt — bt-1 + ct, ∀t ≥ 1
+we have
+(ut+1 - vt+1∖	3c 1	、(Ut-S+1 - vt-s+1∖ J
+%1 = a1 ( U-V J+ Bbs - J + CS) (-F—户 ≥ 0
+where
+U = P + √P2-ρ, V = ρ - vzρ2 - ρ
+Moreover, if 0 < ρ < 1, we have
+t sin[(t + 1)θ]	,τ T	、 t-s sin[(t — S + 1)θ]
+at+1 = aιρ2 — ∙ Q + >(bs - bs-1 + Cs)ρF —	. Q——
+sin θ	sin θ
+s = 1
+where
+θ = arccos (√ρ)
+Proof when t ≥ 1, we have
+at+1 = 2ραt — Pat-I + bt — bt-1 + Ct
+since,
+U = P + √ρ2 - ρ,v = P - √ρ2 - P
+37
+Under review as a conference paper at ICLR 2020
+we obtain
+at+1 - uat = (at - uat-1)v + bt - bt-1 + Ct
+Recursively we have
+at+1 — Uat = (at — Uat-I)V + bt — bt-1 + Ct
+=(at-1 — uat-2)v2 + (bt-1 — bt-2 + Ct-1)v + bt — bt-1 + Ct
+t
+=(a1 — ua0)vt +〉：(bs — bs-1 + Cs)vt S
+S=1
+t
+=a1vt + ^X(bS - bS-1 + CS)Vt S
+S=1
+Dividing both sides by ut+1, we have
+at⅛ = at+u-(t+1) (a1vt + E(bs- bs-1 + cs )vt-)
+uu
+S=1
+t-1
+=-∣ΞΞ1 + u-t ( a1vt-1 + E(bs - bs-1 + CS)vt-1-s
+u	S=1
++ u-(t+1) (a1vt + E(bs — bs-1 + CS)Vt-S)
+tk
+个 + E u-k-1 ( a1vk + E@ - bs-1 + CS)Vk-S
+k=1	S=1
+Multiplying both sides by ut+1
+tk
+αt+1 = a1ut + E Ut k ( a1vk + E(bs - bs-1 + CS)VtS
+k=1	S=1
+tk
++ Ut
+1-( v )t+1
+a1ut 1 +
+aιut
+k=0
+a∖ut
+ut+1 - v
+a1	-------
+u-v
+v
+u
+,t+1
++ ut∑ Σ(bs - bs-1 + CS)V
+k=1s=1
+t
+Σ2 £(bS- - + CS)V-S (uɔ
+S=1 k=S
+t
+)+ ^X(A - bs-1 + CS)
+S=1
+-s (U )k
+八 S 1-( v )t-S-1
+ut-s+1 - vt-s+1
+1 -
++ ut)：(b§ — bs-i + CS)V S
+k
+U
+1 - U
+U — v
+Note that when 0 < ρ < 1, both U and V are complex numbers, we have
+u = √ρeiθ ,v = √ρe-iθ
+where θ = arccos √ρ. And under this context, we have
+t sin[(t + 1)θ]	γt^∕τ	T	、 匕 sin[(t — S + 1)θ]
+at+1 = a1ρ2 —∖ J」+ 5 (bs - bs-1 + CS)PF -	. Q—―
+sin θ	sin θ
+S=1
+That completes the proof.
+Lemma 14 For any matrix X ∈ RN Xn, we have
+n
+E kχvik2
+i=2
+n
+EUXP F2
+i=1
+n
+≤ E "I2 = ιχιF
+i=1
+IIXP TIlF = IXkF
+38
+Under review as a conference paper at ICLR 2020
+Proof
+n	n
+X IIXtVik2 ≤ X IlXtVik2 = kXtPkF = Tr(XtPPTXJ) = Tr(XtXJ) = ∣∣Xt∣∣F
+i=2	i=1
+And similarly,
+n
+X IlXPTeiiI2 = IlXPTlIF = Tr(XtPtPXJ) = Tr(XtX7) = ∣∣XtkF
+i=1
+That completes the proof.
+Lemma 15 Ifwe run Algorithm 2 for K iterations thefollowing inequality holds:
+1 -
+3Cι α2L2
+C4
+EkVf (0)k + (1 - aL - 3C2α4L4) K X E
+K-1
++ K X EHVf(Xk)ll2
+k=0
+where
+≤ 2(f(0)- f *)
+一 ɑK
++ αLσ2 +
+n
+3Cια2 L2(σ2 + ς2)
+C4K
++ 6 C2 α2σ2L2 + 3 C α4σ2L4
+C4	nC4
+pDιn + 4 )
+I 3D2n )
+°1 = max{τ⅛, ∏⅛}
+max
+3λn 3λ2
+(I-IVnI)2，(1 - √λ2 )2(1 - λ2)
+33
+3 = max 1(1 -∣Vn∣)2 , (1-√‰)2(1-λ2)
+C4 = 1 - 12C2a2L2
+Ωk ei
+n
+X ((qk,j - xk+1 ,j ) - (qk,i - xk+ 2 ,i)) Wji
+j=i
+Proof Since
+X k+1 = (2Xk - Xk-1 - aGek + αGek-I)W^n + (Qk - Xk+ I)(W - I)
+=2X k — X k-1 — aGk + αGk-1
+and we have
+~V ~V _ ~V ~V	~K I ~K
+Xk+1 - Xk = Xk - Xk-1 - αGk + αGk-I
+k __	__
+=X1 - X0 - a X(Gt - GtT)
+一K
+-αGk
+As a result, we can reuse Lemma 8 from D-PSGD, thus we have
+1 — αL
+K
+K-1	K-1
+X EIIGkIl2 + K X EIIVf(Xk)ll
+k=0	k=0
+≤ 2(f(0)-f)
+一 ɑK
++ αLσ2 + 与 £ XEIIXk-Xk,iII2
+n nK
+k=0 i=1
+2
+39
+Under review as a conference paper at ICLR 2020
+From Lemma 12 we obatin
+1 - αL
+K
+K-1	K-1
+X EuGk『+ K X Ewf(X k)『
+k=0	k=0
+≤2(f(0)- f *)
+一 αΚ
++ aLσ2 + 3Cia"" + ς2 MkW(0W + 6C"L + 3&α4σ2L4
+n	C4 K	C4	nC4
+K-1
++3Cfa4L4K X EiIGk『+
+4	k=1
+C3L2
+C4nK
+K-1
+X E kΩk IlF
+k=1
+Rearrange the terms, we get
+(1 - 3°Ca L ) Ek▽/(O)k + (1 - aL - 3C2a4L4) K X ElIGkI∣2
+1 KT _
++ K X EH▽/(Xk)∣l
+k=0
+≤ 2(f(0)- f *)
+一 aK
+aLσ2 + 3Cιa2L2(σ2 + ς0) + 6C2 a2σ2L2 + 3且a4σ2L4
+n	C4 K	C4	nC4
+Lemma
+≤
+C3L2
+C4nK
+K-1
+X EkΩkkF
+k=1
+12(f(0)- f *)
+aK
+aLσ2 + 3Cia2L2(σ2 + ς0) + 6 C2 a2σ2L2 + 3 W a4σ2L4
+n	C4 K	C4	nC4
+C3L2 ( 3D in + 4 )
++ CcT I 3D2n )
+That completes the proof.
+Lemma 16
+K-i
+X EkΩkkF ≤
+k=0
+3D3≡+j )2 -
++
+Proof Similar to the case in D-PSGD, we have
+K-i	K-i n
+X EkΩkkF = XX E
+k=0	k=0 i=i
+n
+X Qqk,j - xk+1 ,j ) - (qk,i - xk+ 2 ,i)) Wji
+j=i
+2
+Lemma 3 K-i n	3Din + 4 2
+≤ 4∑ ∑δ2θ2d ≤	3D +	a2G∞dnK
+k=0 i=i	2
+That completes the proof.
+40
+Under review as a conference paper at ICLR 2020
+H Moniqua on AD-PS GD (Proof to Theorem 4)
+H.1 Algorithm
+Algorithm 3 Moniqua with Asynchronous Communication
+Input: initial point xo,i = xo, step size a, the discrepency bound θ, number of iterations K,
+quantization function Q, initial random seed
+1:	for k = 0,1, 2,…，K 一 1 do
+2:	worker ik is updating the gradient while during this iteration the global communication
+behaviour is written in the form of Wk .
+3:	Compute a local stochastic gradient with model delayed by τk: gek-τk,ik
+4:	Compute modulo-ed model: qk,ik - θ ∙ Qδ (Xk/ mod 1)(element-wise division and mod)
+5:	Randomly select one of the neighbors jk and average local weights with remote weights
+while subtracting the biased term: Xk+1 烈 J Xk,ifc + 2 qj — 2 qk,ifc
+6:	Update the local weight with local gradient: Xk+ι,ik J Xk,ik — agk-rk,ifc
+7:	end for
+Output： XK = n Pn=I XK,i
+H.2 Definition and Notation
+In the original analysis of AD-PSGD, to better capture the nature of workers computing at different
+speed, the objective function is expressed as
+n
+f (x) = X pifi (x)
+i=1
+where pi is a parameter denoting the speed of i-th worker gradient updates. In the rest of the proof,
+we denote p = maxi {pi }
+For simplicity, we also define the following terms
+PF(Xk ) = n [p1gk,1, ∙ ∙ ∙ ,pngk,n] ∈ Rd×n
+VF(Xk) = n [pιgk,1, ∙∙∙ ,pnek,n] ∈ Rd×n
+<V, — Γ -X.	1
+Gk = [∙∙∙ , ek,ik ,…]
+Gk = [∙∙∙ , gk,ik ,…]
+Λ =也—JI Wq
+an
+q=a
+H.3 Assumption
+We makes the following assumptions:
+1.	Lipschitzian Gradient: All the function fi have L-Lipschitzian gradients.
+2.	Communication Matrix 12: The communication matrix Wk is doubly stochastic for any
+k ≥ 0 and for any b ≥ a ≥ 0, there exists tmix such that
+b
+Wq I —
+q=a
+3.	Bounded Variance:
+Eξi〜DjVle(xn;ξn) — V∕n(x)∣∣ ≤ σ2,∀i
+12Please refer to Section E for more details
+41
+Under review as a conference paper at ICLR 2020
+E"{1,…,n}kVfi(X)-Vf (x)k2 ≤ ς2, ∀i
+where Vfi(x; ξi) denotes gradient sample on worker i computed via data sample ξi.
+4.	Bounded Staleness: There exists T such that τk ≤ T, ∀k
+5.	Gradient magnitude: The norm of a sampled gradient is bounded by kgek,i k∞ ≤ G∞ for
+some constant G∞ .
+H.4 Proof to Theorem 4
+Proof We start from
+K X EWf (X k)『+fι - 2αL)KK X EWF(Xk-Tk)『
+k=0	k=0
+Lemma 20 2n(f (0) — f *)	(σ2 + 6ς 2)aL
+αK	n
+2L2 +
+12αL3	1 K-1 n
+-----)与 ΣS ΣSpiE Xk
+nK
+2L2 K-1
++-K X E
+k=0
+(Xk - Xk-Tk ) ɪn	2
+n
+Lemma 21 2n(f (0) — f *)
+≤	ακ
+(σ2 + 6ς 2)ɑL	2a2T 2(σ2 + 6ς 2)L2
+n	n2
+n
+igk-Tk,i
+i=1
++ 2L2 +
+12aL3
+n
+24L4α2T2 A 1
+一n2	K K
+K-1 n
+XXiEXk-Tk
+k=0 i=1
+4α2T2L2 K-1
++ ~^K~ X E
+k=0
+4α2T2L2 K-1
++ -Kl^ X E
+k=0
+Lemma19 2n(f (0) — f *)
+≤	αK
+(σ2 + 6ς 2)ɑL	2a2T 2(σ2 + 6ς2) L2
+n	n2
+n
+igk-Tk,i
+i=1
++
++
+2
+2
+128α2t2 L2 2p K-1
++-a^x-1+6ς 2)p+K XE
+n
+igk-Tk,i
+i=1
+2
++ G2∞d
+where A1 = 1 — 192pα2 t2mix L2 as defined in Lemma 19.
+Rearrange the terms, we get
+1X叫IVf(Xk)『≤ 2n(f(0) — f*) + (σ2+ 6ς2)αL + 2α2T2(σ2 + 6ς2)L2
+K	αK	n	n2
+k=0
++ 128pα2tmixL2 (σ2 +6ς2) + 128α7miXL2 G∞d
+A1	A1
+By setting α = 2L+√K(σ2+6ς2)
+1 X EllVf (X )∣∣2 .1_ + √σ2 + 6ς2 + PtmX((J2 + 6ς 2)n2 + n2tmiχ G∞d
+K AE"	(Xk川.K +	√K	+ (σ2 +6ς2)K + 4L2 + (σ2 + 6ς2)K + 4L2
+.1 + √σ2 + 6ς2 + (j2 +6ς 2)tmiχn2 +	n2tmiχG∞d
+.K + —√K — + (σ2 + 6ς 2)K + 1 + (σ2 + 6ς 2)K + 1
+H.5 Lemma for Moniqua on AD-PSGD
+Lemma 17
+_ ≈ In 2	J2	1 ʌ _..	Q
+E Gk-Tk -	≤ n + n XPiEkgk-Tk,ik ,∀k ≥ 0.
+i=1
+42
+Under review as a conference paper at ICLR 2020
+Proof
+〜 n 2 n
+Gek-Tk ^n	≤ xPiE
+i=1
+n
+= X piE
+i=1
+gk-τk ,i
+gk-Tk ,i - gk-Tk ,i
+n
+n2
++ XpiE B 吐产 B
+i=1
+σ2	1 n
+≤ n + n X piE kgk-τk,ik2
+i=1
+Lemma 18
+nn
+X piE kgk-τk,ik2 ≤ 12L2 XpiE
+i=1	i=1
+2
++ 6ς2 + 2E
+n
+pigk-τk,i
+i=1
+2
+, ∀k ≥ 0.
+Proof
+nn
+X piE kgk-τk,ik2 = XpiE
+nn
+gk-τk ,i -	pigk-τk,i +	pigk-τk ,i
+i=1	i=1
+n
+≤ 2 X piE
+i=1
+n
+= 2 X pi E
+i=1
+gk-τk ,i
+gk-τk ,i
+n
+-	pigk-τk ,i
+i=1
+n
+-	pigk-τk ,i
+i=1
+n
++ 2 X piE
+i=1
+n
+pigk-τk,i
+i=1
+n
++ 2E BB	pigk-τk,i
+B i=1
+And
+n
+X piE
+i=1
+n
+gk-τk ,i -	pigk-τk,i
+i=1
+nn
+≤3XpiE∣∣gk-τk,i -Vfi(Xk-τk)B2 +3XPiE
+i=1	i=1
+n
++3XpiE
+i=1
+∣2
+nn	∣
+Epigk-Tk ,i- EpjVfj (X k-Tk)
+i=1	j=1	∣
+nn
+≤3L2 X piE ∣∣Xk-τk ,i- X k-τk∣∣2 +3 X piE
++3E
+∣2
+nn	∣
+Epigk-TkL Epj Vfj (X k-Tk)
+i=1	j=1	∣
+n
+≤3L2 XpiE
+i=1
+∣2
+n∣
+Vfi(Xk-τk) - X pj Vfj (X k-Tk )∣∣
+j=1	∣
+∣2
+n∣
+Vfi(Xk-Tk ) - X Pj Vfj(Xk-Tk )∣∣
+j=1	∣
+Xk-Tk (⅛n - e) ∣∣2 + 3XpiE ∣∣Vfi(Xk-Tk) - Vf(Xk-Tk)∣∣2
+n
++3 X pj E ∣∣gk-Tk ,j- v fj(X k-Tk )∣∣
+j=1
+n
+≤6L2XpiE
+i=1
+E
+n
+2
+2
+2
+2
+2
+2
+That completes the proof.
+43
+Under review as a conference paper at ICLR 2020
+Lemma 19 Let A1 = 1 - 192pα2t2mixL2,
+K-1 n
+XXpiE Xk-τk
+k=0 i=1
+Proof
+≤ 32α2tmiχ
+-Ai
+K-1
+(σ 2 + 6ς 2 )pK + 2p X E
+k=0
+n
+X piE
+i=1
+n
+X piE
+i=1
+k-1
+X-αGet
+t=0
+n
+X0==0XpiE
+i=1
+n
+≤2XpiE
+i=1
+Now for the first term, we have
+n
+2 X piE
+i=1
+n
+pigk-τk,i
+i=1
+- αGk-1-τk-1
+k-1
+XαGet-τtΛtk+-11ei
+t=0
+k-1
+X αGet-τt Λtk+-11ei
+t=0
+Now we replace k with k - τk, that is
+n
+X piE
+i=1
+2
+X"∣∣F 2-j k-τmχ-1 k!
+2
+2n
++ 2 X piE
+i=1
+≤8pα2 E
+2
++ G2∞dK
++ Ck-1
+k-1
+X ΩtΛk-ι1ei
+t=0
+2	k-1	2
+≤2pα2E X Get-τt Λtk+-11
+t=0	F
+≤2pα2 E
+≤8pα2 E
+2
+2
+≤2pα2EkX-1 Get-τtF Λtk+-11!
+n
++ 2 X piE
+i=1
+Summing from k = 0 to K - 1 on both sides, we obtain
+K-1 n
+XXpiE Xk
+2
+-Tk (^n -ei
+K-1	k-τk-1
+≤8pα2 XE X	Get-τt
+k=0
+t=0
+2
+_I k-τk-t-1 I ∖
+2 L	tmix	」
+F
+n K-1
+k-τk -1
+2
++ 2∑PiE E E ΩtΛk-τ
+k-1ei
+i=1	k=0
+t=0
+k-τk -1
+X	ΩtΛk-Tk-1ei
+t=0
+2
+44
+Under review as a conference paper at ICLR 2020
+2
+K -1	k-τk -1
+≤8pα2 X E( X	∣∣GtfHF 2-j" J)
+k=0	t=0	F
+n K-1 k-τk -1
++ 2XPi X E X kΩtk1,2 忖-TkTllIkeikI
+i=1 k=0	t=0	1
+2
+K-1	k-τk -1
+≤8Pα2 X E X	lllGet-τtlll
+k=0
+t=0
+2
+_ j k-τk-tT k ∖
+2 L	tmix	」
+F
+2
+k-τk -t-1
+Ex
+n K-1	k-τk -1
++ 8XPi X E X kΩtk1,2 2-∣
+i=1	k=0	t=0
+Lemma 22	K-1	k-τk-1 l	l
+≤ 8Pα2	E	llGet-τt ll
+k=0
+t=0
+2
+_ j k-τk-tτ k ∖
+2 L	tmix	」
+F
+n	K-1
++ 32tmiχ XPi X EkΩkk2,2
+i=1 k=0
+K-1	k-τk -1
+≤8Pα2 X E X	lllGet-τtlll
+k=0
+t=0
+2
+尸 2-j”工：Ik ) + 128δ2θ2dtmixK
+K-1
+Lemma 22	2
+≤	32pα2t2mix	E Gek-τk	+ 128δ2θ2dt2mixK
+k=0	F
+Note that for the first term, we have
+K-1	2
+X E ∣∣∣Gek-τk ∣∣∣F
+k=0
+K-1
+X E kgek-τk,ikk2
+k=0
+K-1	K-1
+X E kgek-τk,ik - gk-τk,ikk2+ XEkgk-τk,ikk2
+k=0	k=0
+K-1 n
+≤σ2K+XXPiEkgt-τt,ik2
+K-1 n	∣
+≤(σ2 + 6ς2)K + 12L2 XXPiE∣∣∣Xk-τk
+K-1
++2XE
+k=0
+n
+Pigk-τk,i
+i=1
+2
+Putting these two terms back, we obtain
+K-1 n ∣
+PiE ∣Xk-τk
+k=0 i=1
+In
+n
+—
+2
+K-1 n
+(σ2 + 6ς2)K + 12L2 XXPiE
+k=0 i=1
++128δ2 θ2 dt2mixK
+Rearrange the terms, we obtain
+Xk-τk
+—
+K-1
++2XE
+k=0
+(1 - 192pα%χL2) IX XPiE 卜一上(⅛n - e) ||2
+K -1
+≤32Pα2t2mix (σ2 + 6ς2)K+ 2	E
+k=0
+n
+Pigk-τk,i
+i=1
+2
++ 128δ2θ2t2mixK
+n
+Pigk-τk,i
+i=1
+45
+Under review as a conference paper at ICLR 2020
+Lemma 23
+≤	32α2t2mix
+K-1
+(σ2 + 6ς2)pK + 2p X E
+k=0
+n
+pigk-τk,i
+i=1
+2
++ G2∞dK
+Let A1 = 1 - 192pα2 t2mix L2, we obtain
+K-1 n
+X XpiE Xk-τk
+k=0 i=1
+≤ 32> 卜+6ς 2)pK+2pX1 E
+n
+pigk-τk,i
+i=1
+2
++ G2∞dK
+Lemma 20
+⅛X EWf(X k 升2+(1- 2αL) K X EuVF (Xk-Tk 升2
+k=0	k=0
+≤ 2n(f(0)- f *)
+一 αK
+2L2 K-1
++ -K X E
+k=0
++ 2L2 +
+12aL3) 1
+n K K
+K-1 n u
+XXpiEuuuXk-τk
+In -e"∣2 +(σ2 +6ς2)αL
+nu	n
+Proof We Startfrom f(X卜十、)Since
+X k+1 = Xk Wk ~nn + (Qk - Xk )(Wk - I) ^n - αGek-Tk = X k - αGek-Tk
+Then from Taylor ExpanSion, we have
+Ef(X k+1)
+=Ef(X k
+- αGk-τk
+≤Ef (X k ) - αEhVf(X k ), Gk-Tk i +..........-	E IIGek-Tk Il
+=Ef(Xk)	-	αEh Vf(Xk),	Gk-Tk i	- aEhVf(Xk),	Gek-Tk	- Gk-Tk i	+-2-E I Gek-Tk	I
+=Ef(Xk) - αEhVf(Xk), VF(Xk-Tk)i + α2LE g-k,ik
+n	k 2I n
+α = . a__—.—=’一 一
+≤Ef (X k) — — EhVf(X k), VF (Xk-Tk )i
+n
+2
+α2Ln
++	-- EpiE
+i=1
+gk-Tk,ik - gk-Tk,ik
+n
+n
++α-L XpiE Il y Il
+i=1
+22	2n
+≤Ef (X k) — - EhVf(X k), VF (Xk-Tk )i +	+ TT X piEkgk-Tk,ik2
+n	2n2	2n2
+i=1
+=Ef(X k) + 2- E IIVf (X k) - VF (Xk-Tk )II2 - -- E IIVf (X k )II2 - 2- EIIVF (Xk-Tk )II2
+2n	2n	2n
+-2 Lσ2	-2 L n	2
++ -n2 + 京 ΕpiEkgk-Tk,ik
+i=1
+Rearrange theSe termS, we can get
+2- EUVf(X k )II2+2- E ivf (Xk-Tk )II2
+nn
+≤ Ef(Xk) - Ef(Xk+1)+ 2nE IIVf(Xk) - VF(Xk-Tk)II2
+46
+Under review as a conference paper at ICLR 2020
+α2Lσ2	α2L ^ny	ll	2
++ 2n2 + 2n2 XPiEkgk-Tk,ik
+i=1
+Summing over k = 0 to K - 1 on both sides, we can get
+K-1	K-1
+K X EHVf(Xk)∣∣2 + K X EHVF(Xk-Tk)∣∣2
+k=0	k=0
+<2n(f (OK- f*,+k X EuVf(X k) - vf (Xk-Tk )∣∣2+αLσ2+αKκ ∑ X PiEkgk-Tk,ik2
+(_X_£	n	I VJ-
+k=0	k=0 i=1
+For PK=01 E∣∣Vf (Xk) -VF(Xk-Tk)∣∣2, we have
+K-1
+X E∣∣Vf(Xk) -VF(Xk-Tk)∣∣2
+k=0
+K-1
+K-1
+<2 X E∣∣Vf (Xk) - Vf(Xk-τk)∣∣2 + 2 X E ∣∣Vf (Xk-τk) - VF(Xk-Tk)∣∣2
+k=0
+K-1
+k=0
+K-1
+=2
+X ElIVf(Xk) - Vf(Xk-τk)∣∣2 + 2 X E	XPi (Vfi(Xk-Tk ) - gk-τk ,i)
+k=0
+K-1
+k=0
+K-1
+i=1
+n
+<2 X E∣∣Vf(Xk) - Vf(Xk-Tk)∣∣2 + 2 X EXPi ∣∣Vfi(Xk-Tk) - gk-Tk,i∣∣2
+k=0
+K-1
+<2L2 X E
+k=0
+k=0	i=1
+2	K-1 n
++ 2L2 X XPiE Xk
+k=0 i=1
+"I2
+n
+n
+—
+2
+Putting it back, we have
+K-1	K-1
+K X EIIVf(Xk)∣∣2 + K X EIIVF(Xk-Tk)∣∣2
+k=0	k=0
+< 2n(f (0)- f *)
+一 αK
+2L2 K-1
++ ~κ X E
+k=0
+(Xk - Xk-Tk ) ɪn 2
+n
+2 K-1 n
++ 2K- XXPiE
+k=0 i=1
+Xk-Tk
+In
+αLσ2	QL v-^ El	∣∣2
++ ~n- + nκ ∑ EPiEkgk-Tk,in
+k=0 i=1
+Lemma 18 2n(f (0) - f *)
+QK
+2L2 K-1
++ ɪ TE
+K
+k=0
+(Xk - Xk-Tk ) ɪn
+n
+n
+—
+2
+2 K-1 n
++ 2K- XXPiE
+k=0 i=1
+⅛n-"∣∣2+(Qf
+Xk-Tk
++nκ X (12L2 XPiE Xk-Tk( ^nn -e)∣∣+6ς 2+2e
+2n(f (0) - f *)	2L2 K-
++ ɪɪ-
+(Xk - Xk-Tk ) ɪn
+QK
+k=0
+E
+n
+2
++
+.12qL3
+2L2 +--------
+K-1 n
+K X XPiE
+k=0 i=1
+Xk-Tk
+n
+n
+EPigk-Tk ,i
+i=1
+47
+Under review as a conference paper at ICLR 2020
+Note that
+(σ2 + 6ς 2)aL
+n
+2αL K-1
++---τr E E
+nK
+k=0
+pigk-τk,i
+i=1
+n
+pigk-τk,i
+i=1
+2
+=EllVF (Xk-Tk )∣∣2
++
+
+Moving it to the left side, we finally get
+KKX EuVf(Xk )∣∣2+(1- 2αL) KKX EHVF (Xk-Tk )∣∣2
+k=0	k=0
+≤ 2n(f(0)- f*)
+一 ɑK
+2L2 K-1
++ -K X E
+k=0
++ 2L2 +
+12αL3	1 K-1 n ∣∣
+—)我 E EpiE Xk
+nK	∣
+ɪn-e)∣∣2+∖αL
+That completes the proof.
+Lemma 21 For all k ≥ 0, we have
+-l2 KT	-Ti 2
+ɪ X E (Xk - Xk-Tk) 比
+k=0
+2α2T 2(σ2 +6ς 2)L2
+≤ —F~-
+24L4a2T 2
+-n2κ
+K-1 n ∣
+XX E ∣∣Xk-Tk
+k=0 =1
++
++
+4α2T 2L2
+n2K
+K-1
+XE
+k=0
+gk-Tk,i
+=1
+Proof From Lemma 20, we know the fact
+X k+1 = Xk Wk ^n + (Qk - Xk )(Wk
+-I) nn - aGk-Tk
+Xk - aGk-Tk
+As a result
+KT	胃
+X E (Xk- Xk-Tk )，
+∣n
+k=0
+K-1
+XE
+k=0
+K-1	Tk	∣	∣2
+≤a2 X Tk X E Gk-t 区
+∣ n∣
+k=0 t=1
+K-1	Tk	2	n
+≤a2 X Tk X 飞 + * XpiEkgik2
+k=0 t=1 i=1
+a2T 2σ2K
+≤ -n2-
+≤ a2T纭衣
++
+2 K-1 Tk	n
+anT XXXPiEkgk-t,ik2
+k=0 t=1 i=1
+2 K-1 Tk	n	∣
++ W XX(12L2 X PiE Xk-t
+k=0 t=1	i=1
++ 6ς2 + 2E
+n
+igk-t,i
+i=1
+≤ a2T纭衣
++
+a2T2
+n2
+K-1
+X
+k=0
+n∣
+12L2XiE ∣∣Xk-Tk
+i=1
++ 6ς2 + 2E
+n
+igk-Tk,i
+i=1
+48
+Under review as a conference paper at ICLR 2020
+α2T 2(σ2 + 6ς 2)K
+n	+
+12L2α2T 2
+n2
+K-1 n
+X XPiE Xkf
+k=0 i=1
++
+2a2T 2
+n2
+K-1
+XE
+k=0
+n
+Epigk-Tk ,i
+i=1
+2
+And we get
+2/2 K-1
+E7~ E E (Xk - Xk-Tk
+K δ—y
+k=0
+2
+2α2T 2(σ2 +6ς 2)L2
+≤	n2
++
+24L402T 2
+-n2κ-
+K-1 n
+X XPiE Xk-Tk
+k=0 i=1
+In
+n
+4α2T 2 L2
+n2K
+K-1
+XE
+k=0
++
+n
+EPigk-τk,i
+i=1
+2
+That COmPIeteS the proof.
+Lemma 22 Given non-negative sequences {αt}∞=ι, {bt}∞=ι and {τt}∞=ι and a positive number T
+that satisfying
+t-Tt
+t —Tt―s
+at =	Pb T CbS
+s=1
+with 0 ≤ ρ < 1 ,we have
+k
+Sk = Eat ≤
+t=1
+F X bS
+' s=1
+k
+Dk = X a2≤
+t=1
+(2-P)T2
+(1 - P)2
+k
+X bS
+s = 1
+Proof
+k	k t-Tt	k t	k k
+Sk = X at = XX Pb。C bs ≤ XX ρmax( b。C，0)bs = XX ρmax( b ▼ C，0)bs
+t=1	t=1 s = 1	t=1 s=1	s = 1 t=s
+k k-Tk-s	k	Tk	k (T -1 ∞	∖	k	/	T 、 k
+X X Pb 蜀 bs + XX	ρ0bs	≤ XXX	Pm	bs	+	Tk	X bs ≤ T +	1-ρ	X bs
+s=1 t=0	s=1 t=1	s = 1 ∖t=0 m=0	)	s = 1	'	s=1
+k	k	t-Tt	t-Tt	k	t-Tt	t-Tt
+Dk = X a2 = XX Pb -C bs X Pb — Cbr= XXX Pb ' C + b — CbSbr
+t=1	t=1	s = 1	r=1	t=1	s=1	r=1
+≤ XXt Xtρbt-t-sC+bt-ττ-rCb2 + br
+t=1 s=1 r=1
+k t-Tt t-Tt
+t=1 s=1 r=1
+k t-Tt	T-1 ∞
+T≤XXb2ρb▼C XXPm
+t=1 s=1	r=0 m=0
+cs6 ≤
+k t-Tt
+k t-Tt	t-Tt
+XX b2Pb	C
+t=1 s=1
+1 - ρ t=1 s = 1
+UsingSk (2 - ρ)T2
+(1 - P)2
+k
+X b2
+s=1
+≤
+T
+Lemma 23 for Vi, j and Vk ≥ 0, we have
+||Xk (ei - ej )∣∣∞ ≤ θ = 16tmixaG∞
+49
+Under review as a conference paper at ICLR 2020
+Proof Similar to Section F and Section G, we use mathmatical induction to prove this.
+I.	First, for k = 0, we have
+IlXk(ei - ej)k∞ = 0 ≤ θ = 16tmiχαG∞
+II.	Supposefor k ≥ 0, we have ∣∣Xt(ei - ej)∣∞ ≤ θ, Vt ≤ k, then we have
+∣∣Xk+ι(ei — ej )∣∣∞
+In
+----ej
+n
+∞
+≤ Xk+1
+-—ei)[	+ Xk+1
+n 41 ∞
+=2
+V-ei
+1 + Xk+1 I / -
+kk
+E (-αGt-Tt +Ct) ( ∏ Wq
+t=0	∖q=t⅛1
+—
+1 Il 1,∞
+lnl>'
+n J
+1,∞
+k%kι
+1,∞
+≤2 Xk-+Ωt)(Π 明
+t=0 Il	∖q=t⅛1
+—
+n
+k
+≤2 ^X II -aGet-τt+ ω
+t=0
+/	1,∞
+lnl>ll
+k
+k ∏*
+,	q=t+1
+—
+k
+≤4(αG∞ + 2δθ) E 2-b(k-t)/tmix」
+t=0
+tmix-1 ∞
+≤4(αG∞ + 2δθ) E E 2-r
+t=0 r=0
+≤8(αG∞ + 2δθ)tmix
+Put in δ = 321—, we obtain
+32tmix
+||Xk + 1 (ei - ej)∣2 ≤ 8(ɑG∞ + 2δθ)tmix = 8tmixaG∞ + 8tmixaG∞ = 16tmixaG∞
+Combining I and II and we complete the proof.
+50

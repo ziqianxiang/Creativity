@@ -1,0 +1,919 @@
+﻿Published as a conference paper at ICLR 2022
+Toward Efficient Low-Precision Training:
+Data Format Optimization and Hysteresis
+Quantization
+Sunwoo Lee, Jeongwoo Park, Dongsuk Jeon
+Graduate School of Convergence Science and Technology
+Seoul National University, Seoul, Korea
+{ori915,jeffjw,djeon1}@snu.ac.kr
+Ab stract
+As the complexity and size of deep neural networks continue to increase, low-
+precision training has been extensively studied in the last few years to reduce
+hardware overhead. Training performance is largely affected by the numeric for-
+mats representing different values in low-precision training, but finding an optimal
+format typically requires numerous training runs, which is a very time-consuming
+process. In this paper, we propose a method to efficiently find an optimal format
+for activations and errors without actual training. We employ this method to deter-
+mine an 8-bit format suitable for training various models. In addition, we propose
+hysteresis quantization to suppress undesired fluctuation in quantized weights dur-
+ing training. This scheme enables deeply quantized training using 4-bit weights,
+exhibiting only 0.2% degradation for ResNet-18 trained on ImageNet.
+1 Introduction
+Deep neural networks have been used in various fields such as vision, audio, natural language pro-
+cessing, and reinforcement learning. As larger and more complex neural networks are adopted, the
+energy and time consumed for training have become a critical issue in hardware implementation.
+Using low-bit representations in training significantly reduces hardware overhead and memory foot-
+print; hence, neural network training with limited precision has been extensively studied recently.
+For instance, 16-bit formats are already adopted in commercial devices such as FP16 (IEEE, 2019)
+in Nvidia GPUs and bfloat16 (Kalamkar et al., 2019) in Google TPU (Wang et al., 2019). Also,
+Koster et al. (2017) suggested a new data format using a shared exponent suitable for low-precision
+training. Recently, it has been demonstrated that even 8-bit formats could be adopted in deep neural
+network training with reasonable accuracy (Sun et al., 2019; Fox et al., 2020). However, there are
+various issues in realizing low-precision training in practical applications as detailed below.
+Optimal data format for low-precision training: Training performance is susceptible to the data
+format we use to represent variables in the network. When a value is represented using a floating-
+point format with a fixed number of bits, there is a trade-off between dynamic range and precision.
+For instance, allocating more bits to the exponent part in a floating-point format enlarges the dynamic
+range but lowers precision due to fewer bits in the mantissa part. Recent studies on 8-bit training
+suggest various ways to reduce the dynamic range required for number representation to enhance
+representation precision. Early work on 8-bit training (Wang et al., 2018) adopts a 5-bit exponent
+to represent different variables using a single format, but Sun et al. (2019) examine the statistics
+of each variable and optimize the numeric formats separately. Specifically, the values used in the
+forward path (weight and activation) have a relatively narrow dynamic range, and only 4 bits are
+allocated to the exponent. Fox et al. (2020) propose to divide data into smaller blocks and assign a
+shared exponent bias to each block. Since the values in a block tend to exhibit similar statistics, the
+forward (weight and activation) and backward (error) paths could be represented using only 2-bit
+and 4-bit exponents, respectively. Note that the shared exponent bias is effectively identical to the
+scaling factor. If a variable has a value of m ∙ 2e and a shared exponent bias of b, then its actual
+value is m ∙ 2e+bias, which is identical to the scaling factor of 2bias. However, these approaches
+are difficult to generalize since we should empirically decide numeric formats for each task, neural
+1
+Published as a conference paper at ICLR 2022
+Different dataset
+Different quantization
+position
+Different model
+▲
+ycaruccA tenegamI 81tenseR
+Full-	From- Fine-tuning of
+precision	scratch	pre-trained
+model	training	model
+Ill
+■ ■ ■
+69.8%	67.7%	68.8%
+(a) Various quantized training environments	(b) Performance degradation in quan-
+tized models
+Figure 1: Two Challenges in low-precision training. (a) An optimal format varies with dataset,
+quantization scheme, and model. (b) There is a performance gap between from-scratch training
+with quantized weights and fine-tuning of a pre-trained full-precision model.
+network structure, and quantization scheme (Fig. 1). Furthermore, analyzing the statistics of each
+variable is not enough to determine an optimal format. Their distributions often have a long tail, and
+hence the dynamic range of the numeric format should be experimentally selected through many
+trial-and-errors in actual training.
+Performance degradation in from-scratch training: Previous studies on quantized models show
+that a model could achieve comparable accuracy to full-precision models even using 1- or 2-bit
+weights (Choi et al., 2019; Martinez et al., 2020) through fine-tuning a pre-trained model. However,
+in low-precision training where a neural network is trained from scratch using low-precision values
+and computations, the trained model typically shows a noticeable accuracy drop (Elhoushi et al.,
+2021). Fig. 1(b) shows the Top-1 validation accuracy of ResNet-18 (He et al., 2016) trained on
+ImageNet (Deng et al., 2009) for different training schemes. The weights are quantized into a 4-bit
+base-2 logarithmic format. From-scratch training of the model with quantized weights results in a
+2.1% accuracy drop, whereas only 1.0% degradation is observed ifwe fine-tune a pre-trained model.
+This suggests that even though a better solution (i.e., a set of parameters) exists for a given format,
+it cannot be reached through from-scratch training.
+To formalize the issues above, here we divide quantization in low-precision training into two types:
+network quantization and data flow quantization. Network quantization refers to the quantization of
+the neural network model. An example of this type of quantization is weight quantization. In net-
+work quantization, we need to reduce the performance difference between from-scratch training and
+fine-tuning (Yang et al., 2019b). On the other hand, data flow quantization refers to the on-the-fly
+quantization that occurs when data propagate through the network in low-precision training. Exam-
+ples include activation, error, and weight gradient quantizations. Additional errors are introduced in
+weight update computation due to this type of quantization, which leads to performance degradation.
+Hence, we need to find an optimal format to minimize accuracy drop due to computation errors in
+data flow quantization.
+In this paper, we present a systematic approach to implementing low-precision training on various
+models and tasks. First, we present a method to efficiently find an optimal format for data flow
+quantization. In addition, we introduce a hysteresis quantization technique, a new quantization
+method for network quantization that can mitigate the issues of from-scratch training. Our main
+contributions are:
+•	We present a method that can predict the training performance of various numeric
+formats for data flow quantization. This method allows us to determine an appropriate
+data format for different neural network structures, datasets, and tasks efficiently.
+2
+Published as a conference paper at ICLR 2022
+•	Using the method above, we propose an optimal 8-bit format suitable for low-precision
+training of various models, which enables quantization of BatchNorm layer input and im-
+proves hardware efficiency with minimal performance degradation.
+•	We propose a new quantization scheme that utilizes the hysteresis effect to improve
+the performance of from-scratch training in network quantization. This scheme enables
+ultra-low-precision training using 4-bit logarithmic weights.
+2	Data Flow Quantization
+2.1	Numeric Formats
+There are many numeric formats that can be constructed with n bits depending on how much dy-
+namic range is required and how many valid bits are used for representing a value. For example,
+using 8 bits we could implement 8-bit fixed point integer format, 8-bit floating-point formats such as
+FP152, FP143, and FP125 (FP1xy represents 1 sign bit, x exponent bits, and y mantissa bits), 8-bit
+posit format (Gustafson & Yonemoto, 2017), and 8-bit float-fix format (Han et al., 2019). Since
+the diversity of formats that could be formulated using n bits is nearly unlimited, here we assume
+some constraints to limit candidates while still including widely used formats such as fixed-point
+and floating-point formats as below:
+•	The MSB (Most Significant Bit) is used as a sign bit and other bits represent magnitude.
+Accordingly, only symmetric formats that have identical representable ranges for positive
+and negative numbers are considered. Two’s complement representation is slightly asym-
+metric since it can represent one more negative value, but it does not incur a significant
+difference.
+•	The number of valid bits of a larger value is greater than or equal to the number of valid
+bits of a smaller value. The valid bits stand for significant digits in binary representation.
+•	The ratio between consecutive representable values does not exceed 2. For example, the
+base-4 logarithmic format is excluded.
+We could obtain 166 8-bit formats that meet these constraints. Then, we reduce 1 and 2 valid bits
+in each format to obtain 7- and 6-bit formats, resulting in 498 formats in total. More information on
+the numeric formats considered in our experiments is provided in Appendix A.1.
+2.2	Activation and Error Quantization
+In a neural network consisting of n layers, the training process is described by
+Al+1 = fl(Wlt,Al)	(1)
+El = gl(Wlt,El+1)	(2)
+Gwl = hl(Al, El+1)	(3)
+Wlt+1 = o(Gwl, Wlt)	(4)
+where A, E, W, and Gw are activation, error, weight, and weight gradient, respectively. f, g, h,
+and o are forward, backward, gradient, and update functions. l and t represent the layer number and
+time step. We follow the quantized training scheme suggested by Fox et al. (2020), but with the
+following modifications to reduce hardware implementation costs. A and E are quantized not only
+for the GEMM input but also for the BatchNorm layer input. BatchNorm layer normalizes input
+using the mean and variance of each channel, but these values are obtained only after observing
+all the inputs from the previous layer, necessitating that all input values are temporarily stored in
+memory. Therefore, quantizing the BatchNorm layer’s input significantly reduces memory footprint
+and memory access overhead. Additionally, the scope of sharing exponent bias is extended to a
+layer (Al and El) to avoid the overhead of aligning partial sums from different blocks in block-wise
+exponent sharing. Finally, instead of determining the shared exponent bias by analyzing all values
+in the layer, we conservatively update it by detecting overflow and underutilization that occurred in
+the previous mini-batch.
+3
+Published as a conference paper at ICLR 2022
+10-2	2*1OT S*10^
+Training Loss
+^a⅞ +SOiSM
+虹 1l>τ IOr	2*1OT S*10^
+Training Loss
+Spearman's
+Correlatk>π=0.9215
+a c^k9fs,7
+EIWT I(Jr 2*1OT S*10^
+Training Loss
+Spearman's
+Com Iation=O .9283
+10-2	2*1OT Sw10^
+Training Loss
+(a) Error quantization
+(b) Activation quantization
+Figure 2: Training loss vs. proposed performance indicators. Blue dots represent full-precision
+training runs, and yellow, green, and red dots represent training runs with 8-, 7-, and 6-bit formats,
+respectively.
+2.3	Indicators of Training Performance
+Effect of quantized error: Quantizing the error E in the backward path is independent of how the
+forward path behaves since the loss surface of the model does not change. Therefore, the optimal W
+that the network needs to reach through training remains the same regardless of the error quantization
+scheme. However, when the error is quantized, a quantization error ∆E is introduced in E, which
+incurs a noise N∆E in Gw through the gradient function in Eq. 3 and potentially updates each weight
+in the wrong direction. While some amount of noise may improve the training performance through
+regularization, using low-precision formats already introduces a large noise in the network, incurring
+performance degradation (see Appendix A.8). Therefore, we suggest that the weight gradient error
+N∆E could be a good indicator of degradation in training performance. One way to implement this
+is predicting performance using the magnitude of N∆E; however, if the noise is in the same direction
+as Gw , it would only change the amount of each update and result in a less severe effect. Instead,
+we could measure the misalignment between Gw + N∆E and Gw for performance prediction. The
+misalignment between two vectors is estimated by
+∠(A,B)
+-1 f A ∙ B
+Cos	IPkrwZ
+(5)
+Then, the change in the update direction due to N∆E is ∠(Gw, Gw + N∆E). We can expect that the
+smaller ∠(Gw, Gw + N∆E), the better the training performance.
+Effect of quantized activation: Contrary to error quantization, activation quantization affects the
+way the forward path operates, and the loss surface of the model changes. Hence, the global optima
+of weight parameters shift, where the amount of shift would be proportional to the quantization
+noise. The displacement of global optima can be indirectly estimated using the direction of the
+weight gradients Gw . If the angle ∠(Gw , Gw + N∆A) is small, the deviation of the global optima
+is expected to be small as well, suggesting a better training performance.
+In the discussions above, we assumed that the angles ∠(Gw , Gw + N∆E) and ∠(Gw , Gw + N∆A)
+could be used to predict training performance. We experimentally prove this by comparing the
+training performance of different numeric formats. For 498 numeric formats in 6 to 8 bits, we
+compare the loss obtained from training with the proposed performance indicators (Fig. 2). Training
+loss is obtained by training ResNet-18 on CIFAR-10 dataset using SGD with a momentum of 0.9
+for 60 epochs. The batch size is 128 images and the initial learning rate is 0.1, which is decayed
+by a cosine scheduler. We average angles from 100 mini-batches after quantizing a pre-trained
+model. Note that we use Gw of the first layer since it can reflect quantization errors that occur in the
+activations and errors of all the layers in the network. The weight gradients from the full-precision
+network, the network with quantized activations, and the network with quantized errors are Gw ,
+Gw + N∆A , and GW + N∆E , respectively. Fig. 2 shows that using the misalignment angle results
+in not only a higher Spearman’s correlation but also a more distinct shape for low training losses,
+making it a better metric than the error magnitude. For instance, using the error magnitude would
+predict the best format for transformer incorrectly (see Fig. 8(e) in Appendix A.3). While obtaining
+the misalignment angle requires additional computations, its overhead is negligible since the part
+that requires the most time and computation is to obtain Gw , Gw + N∆E , and Gw + N∆A, which
+is still significantly lower than actual training. Using this method, we could determine the optimal
+format for a specific neural network model, dataset, and task very efficiently as we only need to
+4
+Published as a conference paper at ICLR 2022
+70m=0m30,°
+Is + so JN
+70m=0m3°
+10	20	30	40	50	60
+/(Gw,Gw+ Nδe)
+(b) ResNet-101 (ImageNet)
+70mm403°
+(3n+^哀 9ψ
+★
+Fail
+声1泞
+1197
+10	15	20	25
+N(GW, Gw + N∆f)
+(a) ResNet-18 (ImageNet)
+n « ∞ a W
+ɜs + M°-覆 9J7
+Z(Gw,Gw+N∆f)
+(d) 2-layer LSTM (PTB)
+★Fail
+20	30	40
+Z(Gw, Gw + NAE)
+(c) MobileNetV2 (ImageNet)
+7=70Mmk=0km
+ɜs + so -覆 9}7
+FP152
+FP143
+FP134
+INT8
+10	20	30	40	50	60
+Z(Gw,Gw + Nδξ)
+(f) MobileNetV2 + SSDLite (VOC)
+★ ★★
+5	10	15	20	25	30	35	40
+Z(Gw,Gw + Nδξ)
+(e) Transformer (IWLST)
+Figure 3: Scatter plots displaying misalignment angles for 166 8-bit formats. The numbers next to
+four selected data formats (INT8, FP152, FP143, and FP134) represent the loss measured in actual
+training.
+measure the misalignment angle without time-consuming network training. For experiments in Fig.
+2, the amount of computation is reduced by 99.6%, and the reduction will be even larger for larger
+datasets and complex networks that need more epochs for training.
+2.4	Optimal Format for Data Flow Quantization
+Here we show that we could find an optimal format for training with quantized errors and activations
+using the proposed performance estimation method above. To find a format suitable for a wide range
+of models, we select six models with different architectures, layer types, and target tasks that are
+widely used in quantized training research for experiments: ResNet-18, ResNet-101, MobileNetV2
+(Sandler et al., 2018), 2-layer LSTM, small transformer for translation on the IWSLT German to
+English dataset (Cettolo et al., 2014), and SSD-Lite (Liu et al., 2016) with MobileNetV2. We
+first measure misalignment angles for 166 8-bit formats. To verify the correlation between the
+training performance and the misalignment angles, we select four formats that exhibit low hardware
+implementation costs (INT8, FP152, FP143, and FP134) and train the networks using each format.
+While we may use different formats for activation and error, it requires a complicated datapath (Sun
+et al., 2019) and hence we only consider a single format for both variables. The experimental results
+in Fig. 3 demonstrate that the training performance is higher if both misalignment angles are small in
+all tasks and models, confirming that the proposed indicators could be used to determine the optimal
+numeric format. Fig. 3 suggests that FP134 and FP143 are the best candidates across all models.
+For hardware implementation, FP134 is the most optimal format due to its low implementation cost,
+which is discussed in Appendix A.7 in detail. Note that using the error magnitude leads to the same
+conclusion that FP134 is the best format for the target models. See Appendix A.3 for more details.
+3	Network Quantization
+In quantized neural networks, the weight parameters are generally quantized in a way that minimizes
+the quantization error (Choi et al., 2019; Martinez et al., 2020). For instance, if x is quantized
+into a fixed-point format through S X round( S), a proper value is selected for the scaling factor S
+to minimize the quantization error. However, as the weights continue to change during training,
+we need to calculate s for every update, which could cause significant overhead. Therefore, prior
+studies on low-precision training suggest constraining the scaling factor to the power of 2 in the
+shared exponent (Koster et al., 2017) or the shared exponent bias (Fox et al., 2020). In this section,
+5
+Published as a conference paper at ICLR 2022
+Qw
+3
+2
+1
+0	123
+(a) Conventional quantization
+3
+2
+1
+(b) Hysteresis quantization
+Figure 4: Comparison of quantization schemes.
+0
+we analyze the issues behind weight quantization and propose a new quantization scheme to mitigate
+those issues.
+3.1	Fluctuation of Weight Parameters
+In typical low-precision training, a master copy of weight parameters is separately maintained in
+high precision, and those weights are updated based on the computed weight gradient. This high-
+precision weight is quantized into a low-precision format and used for the forward path computation
+during training. If the scaling factor s is constrained to 2n , the quantization threshold remains
+the same unless s is updated due to overflow or underutilization. If the optimal weight is located
+between two representable values of a data format, the quantized weight would fluctuate alternately
+between the two values in each update (Fig. 4(a)) even for a very small weight update, causing large
+fluctuations and undermining training performance.
+3.2	Hysteresis Quantization
+To mitigate the fluctuation issue above, we propose to introduce the concept of hysteresis to quan-
+tization. More specifically, we quantize each weight differently in a way that the quantized value
+tends to stay at its current value, effectively minimizing undesired oscillation between two values
+due to small weight updates. The equation below shows an example of the proposed quantization
+scheme.
+Qt bwtc,	ifwt > Qtw-1
+Qw= dwte,	if wt < Qtw-1
+(6)
+where w is the original value, Qw is its quantized value, and t is the time step. The proposed
+hysteresis quantization reduces fluctuation significantly, stabilizing the training process and allowing
+the network to reach global optima more efficiently. In Fig. 4(b), if the weight change ∆W is
+small, then enough number of those changes should be accumulated to flip Qw . Hence, the update
+frequency is now proportional to the weight gradient. This helps the network to learn better while
+suppressing fluctuations for small Gw values. Alternatively, we may mitigate weight quantization
+errors by adopting AdaRound (Nagel et al. (2020)), which learns whether each weight should be
+rounded up or down to produce the same output as high-precision weights. However, whenever
+full-precision weights are updated, we need to re-train the learnable parameters (i.e., quantization
+scheme of each weight), incurring a large overhead and undermining the benefit of low-precision
+training.
+3.3	Ultra-Low-Precision Format for Network Quantization
+To verify the effectiveness of the proposed hysteresis quantization, we select 4-bit logarithmic rep-
+resentation as an ultra-low-precision format for weight parameters. This format has the same dy-
+namic range as INT8 which is widely used for weight quantization, and is more hardware-efficient
+as multiplication is implemented only using simple shift operations. There have been attempts to
+use logarithmic weights in quantized neural networks (Lee et al., 2017; Elhoushi et al., 2021), but
+from-scratch training shows a significant performance degradation. In logarithmic data formats, the
+interval of quantization points is not uniform, making the effect of fluctuation more severe.
+6
+Published as a conference paper at ICLR 2022
+WOroEflfO Mb
+(a) Average number of Qw changes per
+each update
+φso~l 6~~巴1
+20	40	60	80
+Epochs
+(b) Learning curve
+Figure 5:	Experimental results of hysteresis quantization.
+Fig. 5 shows experimental results of ResNet-18 training on ImageNet using 4-bit logarithmic
+weights. Note that we apply channel-wise quantization to the convolutional layers to compensate
+for the insufficient expression range and layer-wise quantization to the other types of layers. Further
+details on the experimental setup are provided in Appendix A.5.1. First, we measure how many
+quantized weights Qw change when the network performs one weight update using a mini-batch
+and average them over the first 100 updates in the 60th epoch. The experimental result displayed
+in Fig. 5(a) clearly shows that using hysteresis significantly reduces weight change frequency and
+stabilizes the training process. Fig. 5(b) compares the training performance of quantization schemes
+with and without hysteresis. Hysteresis quantization not only speeds up training but also achieves
+better results at the end of training. Note that hysteresis quantization is applicable to other data
+formats, and additional experimental results can be found in Appendix A.4.
+4 Experimental Results
+(a) Forward path computation	(b) Backward path computation
+Activationl Errorl+1
+Gradient GEMM
+Weight Gradientl
+(c) Weight gradient computation
+Figure 6:	Computation flow of 8-bit low-precision training.
+4.1	Low-Precision Training Scheme
+For low-precision training, we need to quantize four variables: activation, error, weight, and weight
+gradient. In our experiments, we apply the quantized training scheme detailed in 2.2 to all of these
+variables, as depicted in Fig. 6. As in previous studies on 8-bit training, the inputs of GEMM are
+all quantized into 8 bits. Additional functions are applied to GEMM results in the forward and
+backward paths. ReLU, tanh, and sigmoid functions are performed directly on the input, whereas
+the input of BatchNorm is re-quantized.
+7
+Published as a conference paper at ICLR 2022
+Table 1: Training Performance of FP134 Data Format
+Model (Dataset) [Metric]	Baseline (FP32)	FP134
+ResNet-18 (ImageNet)	69.8	69.8
+ResNet-101 (ImageNet)	77.6	77.4
+MobileNetV2 (ImageNet)	72.2	71.9
+2-layer LSTM (PTB) [ppl.]	91.5	92.0
+Transformer (IWSLT) [BLEU]	34.8	34.5
+MobileNetV2 + SSDLite (VOC) [mAP]	68.3	68.2
+Table 2: Comparisons of Data Formats for Low-Precision Training of ResNet-18 on ImageNet
+Quantization Scheme	Formats (Exponent, Mantissa)						Top-1 Accuracy	
+	w	GEMM Input x	Batch -Norm Input x	dw	dx	Acc.	FP32	Proposed
+SWALP (Yang et al., 2019a)	81	81 -	-	81	81	321	70.3	65.8
+S2FP8 (Cambier et al., 2020)	(5,2)/(8,23)	(5,2)		-	(5,2)	(5,2)	(8,23)	70.3	69.6
+HFP8 (Sun et al., 2019)	(4,3)	(4,3)	(6,9)	(6,9)	(5,2)	(6,9)	69.4	69.4
+BM8 (Fox et al., 2020)	(2,5)	(2,5)	311	(6,9)	(4,3)	311	69.7	69.8
+FP8-SEB (Park et al., 2021)	(4,3)	(4,3)	(4,3)	(4,3)	(4,3)	(6,23)	69.7	69.0
+FP134 (Ours)	(3,4)	(3,4)	(3,4)	(3,4)	(3,4)	(6,23)	69.8	69.8
+1 Fixed Point
+4.2	8-bit Low-Precision Training
+In Section 2.4, we found that FP134 is the optimal format for low-precision training using the pro-
+posed performance prediction method. We measure the training performance of this format and
+compare it against other 8-bit data formats from recent studies by applying those formats to the
+training of various neural network models. More details on the experimental setup are provided in
+Appendix A.5. The performance of the proposed data format is summarized in Table 1. Overall,
+8-bit training using FP134 achieves nearly the same performance as the full-precision training on all
+models. Even in MobileNetV2, which is known to be sensitive to quantization due to the small num-
+ber of parameters, only 0.3% degradation occurred. Sun et al. (2019) show that HFP8 also exhibits
+only 0.2% accuracy degradation in MobileNetV2 (71.81% vs. 71.61%), but they quantize Batch-
+Norm input into 16 bits instead of 8 bits, roughly doubling the memory access and computational
+complexity. Additionally, since the forward and backward paths employ different data formats,
+HFP8 is actually implemented using 9-bit MAC units in hardware (Agrawal et al., 2021). Table 2
+compares the training performance of various data formats for ResNet-18 training. The columns w,
+x, dw, dx, and acc refer to weight, activation, weight gradient, error, and GEMM accumulation, re-
+spectively. Our FP134 format exhibits no accuracy drop compared to full-precision training. HFP8
+(Sun et al., 2019) and BM8 (Fox et al., 2020) demonstrate similar performance, but they both use
+higher precision to represent BatchNorm inputs, and different formats are adopted in the forward
+and backward paths, necessitating complex computation units when implemented in hardware, as
+decribed above. In addition, BM8 assumes block-wise sharing of exponent bias, incurring additional
+overhead in memory access and data alignment. FP8-SEB (Park et al., 2021) addresses this issue by
+employing layer-wise exponent bias sharing and multi-way MAC units, but it results in a 0.7% ac-
+curacy drop for ResNet-18 training. Contrarily, our data format shows no performance degradation,
+while deeply quantizing BatchNorm inputs into the same format and allowing for a simple datapath
+by using an identical data format in the forward and backward paths.
+4.3	Ultra-Low-Precision Training with 4-bit Logarithmic Weights
+Elhoushi et al. (2021) recently demonstrated that 4-bit logarithmic weights could be used for net-
+work quantization. Fine-tuning of a pre-trained model only showed 0.2% accuracy degradation, but
+8
+Published as a conference paper at ICLR 2022
+Table 3: Comparisons of Training Schemes Using 4-bit Logarithmic Weights for ResNet-18
+	From1 Scratch	Formats (Exponent, Mantissa)			Top-1 Accuracy	
+		w	x, dw, dx	Acc.	FP32	Proposed
+DeepShift-Q (Elhoushi et al., 2021)	X	(3,0)	-	-	69.8	69.6
+	O	(3,0)	-	-	69.8	65.3
+FP134 + 4-bit Log W	O	(3,0)	(3,4)	(6,23)	69.8	67.7
+FP134 + 4-bit Log W + Hysteresis	O	(3,0)	(3,4)	(6,23)	69.8	69.6
+1 X: fine-tuning of pre-trained models, O: from-scratch training						
+Table 4: 4-bit Logarithmic Weight Training with and without Hysteresis Quantization.
+Model (Dataset) [Metric]	FP32	4-bitLogW	4-bit Log W + Hysteresis	∆
+ResNet-18 (ImageNet)	69.8	67.7	69.6	+1.9
+ResNet-101 (ImageNet)	77.6	76.6	77.3	+0.7
+MobileNetV2 (ImageNet)	72.2	67.5	69.6	+2.1
+2-layer LSTM (PTB) [ppl.]	91.5	93.3	93.2	-0.11
+Transformer (IWSLT) [BLEU]	34.8	33.5	33.8	+0.3
+MobileNetV2 + SSDLite (VOC) [mAP]	68.3	63.3	66.1	+2.8
+1 Lower is better
+from-scratch training of the same model resulted in a 4.5% accuracy drop in ResNet-18 training (Ta-
+ble 3). Similarly, our experiments show 2.1% lower accuracy when training ResNet-18 using 4-bit
+logarithmic weights and FP134 format for other variables. However, using hysteresis quantization
+greatly improves the training performance and reduces accuracy degradation to 0.2%. This is iden-
+tical to the training performance achieved through fine-tuning a pre-trained model by Elhoushi et al.
+(2021), confirming that hysteresis quantization effectively solves the issue of sub-optimal solutions
+in from-scratch training. In addition, Table 4 demonstrates that hysteresis quantization improves
+the training performance in all target models. Note that we quantized all trainable weights except
+for the BatchNorm parameters into 4 bits in experiments; the training performance could be further
+improved by using higher precision for error-sensitive parts such as the first/last layers and residual
+connections.
+5 Conclusion
+In low-precision training, the dynamic range of a tensor is data-dependant, and hence an optimal
+data format depends on various factors such as model, dataset, and quantization scheme. We showed
+that the training performance of a specific data format for activation and error could be predicted
+by observing the errors introduced in the weight gradients. Based on this observation, we deter-
+mined an optimal 8-bit format for low-precision training very efficiently without running numerous
+training runs. The proposed FP134 format achieved a similar or better accuracy compared to prior
+works, while allowing for efficient hardware implementation through quantizing BatchNorm inputs
+and using a unified data format in both forward and backward paths. In addition, we proposed
+the hysteresis quantization scheme for network quantization, which improves training performance
+by suppressing undesired fluctuations and stabilizing the training process. In ultra-low-precision
+training with 4-bit logarithmic weights, hysteresis quantization significantly improves training per-
+formance by mitigating sub-optimal solutions, closely matching the performance obtained through
+fine-tuning a pre-trained model. We expect that these two schemes can complement each other to
+enable practical low-precision training on various models and tasks.
+Acknowledgments
+This work was supported by the National Research Foundation of Korea (Grant No. NRF-
+2022R1C1C1006880). The EDA tool was supported by the IC Design Education Center.
+9
+Published as a conference paper at ICLR 2022
+References
+Ankur Agrawal, Sae Kyu Lee, Joel Silberman, Matthew Ziegler, Mingu Kang, Swagath Venkatara-
+mani, Nianzheng Cao, Bruce Fleischer, Michael Guillorn, Matthew Cohen, et al. A 7nm 4-core ai
+chip with 25.6 tflops hybrid fp8 training, 102.4 tops int4 inference and workload-aware throttling.
+In 2021 IEEE International Solid-State Circuits Conference (ISSCC), volume 64, pp. 144-146.
+IEEE, 2021.
+Leopold Cambier, Anahita BhiWandiWalia, Ting Gong, Mehran Nekuii, Oguz H EliboL and Hanlin
+Tang. Shifted and squeezed 8-bit floating point format for low-precision training of deep neural
+netWorks. arXiv preprint arXiv:2001.05674, 2020.
+Mauro Cettolo, Jan Niehues, Sebastian Stuker, Luisa Bentivogli, and Marcello Federico. Report on
+the 11th iWslt evaluation campaign, iWslt 2014. In Proceedings of the International Workshop on
+Spoken Language Translation, Hanoi, Vietnam, volume 57, 2014.
+JungWook Choi, SWagath Venkataramani, Vijayalakshmi Srinivasan, Kailash Gopalakrishnan, Zhuo
+Wang, and Pierce Chuang. Accurate and efficient 2-bit quantized neural netWorks. In MLSys,
+2019.
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hi-
+erarchical image database. In 2009 IEEE conference on computer vision and pattern recognition,
+pp. 248-255. Ieee, 2009.
+Mostafa Elhoushi, Zihao Chen, Farhan Shafiq, Ye Henry Tian, and Joey YiWei Li. Deepshift: To-
+Wards multiplication-less neural netWorks. In Proceedings of the IEEE/CVF Conference on Com-
+puter Vision and Pattern Recognition, pp. 2359-2368, 2021.
+Sean Fox, Seyedramin Rasoulinezhad, Julian Faraone, Philip Leong, et al. A block minifloat repre-
+sentation for training deep neural netWorks. In International Conference on Learning Represen-
+tations, 2020.
+John L Gustafson and Isaac T Yonemoto. Beating floating point at its oWn game: Posit arithmetic.
+Supercomputing Frontiers and Innovations, 4(2):71-86, 2017.
+Dong Han, Shengyuan Zhou, Tian Zhi, Yibo Wang, and Shaoli Liu. Float-fix: An efficient and
+hardWare-friendly data type for deep neural netWork. International Journal of Parallel Program-
+ming, 47(3):345-359, 2019.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recog-
+nition. In Proceedings of the IEEE conference on computer vision and pattern recognition, pp.
+770-778, 2016.
+IEEE. Ieee standard for floating-point arithmetic, ieee std 754-2019 (revision of ieee 754-2008).
+Institute of Electrical and Electronics Engineers NeW York, 2019.
+Dhiraj Kalamkar, Dheevatsa Mudigere, Naveen Mellempudi, Dipankar Das, Kunal Banerjee,
+Sasikanth Avancha, Dharma Teja Vooturi, Nataraj Jammalamadaka, Jianyu Huang, Hector Yuen,
+et al. A study of bfloat16 for deep learning training. arXiv preprint arXiv:1905.12322, 2019.
+Urs Koster, Tristan J Webb, Xin Wang, Marcel Nassar, Arjun K Bansal, William H Constable,
+Oguz H Elibol, Scott Gray, Stewart Hall, Luke Hornof, et al. Flexpoint: An adaptive numerical
+format for efficient training of deep neural netWorks. arXiv preprint arXiv:1711.02213, 2017.
+EdWard H Lee, Daisuke Miyashita, Elaina Chai, Boris Murmann, and S Simon Wong. Lognet:
+Energy-efficient neural netWorks using logarithmic computation. In 2017 IEEE International
+Conference on Acoustics, Speech and Signal Processing (ICASSP), pp. 5900-5904. IEEE, 2017.
+Wei Liu, Dragomir Anguelov, Dumitru Erhan, Christian Szegedy, Scott Reed, Cheng-Yang Fu, and
+Alexander C Berg. Ssd: Single shot multibox detector. In European conference on computer
+vision, pp. 21-37. Springer, 2016.
+Mitchell Marcus, Beatrice Santorini, and Mary Ann MarcinkieWicz. Building a large annotated
+corpus of english: The penn treebank. 1993.
+10
+Published as a conference paper at ICLR 2022
+Brais Martinez, Jing Yang, Adrian Bulat, and Georgios Tzimiropoulos. Training binary neural
+networks with real-to-binary convolutions. arXiv preprint arXiv:2003.11535, 2020.
+Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort. Up or
+down? adaptive rounding for post-training quantization. In International Conference on Machine
+Learning,pp. 7197-7206. PMLR, 2020.
+Jeongwoo Park, Sunwoo Lee, and Dongsuk Jeon. A neural network training processor with 8-bit
+shared exponent bias floating point and multiple-way fused multiply-add trees. IEEE Journal of
+Solid-State Circuits, 2021.
+Mark Sandler, Andrew Howard, Menglong Zhu, Andrey Zhmoginov, and Liang-Chieh Chen. Mo-
+bilenetv2: Inverted residuals and linear bottlenecks. In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pp. 4510-4520, 2018.
+Xiao Sun, Jungwook Choi, Chia-Yu Chen, Naigang Wang, Swagath Venkataramani, Xiaodong Cui,
+Wei Zhang, Kailash Gopalakrishnan, et al. Hybrid 8-bit floating point (hfp8) training and infer-
+ence for deep neural networks. 2019.
+Thierry Tambe, En-Yu Yang, Zishen Wan, Yuntian Deng, Vijay Janapa Reddi, Alexander Rush,
+David Brooks, and Gu-Yeon Wei. Algorithm-hardware co-design of adaptive floating-point en-
+codings for resilient deep learning inference. In 2020 57th ACM/IEEE Design Automation Con-
+ference (DAC), pp. 1-6. IEEE, 2020.
+Naigang Wang, Jungwook Choi, Daniel Brand, Chia-Yu Chen, and Kailash Gopalakrishnan. Train-
+ing deep neural networks with 8-bit floating point numbers. In Proceedings of the 32nd Interna-
+tional Conference on Neural Information Processing Systems, pp. 7686-7695, 2018.
+Yu Emma Wang, Gu-Yeon Wei, and David Brooks. Benchmarking tpu, gpu, and cpu platforms for
+deep learning. arXiv preprint arXiv:1907.10701, 2019.
+Guandao Yang, Tianyi Zhang, Polina Kirichenko, Junwen Bai, Andrew Gordon Wilson, and Chris
+De Sa. Swalp: Stochastic weight averaging in low precision training. In International Conference
+on Machine Learning, pp. 7015-7024. PMLR, 2019a.
+Jiwei Yang, Xu Shen, Jun Xing, Xinmei Tian, Houqiang Li, Bing Deng, Jianqiang Huang, and Xian-
+sheng Hua. Quantization networks. In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, pp. 7308-7316, 2019b.
+11
+Published as a conference paper at ICLR 2022
+A Appendix
+A. 1 Various Formats Analyzed in Section 2
+In this paper, we made three assumptions on the quantization formats that were analyzed. Firstly,
+1-bit is allocated as a sign bit, so only symmetric formats are allowed, and secondly, the number of
+valid bits with a large absolute numerical value must be greater than or equal to the number of valid
+bits with a small absolute numerical value. Lastly, the base does not exceed 2.
+Considering the above assumptions, we provide a systematical approach for generating different
+quantization methods that were used for analysis in Section 2, in order to create quantization meth-
+ods that have trade-offs in terms of dynamic range and the number of valid bits. The quantization
+method is expressed with the following items: i) a list of decreasing positive real numbers P that
+contains the interval points (Eq. 7) and ii) a non-increasing integer list L that accompanies the in-
+terval list, with each item representing the number of valid bits (Eq. 8). Here, s is shared exponent
+bias.
+P = {2s+1,2s,2s-1, ..., 2s-K+1} where s ∈ N	(7)
+L = {l0, l1, ..., lK-1} where lk ∈ N, i < j ⇒ li ≥ lj	(8)
+The quantization points Q are generated in each of the intervals that are sliced with 2lk-1 evenly
+distributed datapoints. If the interval is {2s+1 , 2s}, the quantization point Q can be expressed by
+Eq. 9.
+1	2	2lk-1	1
+Q = {2s, 2s(1 + L), 2s(1 + 2k=1),..., 2s(1 + F-L)}	(9)
+Notice that L for an α-bit quantization must satisfy
+K-1
+2α-1
+k=0
+1 +	2lk-1
+(10)
+Since the format is symmetric, only half of the data points are assigned to positive numbers, so the
+exponent in Eq. 10 should be α 1 instead of α. The reason for adding 1 is to include a zero value.
+For example, when shared exponent bias is -1, an 8-bit fixed-point quantization would be expressed
+as follows:
+(11)
+L={7,6,5,4,3,2,1}	(12)
+The first interval from 1 to 0.5 would be evenly sliced by 27-1 datapoints, the next interval from 0.5
+to 0.25 with 26-1, etc. Various cases are shown in Fig. 7, with P plotted on the x-axis and L plotted
+on the y-axis. Since P represents the range of values due to shared exponent bias that is independent
+of the data format, L can represent all of the various data formats we consider in this paper.
+a-q p=e> Jo-9qEnN
+Our notation
+---------8-bit	Fixed-point	[7,6,5,4,3,2,1]
+-------- 8-bit	Logarithmic	number	[1,1,1,1,1,...,1]
+——8-bit FP143	[4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,3,2,1]
+——8-bit Posit	[1,1,2,3,4,5,6,6,5,4,3,2,1]
+---------8-bit	Float-Fix	[6,6,5,5,4,4,3,3,2,2,1,1]
+Figure 7:	Number of valid bits in various 8-bit formats.
+When selecting 8-bit formats, we chose the formats so that the intervals with less than 3 valid bits
+do not appear for more than two digits to reduce the search space, as they have an unnecessarily
+large dynamic range. Thus, formats such as [7,6,5,4,2,2,2,1] were excluded from the search space.
+Considering all of the generation rules, we selected 166 distinct 8-bit formats with different dynamic
+range and valid bits from [7,6,5,4,3,2,1] to [3,3,3,...,3,2,1]. After the number of valid bits for an 8-bit
+format is selected, 1 or 2 is subtracted from each value to create a corresponding 7-bit and 6-bit for-
+mats. For example, in the case of [6,5,5,5,5,4,4,4,3,2,1] 8-bit format, the 7-bit corresponding format
+is [5,4,4,4,4,3,3,3,2,1] and 6-bit corresponding format is [4,3,3,3,3,2,2,2,1]. From the generated 166
+8-bit formats, 7-bit and 6-bit formats were also generated using this rule.
+12
+Published as a conference paper at ICLR 2022
+A.2 S oftware Implementation Details
+To support quantized training for various formats, custom C++ and CUDA codes to emulate quan-
+tized data were written. Our custom C++ and CUDA extension code could perform quantization-
+related functions through utilizing the Python APIs in PyTorch for extendable research while main-
+taining high performance. We emulate the quantized value using custom code in the part that needs
+quantization throughout the network, and PyTorch built-in functions are used for computation ker-
+nels such as convolution and matrix multiplication. We created a package named lptorch, short for
+low precision PyTorch, and the code can be found in the supplementary material.
+A.3 Angle vs. Magnitude to Predict Performance
+∑∣N∆f∣	WlNAEl	∑∣nδξ∣
+(b) ResNet-101 (ImageNet) (c) MobileNetV2 (ImageNet)
+(a) ResNet-18 (ImageNet)
+(d) 2-layer LSTM (PTB)
+Iooo8	1500∞
+FP152
+FP143
+FP134
+INT8
+(e) Transformer (IWLST) (f) MobileNetV2 + SSDLite (VOC)
+Figure 8:	Scatter plots showing ∣Nδe | and ∣Nδa∣ of 166 8-bit quantization formats. The number
+next to the star represents the loss obtained through actual training.
+In addition to the misalignment angles of Gw (∠(Gw , Gw + N∆A) and ∠(Gw , Gw + N∆E)), as
+defined in Section 2.3, We used the magnitude of noise (∣Nδa∣ and ∣Nδe |) in order to predict the
+final trained performance, and the results are shown in Fig. 8. Fig. 3 and Fig. 8 show that both the
+error magnitude and the misalignment angle are good metrics for determining optimal data format.
+For the six target models, both metrics suggest FP134 as the best format. However, the misalignment
+angle still better captures the training performance. For instance, in Fig. 8(e), although FP134 shows
+smaller noise magnitude, the actual training loss is smaller for FP143. Similarly, in Fig. 8(b), (c)
+and (f), although INT8 failed and FP152 succeeded in training, the absolute value of noise did not
+indicate a clear superior of the two formats. Based on these observations, we conclude that the
+misalignment angles are more suitable for predicting training performance compared against using
+the absolute value of noise.
+A.4 Hysteresis Quantization with Integer Weights
+In addition to 4-bit logarithmic weights, we also tested the hysteresis quantization scheme on a low-
+precision integer format (INT4) that uses uniform quantization. The results are shown in Table 5.
+Experimental results show that using hysteresis improves the performance in most cases. In addition,
+in MobileNetV2 training with INT4 weights, training initially failed, but using hysteresis enables
+reliable training, which suggests that hysteresis quantization not only helps the network to reach the
+optimal point but also prevents divergence in an unwanted direction during the training process.
+However, it is interesting to see that the hysteresis quantization is less effective on the LSTM model
+for the INT4 format. We suspect that this is due to the weight distribution characteristics of the
+LSTM model. As shown in Fig. 9, most of the weights have a relatively large magnitude in the
+13
+Published as a conference paper at ICLR 2022
+Table 5: 4-bit Uniform Weight Training with and without Hysteresis Quantization.
+Model (Dataset) [Metric]	FP32	INT4 W	INT4 W + Hysteresis	∆
+ResNet-18 (ImageNet)	69.8	61.8	67.0	+5.2
+MobileNetV2 (ImageNet)	72.2	Fail	69.7	-
+2-layerLSTM (PTB) [ppl.]	91.5	113.4	118.3	+4.91
+Transformer (IWSLT) [BLEU]	34.8	32.3	32.4	+0.1
+MobileNetV2 + SSDLite (VOC) [mAP]	68.3	Fail	65.7	-
+1 Lower is better
+0.40
+0.35
+0.30
+0.25
+0.20
+0.15
+0.10
+0.05
+0.00
+-30	-25	-20	-15	-10	-5	0
+Base-2 Logarithm of normalized absolute value
+Figure 9: Weight distribution of first layer of 2-layer LSTM and ResNet-18.
+LSTM model when normalized, contrary to ResNet-18 in which the weights are more evenly dis-
+tributed. In logarithmic formats, the relative amount of quantization error is similar for all values. In
+contrast, the relative amount of quantization error is smaller for large values in uniform quantization.
+Therefore, the weight parameters ofLSTM are more severely affected by fluctuation in logarithmic
+formats, making our hysteresis quantization scheme more effective in those formats compared to
+uniform quantization.
+A.5 Experimental Details
+A.5.1 ResNet-18 (ImageNet)
+70
+60
+50
+40
+30
+20
+10
+0	20	40	60	80
+Epochs
+70605040m20
+Sl 00< u-p=eA
+20	40	60	80
+Epochs
+Figure 10: Top-1 Accuracy on ImageNet using a ResNet-18 model.
+14
+Published as a conference paper at ICLR 2022
+We conducted ImageNet experiments using SGD with a momentum of 0.9 for 90 epochs with a batch
+size of 256 images and an initial learning rate of 0.1 which is decayed by a factor of 10 at the 30th
+and 60th epochs. We used the ResNet-18 architecture from the official PyTorch implementation1.
+Fig. 10 shows Top-1 training & validation accuracy graphs. Observation of the training graph
+indicates that all of the results are close to the baseline within 0.2% with the exception of FP130
+without hysteresis quantization.
+A.5.2 ResNet- 1 0 1 (ImageNet)
+m706050wm2°
+84 B~~≡J1
+10
+0
+0	20	40	60
+Epochs
+8070605040m2010
+Sl Oo< u-p=eA
+20	40	60	80
+Epochs
+Figure 11: Top-1 Accuracy on ImageNet using a ResNet-101 model.
+We trained ResNet-101 by applying the same training method as ResNet-18. We conducted Im-
+ageNet experiments using SGD with a momentum of 0.9 for 90 epochs with a batch size of 256
+images and an initial learning rate of 0.1 which is decayed by a factor of 10 at the 30th and 60th
+epochs. We used the ResNet-101 architecture from the official PyTorch implementation2. Fig. 11
+shows Top-1 training & validation accuracy graphs. Observation of the training graph indicates that
+all of the results are close to the baseline with less than 0.3% performance drop except for FP130
+without hysteresis quantization.
+A.5.3 MobileNetV2 (ImageNet)
+706050wm2010
+1％l 84 B~~≡Jl
+0	50	100	150	200	250
+Epochs
+70605040m20
+Sl 00< u-p=eA
+0	50	100	150	200	250
+Epochs
+Figure 12: Top-1 Accuracy on ImageNet using a MobileNet-V2 model.
+We conducted ImageNet experiments using SGD with a momentum of 0.9 for 270 epochs with
+a batch size of 256 images and cosine annealing with an initial learning rate of 0.05. We used
+the MobileNetV2 architecture from the official PyTorch implementation3. Fig. 12 shows Top-
+1 training & validation accuracy graphs. Observation of the training graph indicates that FP130
+1https://github.com/pytorch/examples/tree/master/imagenet
+2https://github.com/pytorch/examples/tree/master/imagenet
+3https://github.com/pytorch/examples/tree/master/imagenet
+15
+Published as a conference paper at ICLR 2022
+without hysteresis leads to very unstable fluctuations throughout the training. On the other hand,
+in FP130 with hysteresis, training is less susceptible to fluctuations and follows the baseline (FP32)
+training closely until the learning rate decreases toward the latter part of learning, where both FP130
+with hysteresis and FP134 show some degradation from the baseline. This is seen as a limitation
+due to the low precision of each format.
+A.5.4 2-LAYER LSTM (PTB)
+50
+50m50m50
+3 3 2 2 1
+gx-djd αc≡-εH
+2m1m1601w1201m
+x-djd Eo⅞τ=n>
+O 5	10	15	20	25	30	35	40	O 5	10	15	20	25	30	35	40
+Epochs	Epochs
+Figure 13: Perplexify on PTB using a 2-layer LSTM model.
+We adopted the 2-layer Long Short Term Memory (LSTM) network from PyTorch Examples4 for
+language modeling on the Penn Treebank dataset (Marcus et al., 1993). We ran experiments in
+batches of 20 sentences with an initial learning rate of 20 which is decayed by a factor of 4 at epoch
+11, 16, 26, 31 and 37. The embedding and hidden dimensions are 650 and the sequence length is
+35. Fig. 13 shows training & validation perplexity.
+A.5.5 TRANSFORMER MODEL (IWLST)
+We adopted the Transformer Base model from the FairSeq5 repository on the IWSLT’14 German
+to English translation task. We used Adam optimizer and default training parameters found in the
+repository and trained from scratch for 25 epochs. BLEU scores were calculated using the script
+from the repository.
+A.5.6 MOBILENETV2 + SSDLITE (VOC)
+We adopted a PyTorch implementation of SSDLite from the online repository6. The base network
+is MobileNetV2 which was pretrained with each format in Appendix A.5.3. The entire network is
+trained on VOC2012 and VOC2007 trainval datasets and evaluated on VOC2007 validation dataset.
+We used SGD with a momentum of 0.9 for 200 epochs in batches of 32 images and cosine annealing
+with an initial learning rate of 0.01. Fig. 14 shows validation loss at every 5 epochs. Even in
+this experiment, in the case of FP130 without hysteresis the loss fluctuates significantly, whereas
+in FP130 with hysteresis learning proceeds much more stably. FP134 showed similar results to the
+baseline regardless of hysteresis quantization.
+A.6 Model Quantization Methods
+We quantized GEMM input and batchnorm input in all quantized training experiments. Among the
+six models used in the experiment, the quantization details for three representative structures are
+shown in the Fig. 15. In each structure of figure, inputs such as x, c, h, V, K, and Q are also all
+quantized in 8 bits.
+4https://github.com/pytorch/examples/tree/master/word」anguage_model
+5https://github.com/pytorch/fairseq
+6https://github.com/qfgaohao/pytorch-ssd
+16
+Published as a conference paper at ICLR 2022
+(a) Residual
+Block in ResNet
+50505050
+& <d554433
+SSO-UOqBP=BA
+O 25	50	75	100	125	150	175	200
+Epochs
+Figure 14: Validation loss on VOC using a MobileNetV2 + SSDLite.
+VKQ
+(b) LSTM	(c) Multi-head Attention
+Figure 15: Quantized network structures.
+A.7 Hardware Evaluation
+For hardware implementation cost comparisons, we implemented a conventional MAC unit and a
+multi-way MAC unit with integer-based accumulation (Tambe et al., 2020; Park et al., 2021) that
+support data formats presented in Section 4.2. For accumulation, we use FP169 with chunk-based
+accumulation (Wang et al., 2018). Experimental results in Table 6 show that FP134 exhibits lower
+Table 6: Area and Power of 2-Stage Pipelined MAC Units Synthesized in 40nm Process.
+MAC StrUctUre	Area per MAC [μm2]					Power per MAC [μW]				
+	FP134	FP1431 HFP82 BM83 Flex16+54				FP134 FP1431 HFP82 BM83 Flex16+54				
+Conventional	1355	1320	1308	1460	3800	122	116	106	141	537
+MUlti-way 2-inpUt	1335	1480	2342	1865	2268	178	178	283	258	371
+4-inpUt	888	1034	1615	1296	1885	120	135	205	184	351
+8-inpUt	678	836	1343	1074	1672	97	123	194	168	342
+16-inpUt	571	698	1065	957	1540	95	114	170	155	329
+32-inpUt	511	668	994	898	1485	87	111	170	152	326
+64-inpUt	509	638	955	856	1450	88	110	172	149	326
+1 Park et al. (2021) 2 SUn et al. (2019) 3 FoX et al. (2020) 4 Koster et al. (2017)
+17
+Published as a conference paper at ICLR 2022
+cost than FP143 and other formats in previous studies. Note that HFP8 (Sun et al., 2019) and BM8
+(Fox et al., 2020) employ different formats for activation and error. Therefore, they need to be
+implemented in FP153 and FP145 to support all operations with a single MAC unit (Agrawal et al.,
+2θ2l). Since Flex16+5 (Koster et al., 2017) requires 16-bit multiplication, its cost is significantly
+higher than other 8-bit formats.
+Figure 16: Multi-way MAC unit with an adder tree.
+A conventional MAC unit consists of a multiplier and an accumulator. In the multiplier, the expo-
+nents of two input operands are summed while their mantissas are multiplied. The multiplication
+part is more complex, and hence it dominates the area of the multiplier. As a result, the size of the
+multiplier is larger when more bits are allocated to mantissa. In the accumulator, a floating-point
+adder adds the multiplication results to a partial sum in FP169. The adder is decomposed into a
+shifter that aligns the mantissa by the exponent difference, an integer adder that sums aligned man-
+tissas, and a quantization unit that converts the result back to FP169. Since the result is re-quantized
+into FP169, the addition operation of aligned mantissas does not need to be lossless. FP169 format
+has a 10-bit mantissa including one hidden bit. We only need to accurately calculate higher 10 bits,
+which necessitates a 12-bit adder considering rounding. Shifting by more than 12 bits is not needed
+even if the result of the multiplier has a larger exponent range. Therefore, the shifter, adder, and
+quantization unit, which are the components of the accumulator, are not affected by the input for-
+mat. There are minor differences such as an adder that calculates the difference between exponents
+and a shifter with a different bit width of the input, but their costs are ignorable.
+Contrarily, a multi-way MAC consists of a multiplier, a shifter for alignment, an adder tree, a nor-
+malization unit, and a final accumulator. The multiplier and the final accumulator are identical to
+those of the conventional MAC. However, since only one normalization unit and one final accumu-
+lator are shared across multiple inputs, their implementation cost becomes insignificant for a larger
+number of inputs. The shifter for alignment converts the multiplier output to an integer format since
+the cost of integer addition is lower than that of floating-point addition. Then, the adder tree sums
+those integer values, and the normalization unit converts the result back to a floating-point format.
+The cost of the shifter for alignment, adder tree, and normalization unit is all determined by the
+integer bit width, and the larger the exponent range of the input operands, the larger the required
+bit width, as shown in Fig. 16. In FP134, FP143, and FP152, the minimum integer bit widths are
+23, 37, and 67 bits, respectively. Since the bit width is sufficiently large, the cost difference of these
+units exceeds the cost difference of the multiplier. Therefore, the cost of a multi-way MAC increases
+with the number of exponent bits.
+When designing a neural network training processor, some parts of the hardware (e.g., batch normal-
+ization, non-linear activation functions such as tanh and sigmoid, and softmax function) are typically
+implemented with higher precision to avoid performance drop. Hence, we need to consider data for-
+18
+Published as a conference paper at ICLR 2022
+Table 7: Area and Power of Format Converting Units Synthesized in 40nm Process.
+Direction	Area [μm2 ]					Power [μW ]				
+	FP134 FP143		HFP81 BM82		Flex16+53	FP134 FP143 HFP81			BM82 Flex16+53	
+To FP32	155	141	145	176	330	28	26	27	30	53
+From FP32	139	144	152	162	427	19	20	22	23	55
+1 SUn et al. (2019)2 Fox et al. (2020) 3 Koster et al. (2017)
+Table 8: FPGA Implementation Results of 2-Stage Pipelined MAC Units
+MAC Structure	FP134		FP1431		HFP82		BM83		Flex16+54	
+	LUT	FF	LUT	FF	LUT	FF	LUT	FF	LUT	FF
+Conventional	284	35	269	33	273	33	304	35	606	69
+Multi-way										
+2-input	499	62	648	76	990	108	755	80	891	70
+4-input	719	63	958	77	1589	109	1193	81	1499	71
+8-input	1141	64	1503	78	2681	110	2013	82	2664	72
+16-input	1997	65	2603	79	4632	110	3516	83	4955	73
+32-input	3526	66	4758	80	8614	112	6591	84	9500	74
+64-input	6713	67	9074	81	16289	113	12724	85	18649	75
+1 Park et al. (2021)2 Sun et al. (2019) 3 Fox et al. (2020) 4 Koster et al. (2017)
+mat conversion overheads when comparing different formats. If we consider varioUs 8-bit data for-
+mats with different representation methods, as we did in Table 6, and assume that computations other
+than MAC operations are implemented in full precision, the processing architecture (except MAC
+units) will be identical for all formats. In addition, the on/off-chip memory space, control logics, and
+on-chip interconnects will remain the same. The only difference would be the low-precision MAC
+units and the data conversion units between full-precision and low-precision formats. However, the
+cost of conversion between low-precision and high-precision floating-point formats is typically very
+low and does not vary much with the low-precision format. For low-precision to high-precision
+conversion, we only have to add a bias-correction term to the exponent and add 0 after the mantissa.
+For high-precision to low-precision conversion, we need to add a bias-correction term to the expo-
+nent, clamp the overflowed value to the maximum, and round off the mantissa. The cost is very low
+compared to the MAC operation, and the cost difference between different low-precision formats
+is negligible. We have synthesized the conversion units for different formats, and their costs are
+presented in Table 7. The experimental results confirm that the overhead of data format conversion
+is significantly lower than MAC operations. In addition, all formats except Flexpoint exhibit similar
+conversion costs.
+In addition to the synthesis result for ASIC implementation in Table 6, we measured the hardware
+overhead of MAC units of different data formats on FPGA. Table 8 shows the synthesis results
+on Xilinx Artix-7 FPGA (XC7A100TCSG324-1). Those MAC units do not need block RAMs
+(BRAMs), and we used a compiler directive to avoid using DSP modules for fair comparisons.
+Table 8 shows a similar trend to Table 6; the cost of one MAC gradually decreases as the number
+of inputs increases in the multi-way MAC. Also, due to integer-based addition in the adder tree, the
+cost of FP134, which has the smallest dynamic range, exhibits lower costs than the other formats.
+A.8 Effect of Quantization Noise on Data Flow Quantization
+Table 9 shows the training results when both activation and error are quantized in various data for-
+mats. If an appropriate amount of noise is introduced in the network during training, it will increase
+the training loss but reduce the validation loss, suggesting that the model has been improved due
+to the regularization effect. However, if the noise level continues to increase, the model’s perfor-
+mance will start to degrade at some point. For instance, when MobileNetV2 is quantized in FP134,
+its performance is improved through the regularization effect since the training loss increases while
+19
+Published as a conference paper at ICLR 2022
+Table 9: Training Result Comparisons
+Model (Dataset)		FP32		FP134		FP143		FP152	
+		train	val	train	val	train	val	train	val
+ResNet-18	Loss	1.286	1.220	1.292	1.223	1.302	1.233	1.343	1.261
+(ImageNet)	Accuracy	69.50	69.73	69.46	69.67	69.19	69.63	68.27	68.93
+MobileNetV2	Loss	1.182	1.118	1.197	1.113	1.217	1.133	1.301	1.192
+(ImageNet)	Accuracy	71.47	72.20	71.16	72.25	70.63	71.92	68.70	70.35
+2-layer LSTM	Loss	3.994	4.517	4.014	4.525	4.005	4.518	4.037	4.535
+(PTB)	ppl.	54.27	91.54	55.39	92.30	54.89	91.68	56.63	93.20
+Transformer	Loss	3.498	3.847	3.531	3.885	3.527	3.887	3.621	3.942
+(IWSLT)	BLEU	-	34.75	-	34.77	-	34.6	-	33.79
+MobileNetV2	Loss	-	2.743	-	2.773	-	2.801	-	2.970
++SSDLite(VOC)	mAP	-	68.34	-	68.16	-	68.32	-	66.56
+the validation loss decreases compared to FP32. However, both the training and validation losses
+increase when quantized in most cases, resulting in lower accuracy. This suggests that using a very
+low precision data format already introduces a large amount of noise in the network, incurring per-
+formance degradation. Hence, it is necessary to reduce error in the network to improve the training
+performance in low-precision training.
+20

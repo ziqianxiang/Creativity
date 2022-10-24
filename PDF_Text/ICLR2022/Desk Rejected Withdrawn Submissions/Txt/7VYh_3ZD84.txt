@@ -1,0 +1,836 @@
+﻿Under review as a conference paper at ICLR 2022
+Sharpness-Aware Minimization in Large-Batch
+Training: Training Vision Transformer In
+Minutes
+Anonymous authors
+Paper under double-blind review
+Ab stract
+Large-batch training is an important direction for distributed machine learning,
+which can improve the utilization of large-scale clusters and therefore acceler-
+ate the training process. However, recent work illustrates that large-batch train-
+ing is prone to converge to sharp minima and cause a huge generalization gap.
+Sharpness-Aware Minimization (SAM) tries to narrow the generalization gap by
+seeking parameters that lie in a flat region. However, it requires two sequential
+gradient calculations that doubles the computational overhead. In this paper, we
+propose a novel algorithm LookSAM to significantly reduce its additional train-
+ing cost. We further propose a layer-wise modification for adapting LookSAM to
+the large-batch training setting (Look-LayerSAM). Equipped with our enhanced
+training algorithm, we are the first to successfully scale up the batch size when
+training Vision Transformers (ViTs). With a 64k batch size, we are able to train
+ViTs from scratch within an hour while maintaining competitive performance.
+1	Introduction
+Data parallelism is one of the most commonly used techniques when training large-scale Deep Neu-
+ral Network (DNN) models on distributed systems. As the number of processors increases, the
+batch size of the stochastic optimizers (such as SGD or Adam) enlarges accordingly, leading to
+large-batch training. Due to the reduced variance in each update, Keskar et al. (2016) reported that
+large-batch training often converges to sharp local minima, which hurts the generalization perfor-
+mance of the resulting DNN models. Methods have been proposed to tackle this problem in the past
+few years, such as strong data augmentation used in (Kumar et al., 2021; Ying et al., 2018) and a set
+of new layer-wise adaptive optimizers proposed in You et al. (2017; 2019). However, most of the
+algorithmic improvements have been made on first order methods such as SGD and Adam.
+Recently, Foret et al. (2020) proposed an algorithm named Sharpness Aware Minimization (SAM),
+which explicitly penalizes the sharp minima and biases the convergence to a flat region. Further,
+Chen et al. (2021) showed that SAM optimizer can improve the validation accuracy of Vision Trans-
+former models on ImageNet-1k by a significant amount (+5.3% when training from scratch). De-
+spite being able to escape from sharp regions, SAM has not been applied to large-batch training. The
+main challenge is that the update rule of SAM involves two sequential (non-parallelizable) gradient
+computations at each step, which will double the training time. Furthermore, although plenty of
+works studying large-batch training on ResNet models (Goyal et al., 2017; Akiba et al., 2017; Jia
+et al., 2018), to the best of our knowledge none of previous works conduct on ViTs.
+In this paper, we aim to develop an efficient version of SAM optimizer that can be applied in the
+large-batch training setting. In particular, our contributions can be summarized in three folds.
+•	We develop a novel algorithm, called LookSAM, to speed up the training of SAM. Instead of com-
+puting the inner gradient ascent at every step, the proposed LookSAM computes it periodically
+and reuses the direction that leads to flat regions. The empirical results illustrate that LookSAM
+achieves similar accuracy gains to SAM while enjoying comparable computational complexity
+with first-order optimizers such as SGD or Adam.
+1
+Under review as a conference paper at ICLR 2022
+•	Inspired by the successes of layer-wise scaling proposed in large-batch training (You et al., 2017;
+2019), we develop an algorithm to scale up the batch size of LookSAM by adopting layer-wise
+scaling rule for weight perturbation (Look-LayerSAM). The proposed Look-LayerSAM can scale
+up the batch size to 64k, which is anew record for ViT training and is 16× compared with previous
+training settings.
+•	Our proposed Look-LayerSAM can achieve 〜8× speedup over the training settings in DosoVit-
+skiy et al. (2020) with a 4k batch size, and we can finish the ViT-B-16 training in 0.7 hour. To the
+best of our knowledge, this is a new speed record for ViT training.
+2	Background and Related Work
+In this section, we will describe recent developments on large batch training, with a review of related
+work on handling the sharp local minima problem.
+2.1	Large-Batch Training
+Large-batch training is an important direction for distributed machine learning, which can improve
+the utilization of large-scale clusters and accelerate the training process. However, training with a
+large batch size incurs additional challenges (Keskar et al., 2016; Hoffer et al., 2017). Keskar et al.
+illustrates that large-batch training is prone to converge to sharp local minima and cause a huge
+generalization gap. Traditional methods try to carefully tune the hyper-parameters to narrow the
+generalization gap, such as learning rate, momentum, and label smoothing (Goyal et al., 2017; Li,
+2017; You et al., 2018; Shallue et al., 2018). Goyal et al. propose warmup to better tune the learning
+rate for training, which tries to increase the learning rate from a small value at the beginning stage
+and then start to decrease after increased to the target value. Leveraging the warmup training strat-
+egy, Goyal et al. can scale up the batch size to 8,192 for ResNet-50 (He et al., 2016) on ImageNet-1k
+(Deng et al., 2009). However, these heuristic approaches cannot be regarded as a principle solution
+for large-batch training (Shallue et al., 2018).
+Recently, to avoid these hand-tuned methods, adaptive learning rate on large-batch training has
+gained enormous attention from researchers (Reddi et al., 2018; 2019; Zhang et al., 2019). Many
+recent works attempt to use adaptive learning rate to scale the batch size for ResNet-50 on ImageNet
+(Martens & Grosse, 2015; Iandola et al., 2016; Akiba et al., 2017; Smith et al., 2017; Devarakonda
+et al., 2017; Codreanu et al., 2017; You et al., 2018; Jia et al., 2018; Osawa et al., 2018; You et al.,
+2019; Yamazaki et al., 2019). More specially, You et al. proposed layer-wise adaptive learning rate
+algorithm LARS (You et al., 2017) to scale the batch size to 32k for ResNet-50. Based on LARS
+optimizer, Ying et al. can finish the ResNet-50 training in 2.2 minutes through TPU v3 Pod (Ying
+et al., 2018). Liu et al. use adversarial learning to further scale the batch size to 96k. In addition, You
+et al. (2019) propose the LAMB optimizer to scale up the batch size when training BERT, resulting
+in a 76 minutes training time.
+2.2	Sharp Local Minima
+Sharp local minima would largely influence the generalization performance of deep networks (Smith
+& Le, 2017; Kwon et al., 2021; Dziugaite & Roy, 2017; Chaudhari et al., 2019; Izmailov et al., 2018;
+Jin et al., 2018). Recently, many studies have attempted to explore the studies of sharp local minima,
+thus to address the optimization problem (Yi et al., 2019; Tsuzuku et al., 2020; Dinh et al., 2017; Li
+et al., 2017; Chaudhari et al., 2019; Kwon et al., 2021; He et al., 2019; Foret et al., 2020). For exam-
+ple, Jastrzebski et al. state that three factors - learning rate, batch size and gradient covariance, can
+influence the minima found by SGD. Besides, Chaudhari et al. propose a local-entropy-based objec-
+tive function that favors flat regions during training, to avoid approaching the sharp valleys and bad
+generalization. He et al. observe the loss surfaces and introduce the concept of asymmetric valleys
+to derive a deeper understanding of flat and sharp minima. By the discovery of Fisher Information
+Matrix (FIM) as an implicit regularizer of SGD, Jastrzebski et al. try to explicitly penalize the trace
+of the FIM to solve the problem of sharp minima. Wen et al. introduce the SmoothOut framework
+to smooth out sharp minima and thereby improve generalization. More recently, Sharpness-Aware
+Minimization (SAM) (Foret et al., 2020) introduce a novel procedure that can simultaneously min-
+imize loss value and loss sharpness to narrow the generalization gap. It presents rigorous empirical
+2
+Under review as a conference paper at ICLR 2022
+results over a variety of benchmark experiments and achieves state-of-the-art performance. The
+main focus of this paper is on improving the efficiency and scalability of SAM.
+3	Proposed Method
+In this section, we will first give an overview of the SAM optimizer and discuss the computational
+overhead introduced by SAM. The proposed algorithms, including LookSAM and Layer-wise Look-
+SAM will then be introduced in full details.
+3.1	Overview of SAM
+Let S = {(xi , yi)}in=1 be the training dataset, where each sample (xi , yi) follows the distribution
+D. Let f (x; w) be the neural network model with trainable parameter w ∈ Rp. The loss function
+corresponding to an input xi is given by l(f(xi; w), yi) ∈ R+, shortened to l(xi) for convenience.
+The empirical training loss can be defined as LS = n PZi l(f (xi； w), yi). In the SAM algo-
+rithm (Foret et al., 2020), we need to find the parameters whose neighbors within the `p ball have
+low training loss LS(w) through the following modified objective function:
+LSSAM (w) = max LS(w + (w)),	(1)
+kkp≤ρ
+where p ≥ 0 and ρ is the radius of lp ball. As calculating the optimal solution of inner maximization
+is infeasible, SAM uses one-step gradient ascent to approximate it:
+^(w) = ρVw LS (w)∕kVw LS (w)k ≈ arg max LS (W + e).	(2)
+kkp≤ρ
+Finally, SAM computes the gradient with respect to perturbed model W + ^ for the update:
+VwLSAM(W) ≈ VwLs(w)∣w+^.	(3)
+However, they need to calculate two sequential gradients at each step based on Equation 3, which
+will double the computational cost for each update.
+3.2 LOOKSAM
+The main drawback of SAM lies in its computational overhead. The update rule (Eq 3)
+demonstrates that each iteration of SAM needs two sequential gradient computations, one
+for obtaining € and another for computing the gradient descent update (see Figure 3).
+This will double the computational complexity com-
+pared to SGD or Adam optimizers. Further, these two
+gradient evaluations are not parallelizable, which will be
+a bottleneck in large-batch training. This is also one of
+the main reasons that SAM hasn’t been applied in large-
+batch training.
+However, recent work has demonstrated that SAM yields
+significant accuracy gain when training vision trans-
+former models (Chen et al., 2021) (e.g., more than 4%
+accuracy improvement when training ImageNet from
+scratch), and further, SAM’s ability to escape from sharp
+minima is valuable in large-batch training. In particu-
+lar, Keskar et al. (2016) showed that the main challenge
+in large-batch training is the convergence to sharp local
+minima due to insufficient noise in first-order stochastic
+updates, and SAM is a natural remedy for this problem
+if it can be conducted efficiently. These motivate our
+work on improving SAM’s computational efficiency and
+applying it to large-batch training.
+Model
+Figure 1: Accuracy of SAM-5, SAM and
+vanilla ViT on ImageNet-1k. SAM-5 in-
+dicates the method that calculating SAM
+gradients every 5 steps.
+3
+Under review as a conference paper at ICLR 2022
+To reduce the computation of the two sequential gra-
+dients in SAM, a naive method is to use SAM update
+only at every k steps, resulting in 1X additional Cal-
+culation on average. We name this method SAM-k,
+where k indicates the frequency of using SAM. Unfor-
+tunately, this naive method does not work well. As
+shown in Figure 1, we use ViT as the base model
+and the experimental results illustrate that the accu-
+racy degradation is huge when using SAM-5, although
+the efficiency is significantly improved. For exam-
+ple, SAM can improve the accuracy from 74.7% to
+79.4% for ViT-B-16. However, the accuracy drops
+to 75.7% when using SAM-5, which significantly de-
+grades the performance of SAM. This motivates us to
+explore how to effectively improve the efficiency of
+SAM while maintain its high accuracy.
+Figure 2: Difference of gradients between
+every 5 steps for gs, gh, and gv . gv that
+leads to a smoother region changes much
+slower than gs and gh .
+In the following, we propose a novel LookSAM algo-
+rithm to address this challenge, where the main idea
+is to study how to reuse information to prevent computing SAM’s gradient every time. As shown
+in Figure 3, the SAM's gradient gs = VwLS(w)∣w+⅛ targets to a flatter region (the blue arrow)
+compared with the SGD gradient (the yellow arrow). The update of SAM can be divided into two
+parts: the first part (denoted as gh) is to decrease the loss value, and the second part (denoted as gv)
+is to bias the update to a flat region. More specifically, gh is on the direction of the vanilla SGD’s
+gradient, which needs to be calculated at each step even without SAM. Therefore, the additional
+computational cost of SAM is mainly induced by the second part gv. Given the SAM’s gradient (the
+red arrow) and the direction of SGD’s gradient (gh), we can conduct a projection to obtain gv :
+gv = VwLS (w) | w+^ ∙ Sin(O),
+(4)
+where θ is the angle between the SGD’s gradient and SAM’s gradient. Empirically, we observe that
+gv changes much slower than gh and gs. In Figure 2 we plot the change of these three components
+between iteration t and iteration t + 5 throughout the whole training process of SAM, and the results
+indicate that the difference of gv (the green line) shows a much more stable pattern than that of
+gh (the orange line) and gs (the blue line). Intuitively, this means the direction pointing to the flat
+region won’t change significantly within few iterations.
+Therefore, we propose to only calculate the exact SAM’s gradient every k steps and reuse the
+projected gradient gv for the intermediate steps. The pseudocode is shown in Algorithm 1.
+We calculate the original SGD gradient g = VwLB(W)
+based on the sample minibatch B at every step. For ev-
+ery k steps, We compute SAM's gradient and meanwhile
+getting the projected component gv (Equation 4) that
+will be reused for the subsequent steps. At the follow-
+ing k steps, we only calculate the SGD gradient, armed
+with projected component to get the approximated SAM
+gradient. In other words, we train the model and try
+to mimic the SAM procedure, by sufficiently distilling
+the information from SAM gradient every k steps. This
+contributes to the considerable reduction of computation
+cost, coincident with a smooth convergence that could
+bias the learning towards a flat region.	FigUre 3: ViSUalizatiOn of LOOkSAM.
+To reuse gv in intermediate steps to mimic the SAM's
+update, we add gv to the current gradient g (computed on the clean loss). As the empirical analysis
+in Figure 2 suggests that gs and gh are not very stable, we propose a adaptive ratio to combine them.
+More specifically, we define ^^ as the adaptive ratio to scale a. In this way, we can ensure that
+the norms of g and gv are at the same scale.
+4
+Under review as a conference paper at ICLR 2022
+Algorithm 1 LookSAM
+Input: x ∈ Rd , learning rate ηt , update frequency k .
+for t — 1 to T do
+Sample Minibatch B = {(xi, yi),…，(χ∣B∣,y∣B∣)} from X.
+Compute gradient g = VwLb(W) on minibatch B.
+if t%k = 0 then
+Compute e(w) = P ∙ sign(g)
+Compute SAM gradient: gs = VwLB(w)|w+(w)
+gv = gs - kgsk COS(O) ∙ kgk, Where CoS(O) = kɪk
+else
+gs = g + α ∙ ∣rgvk∣ ∙ gv
+end if
+Update weights: wt+ι = Wt — ηt ∙ gs
+end for
+To demonstrate the reusing procedure, we theoretically derive the change ofgv within k steps in the
+following way (full derivation is shown in AppendixA.5),
+kgv,t - gv,t+k k ≈ k 1P 5 * *wt LS (Wt) Il 5wt LS (Wt)
+2	k 5wt LS (Wt)k
+1	2	5wt+k LS (Wt+k)
+- 2ρ 5wt+k	S(wt+k) k5wt+k LS(wt+k)kk,
+(5)
+where we ignore the third order terms in Taylor expansion in the derivation. As calculating SAM
+gradients leads to a relatively flat part of the region, the second order derivative is very small, from
+which we can infer the change of gv component is small compared to the gradient. This supports
+our algorithm in reusing gv and re-caculating it only periodically.
+3.3 Layer-Wise LookSAM
+When scaling up the batch size of SAM or LookSAM in large-batch training, we observe degraded
+performance as shown in the experiments (see Table 2). You et al. (2017; 2019) showed that the
+training stability with large batch training varies for each layer and applied a layer-wise adaptive
+learning rate scaling method to improve AdamW (also known as LAMB) to resolve this issue. We
+conjecture this also affects the SAM procedure, which motivates the following development of layer-
+wise SAM (LayerSAM) optimizer. As we are trying to introduce the layer-wise scaling into the inner
+maximization of SAM, it is different from You et al. (2019) which applied the scaling to the final
+update direction of AdamW.
+Let Λ denote a diagonal l × l matrix Λ = diag(ξ1, ξ2 * *, ..., ξl), where ξj(j=1,2,...,l) is the layer-wise
+adaptive rate and can be calculated by k5/Lwj(W j∣ for each layer. We then adopt this scaling into
+the inner maximization of SAM as
+LS (W) = max LS(W + ).
+∣Λ∣p≤ρ
+(6)
+Here the main idea is to scale each dimension of the perturbation vector according Λ. Similar to
+SAM, the weight perturbation in LayerSAM is the solution of the first-order approximation of equa-
+tion 6. With the added Λ, the approximate inner solution can be written as
+
+P Sign(5w LS (W))Λ
+| 5w LS(w)∣q-1
+(k5w LS (w)kq)P
+(7)
+where P + ɪ = 1. Equation 7 gives Us the layer-wise calculation of e to scale UP the batch size when
+using LookSAM. Algorithm 3 (in Appendix A.2) provides us the pseudo-code for the full Layer-
+SAM. Moreover, in order to combine advantages of both LookSAM and LayerSAM in large batch
+training, we further propose Look Layer-wise SAM (Look-LayerSAM) algorithm. The pseudo-
+code is given in Algorithm 2. Empirically, we show that Layer-LookSAM significantly outperforms
+LookSAM in large-batch training, as will be demonstrated in Section 4.
+5
+Under review as a conference paper at ICLR 2022
+Algorithm 2 Look-LayerSAM
+Input: x ∈ Rd , learning rate ηt , update frequency k .
+for t — 1 to T do
+Sample Minibatch B = {(xi,yi),…，(x∣b∣, y∣B∣)} from X.
+Compute gradient g = NwLB (W) on minibatch B.
+if t%k = 0 then
+Compute e(w)⑴=P jkw(i)k ∙ sign(g)
+Compute SAM gradient: gs = NwLB(w)|w+(w)
+gv = gs - kgsk COS(O) ∙诜,Where COS(O) = .Kk
+else
+gs = g + α ∙ ∣ik⅛ ∙ gv
+end if
+Update weights: wt+1 = Wti) - η(i) ∙ gSi)
+end for
+4	Experimental Results
+In this section, we evaluate the performance of our proposed LookSAM, LayerSAM and Look-
+LayerSAM. First, we empirically illustrate that LookSAM can obtain similar accuracy to vanilla
+SAM while accelerate the training process. Next, we show that LayerSAM has better generalization
+for large-batch training on ImageNet-1k compared with vanilla SAM. In addition, we observe Look-
+LayerSAM can not only scale up to larger batch size but also significantly speed up the training. As
+Vision Transformer (ViT) training has become one of the most important application of SAM (Chen
+et al., 2021), our experiments will mainly focus on training the ViT model, while we also include
+some experiments of ResNet and WideResNet on CIFAR10 and CIFAR100 in Appendix A.3 to
+further evaluate the generality of the proposed methods.
+4.1	Setup
+Dataset. ImageNet training is the current benchmark for evaluating the performance of large-batch
+training. In this paper, we use ImageNet-1k with 1.3M images (Deng et al., 2009) to train the ViT
+models.
+Models. To explore the scalability of SAM for ViT models (Dosovitskiy et al., 2020), we select the
+ViT models with various size to scale up batch size, such as ViT-Base and ViT-Small.
+Baselines. Our main baseline is SAM (Foret et al., 2020). To better assess the performance of
+LookSAM, we propose the algorithm SAM-k as the baseline for comparison. More specially, SAM-
+k can be seen as the method that directly use SAM every k steps.
+Implementation Details. We implement our algorithm in JAX (Bradbury et al., 2018) and follow
+the original setting from SAM (Foret et al., 2020). To compare the performance of LookSAM with
+vanilla SAM, we conduct AdamW (Loshchilov & Hutter, 2017) as the optimizer. Note that the input
+resolution is 224, which is the official setting for ViT. To scale up the batch size, we use LAMB (You
+et al., 2019) as our base optimizer for large-batch training and compare our approaches with SAM.
+We apply learning rate warmup scheme (Goyal et al., 2017) to avoid the divergence due to the large
+learning rate, where training starts with a smaller learning rate η and gradually increases to the
+large learning rate η for 300 epochs. In addition, to further improve the performance of large-batch
+training, we use RandAug (Cubuk et al., 2020) and Mixup (Zhang et al., 2017) to scale the batch
+size to 64k. The implementation details can be found in Appendix A.4.
+4.2	ImageNet Training from S cratch on Vision Transformer
+Following the original setting of ViT, we firstly train ViT with LookSAM and compare it with
+vanilla ViT and SAM-k. The experimental results are given in Table 1. It shows that LookSAM
+achieves similar accuracy with vanilla SAM and obtains much better performance than SAM-k.
+Specifically, compared with the minimal improvement of SAM-k over vanilla AdamW, LookSAM
+6
+Under review as a conference paper at ICLR 2022
+yields considerable improvements, such as the top-1 accuracy improvement from 74.7% to 79.8%
+on LookSAM-5, while SAM-5 can only achieve 75.7%. In addition, our proposed LookSAM al-
+gorithm can achieve faster training speed and maintain the similar accuracy compared with SAM.
+Further, by computing SAM’s update only periodically, our method significantly improve the time
+cost over SAM while keeping similar predictive performance. For instance, LookSAM-5 enables a
+competitive reduction of training time by 2/3 for ViT-B-16 (from 103.1s to 68.6s) without any loss
+in test accuracy (79.8%). Moreover, this advantage is widely reflected in different settings (shown
+in Table 1) and thereby our proposed methods can be adopted in a variety of ViT models.
+Table 1: Top-1 accuracy and training time in per epoch (accuracy/time) of ViTs trained from scratch
+on ImageNet-1k. We use warmup scheme coupled with a cosine scaling rule for 300 epochs. Fol-
+lowing the original setting of ViT, we set batch size as 4096.
+Model	AdamW	SAM-5	LookSAM-5	SAM-10	LookSAM-10	SAM
+ViT-B-16	74.7∕59.7s	75.7∕68.6s	^^79.8/70.5s	75.1∕63.7s	78.7/67.1s	79.8∕103.1s
+ViT-B-32	68.7∕21.8s	69.8∕24.7s	72.6/26.3s	69.0∕23.4s	71.5/24.4s	72.8∕38.5s
+ViT-S-16	74.9∕24.1s	75.5∕28.3s	77.6/30.1s	74.9∕25.4s	77.1/27.6s	77.6∕44.9s
+ViT-S-32	68.1∕18.2s	68.7∕18.5s	68.8/19.8s	68.1∕18.5s	68.7/19.5s	68.9∕25.7s
+4.3	Large-Batch Training for Vision Transformer
+To further evaluate the performance of our proposed algorithms for large-batch training, we use
+Look-LayerSAM to scale the batch size for ViT training on ImageNet-1k. As shown in Table 2,
+based on Look-LayerSAM, we can scale the batch size from 4096 to 32768 while keep the accuracy
+above 77%. Note that although vanilla SAM can improve the performance of ViT while scaling
+up, the improvement is weakened as batch size increases. For instance, the improvements are 4%,
+4%, 3.2%, 2.7% from batch size 4096 to 32768 over LAMB (which is a standard optimizer for
+large batch training). In contrast, our proposed Look-LayerSAM can consistently achieve a higher
+improvement even if scaling up the batch size to 32768. In particular, the increment on accuracy
+are stable from 4096 to 32768: 5.6%, 5.8%, 4.4% and 5.5% over the LAMB optimizer. Moreover,
+LookSAM is able to achieve the performance on par with the vanilla SAM, while enjoying similar
+computational cost as LAMB. For example, top-1 accuracy of SAM and LookSAM are 78.6% and
+78.9%, respectively, when batch size is 4096. We continue to observe that Look-LayerSAM offer
+much more considerable benefits on large batch training, including 80.3% accuracy on 4096, as well
+as 77.1% on batch size 32768, in which SAM and LookSAM achieve 75.1% and 75.3%.
+Table 2: Large-batch training accuracy of ViT-B-16 on ImageNet-1k. We use warmup scheme cou-
+pled with linear rule to scale the learning rate for 300 epochs. Look-LayerSAM achieves consistent
+higher accuracy than SAM from 4k to 32k.
+Algorithm	4k	8k	16k	32k
+LAMB	74.6	74.3	74.4	72.4
+LAMB + SAM	78.6	78.3	77.6	75.1
+LAMB + Look-SAM	78.9	78.4	77.1	75.3
+LAMB + Look-LayerSAM	80.3	79.5	78.4	77.1
+In addition, related work has shown that data augmentation can improve the performance of large-
+batch training. Therefore, we try to further scale the batch size to 64k based on RandAug and Mixup.
+The experimental results are shown in Table 3, which illustrates that our proposed Layer-LookSAM
+can work together with data augmentation and improve the performance of large-batch training.
+For instance, Look-LayerSAM can also achieve 74.9% when applying RandAug and Mixup at 64k.
+After using Mixup, the accuracy improves to 75.6%.
+7
+Under review as a conference paper at ICLR 2022
+Accuracy-lraιπι ng Ti me σf viT-B-16 on ImageNet-Ik
+Accuracy-Traιπιng Ti me of viτ-B-32 on ImageNet-Ik
+sdu6nojua
+24000
+22000
+20000
+ιβooo∙
+16000-
+14000
+12000
+ιoooo∙
+throughput
+-Ir- accuracy
+.82	60000
+βθ	55000-
+50000-
+45000-
+■ 74	40006
+■ 72	35000-
+70	3∞00
+sdsnoJc~
+&S3UUQ
+l∞kSAMtl) LookSAM(S) UnkSAM(IO) L∞kSAM(20)
+throughput	-⅜- MCUeW
+LookSAMtl) LookSAM(S) LookSAMtlO) LookSAM(ZO)
+-74
+55000
+50000 -
+45000
+«000	-
+.e4	35000■
+Q	30000
+■ «1	2508	-
+Accuracy-Training Time of viTS-16 on ImageNet-Ik
+sdsnoJc~
+X35n8e
+(C) ViT-S-16
+X35n8e
+⑶ ViT-B-16
+(b) ViT-B-32
+Figure 4: Accuracy-Training Time of different models for LookSAM-k on ImageNet-Ik. With the
+growth of k value, the throughput is increasing but the accuracy starts to drop. There is a trade-off
+between the accuracy and training speed.
+Table 3: Accuracy of ViT-B-16 on ImageNet-1k when using RandAug and Mixup
+Algorithm	RandAug	Mixup	Optimizer	32k	64k
+Vanilla ViT			LAMB	72.4	68.1
+Look-LayerSAM			LAMB	77.1	72.0
+Look-LayerSAM	X		LAMB	79.2	74.9
+Look-LayerSAM	X	X	LAMB	79.7	75.6
+To further evaluate the performance of LookSAM about accelerating the training of SAM, we an-
+alyze their training time when scaling batch size from 4096 to 32768. Note that we use TPU v3
+128 chips, TPU v3 256 chips, TPU v3 512 chips and TPU v3 1024 chips to report the speed of
+ViT-B-16 on batch size 4096, 8192, 16384 and 32768. Besides, we use warmup schedule coupled
+with linear learning rate decay for 300 epochs. The experimental results are shown in Table 4, which
+illustrates that LayerSAM will cause about 1.7× training time compared with vanilla ViT. However,
+Look-LayerSAM can significantly reduce the training time and achieve 1.5× speed compared with
+LayerSAM when k = 5. In particular, training time of ViT-B-16 on ImageNet-1k can be reduced to
+0.7 hour.
+To sum up, with Look-LayerSAM, we are able to train Vision Transformer in 0.7 hour and achieve
+77.1% top-1 accuracy on ImageNet-1k with 32K batch size, outperforming existing optimizers such
+as LAMB and SAM.
+Table 4: Training Time of ViT-B-16 on ImageNet-1k
+Algorithm	4k	8k	16k	32k
+LAMB	4.8h	2.4h	1.2h	/
+LAMB + LayerSAM	8.4h	4.3h	2.2h	1.1h
+LAMB + Look-LayerSAM	5.6h	2.8h	1.4h	0.7h
+4.4	Accuracy and Efficiency Tradeoff
+The reuse frequency k controls the trade-off between the accuracy and speed. In this section, we try
+to conduct an analysis on the performance of LookSAM with different values ofk. The experimental
+results in Figure 4 indicates that LookSAM can achieve the similar accuracy as vanilla SAM when
+k ≤ 5. With reuse frequency k getting larger, the accuracy begin to drop while the training speed
+is accelerated. When k is larger than 15, we notice that the speed is converged (almost identical to
+plain AdamW training). Therefore, in practice we can determine the k value based on the desired
+trade-off, and we recommend k = 5 for general applications since it will significantly improve the
+efficiency while still achieve almost identical test accuracy as SAM.
+8
+Under review as a conference paper at ICLR 2022
+4.5	Sensitivity Analysis about Hyper-Parameters
+In this section, we will analyse the sensitivity of our proposed algorithms for hyper-parameters,
+including the intensity of perturbation ρ and gradient reuse weight α.
+4.5.1	SENSITIVITY ANALYSIS OF α
+We study the effect of gradient reuse weight α has on the performance of training ImageNet-1k. As
+for batch size, we select 16384 and 32768 to analyze. That is because larger batch size is always
+more sensitive to the hyperparameters. The experiments are conducted on ViT-B-16 using Look-
+LayerSAM, with LAMB as optimizer. In the experiment, we set ρ as 1.0. We report the validation
+accuracy for different α (0.5,0.7,1.0) in Table 5. When α = 0.7, Look-LayerSAM achieves the best
+accuracy 78.4% on batch size 16384 and 77.1% on batch size 32768. Further, even if α is not well
+tuned, Look-LayerSAM is able to obtain a good performance, including above 77% accuracy on
+16384 and approx. 76% on 32768.
+Table 5: Sensitivity Analysis of α
+Model	Method	Optimizer	Batch Size	α = 0.5	α = 0.7	α = 1.0
+ViT-B-16	Look-LayerSAM	LAMB	~~16384^^	77.7	78.4	78.2
+ViT-B-16	Look-LayerSAM	LAMB	32768	76.5	77.1	75.9
+4.5.2	SENSITIVITY ANALYSIS OF ρ
+Finally, we also have a sensitivity analysis for different value of ρ, the intensity of perturbation on
+Look-LayerSAM algorithm. We evaluate the accuracy of ViT-B-16 on batch size 16384 and 32768.
+We set α = 0.7, the best value in our analysis from Section 4.5.1. The experimental results regarding
+ρ (0.5,0.8,1.0,1.2) are shown in Table 6. We report when ρ = 1.0, Look-LayerSAM achieves the
+highest accuracy on both batch size 16384 (78.4%) and 32768 (77.1%). Additionally, we observe
+the overall robustness from the analysis of ρ, which gives us 77% accuracy on 16384 and more than
+75% accuracy on 32768 without finetuning.
+Table 6: Sensitivity Analysis of ρ
+Model	Method	Optimizer	Batch Size	ρ = 0.5	ρ=0.8	ρ= 1.0	ρ = 1.2
+ViT-B-16	Look-LayerSAM	LAMB	^^16384^^	77.0	77.8	78.4	77.9
+ViT-B-16	Look-LayerSAM	LAMB	32768	75.2	76.4	77.1	76.7
+5	Conclusion
+We propose a novel algorithm LookSAM to reduce the additional computation from SAM and speed
+up the training process. To further evaluate the performance in large-batch training, we propose
+Look-LayerSAM, which use a layer-wise schedule to scale the weight perturbation of LookSAM.
+Finally, we evaluate our proposed algorithms on Vision Transformer. Experimental results illustrate
+that we can scale the batch size to 64k and obtain the accuracy above 75%. Further, we can achieve
+about 8× speedup over the training settings in Dosovitskiy et al. (2020) with a 4k batch size and
+finish the ViT training in 0.7 hour. To the best of our knowledge, this is a new speed record for ViT
+training.
+9
+Under review as a conference paper at ICLR 2022
+6	Ethics Statement
+We are not aware of any potential ethical issues in our work.
+7	Reproducibility Statement
+We provide detailed experimental setting of all experiments in Section 4 and Appendix to ensure the
+reproducibility of this paper. More specially, all the model architecture can be found in Appendix
+A.4 (Table 9). As for the hyperparameters of ViTs, we also introduce them in Appendix A.4 (Table
+10 and Table 11), which includes the learning rate, optimizer, weight decay, perturbation value ρ
+and so on.
+References
+Takuya Akiba, Shuji Suzuki, and Keisuke Fukuda. Extremely large minibatch sgd: Training resnet-
+50 on imagenet in 15 minutes. arXiv preprint arXiv:1711.04325, 2017.
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and Qiao
+Zhang. JAX: composable transformations of Python+NumPy programs, 2018. URL http:
+//github.com/google/jax.
+Pratik Chaudhari, Anna Choromanska, Stefano Soatto, Yann LeCun, Carlo Baldassi, Christian
+Borgs, Jennifer Chayes, Levent Sagun, and Riccardo Zecchina. Entropy-sgd: Biasing gradient
+descent into wide valleys. Journal of Statistical Mechanics: Theory and Experiment, 2019(12):
+124018, 2019.
+Xiangning Chen, Cho-Jui Hsieh, and Boqing Gong. When vision transformers outperform resnets
+without pretraining or strong data augmentations. arXiv preprint arXiv:2106.01548, 2021.
+Valeriu Codreanu, Damian Podareanu, and Vikram Saletore. Scale out for large minibatch sgd:
+Residual network training on imagenet-1k with improved accuracy and reduced time to train.
+arXiv preprint arXiv:1711.04291, 2017.
+Ekin D Cubuk, Barret Zoph, Jonathon Shlens, and Quoc V Le. Randaugment: Practical automated
+data augmentation with a reduced search space. In Proceedings of the IEEE/CVF Conference on
+Computer Vision and Pattern Recognition Workshops, pp. 702-703, 2020.
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hi-
+erarchical image database. In 2009 IEEE conference on computer vision and pattern recognition,
+pp. 248-255. Ieee, 2009.
+Aditya Devarakonda, Maxim Naumov, and Michael Garland. Adabatch: Adaptive batch sizes for
+training deep neural networks. arXiv preprint arXiv:1712.02029, 2017.
+Laurent Dinh, Razvan Pascanu, Samy Bengio, and Yoshua Bengio. Sharp minima can generalize
+for deep nets. In International Conference on Machine Learning, pp. 1019-1028. PMLR, 2017.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, et al. An
+image is worth 16x16 words: Transformers for image recognition at scale. arXiv preprint
+arXiv:2010.11929, 2020.
+Gintare Karolina Dziugaite and Daniel M Roy. Computing nonvacuous generalization bounds for
+deep (stochastic) neural networks with many more parameters than training data. arXiv preprint
+arXiv:1703.11008, 2017.
+Pierre Foret, Ariel Kleiner, Hossein Mobahi, and Behnam Neyshabur. Sharpness-aware minimiza-
+tion for efficiently improving generalization. arXiv preprint arXiv:2010.01412, 2020.
+10
+Under review as a conference paper at ICLR 2022
+Priya Goyal, Piotr Dollar, Ross Girshick, Pieter Noordhuis, LUkasz Wesolowski, AaPo Kyrola, An-
+drew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet
+in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Haowei He, Gao Huang, and Yang Yuan. Asymmetric valleys: Beyond sharP and flat local minima.
+arXiv preprint arXiv:1902.00744, 2019.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. DeeP residual learning for image recog-
+nition. In IEEE Conference on Computer Vision and Pattern Recognition, 2016.
+Elad Hoffer, Itay Hubara, and Daniel Soudry. Train longer, generalize better: closing the general-
+ization gaP in large batch training of neural networks. arXiv preprint arXiv:1705.08741, 2017.
+Forrest N Iandola, Matthew W Moskewicz, Khalid Ashraf, and Kurt Keutzer. Firecaffe: near-
+linear acceleration of deeP neural network training on comPute clusters. In IEEE Conference on
+Computer Vision and Pattern Recognition, 2016.
+Pavel Izmailov, Dmitrii PodoPrikhin, Timur GariPov, Dmitry Vetrov, and Andrew Gordon Wil-
+son. Averaging weights leads to wider oPtima and better generalization. arXiv preprint
+arXiv:1803.05407, 2018.
+Stanislaw Jastrzebski, Zachary Kenton, Devansh ArPit, Nicolas Ballas, Asja Fischer, Yoshua
+Bengio, and Amos Storkey. Three factors influencing minima in sgd. arXiv preprint
+arXiv:1711.04623, 2017.
+Stanislaw Jastrzebski, Devansh ArPit, Oliver Astrand, Giancarlo B Kerg, Huan Wang, Caiming
+Xiong, Richard Socher, Kyunghyun Cho, and Krzysztof J Geras. CatastroPhic fisher exPlosion:
+Early Phase fisher matrix imPacts generalization. In International Conference on Machine Learn-
+ing,pp. 4772-4784. PMLR, 2021.
+Xianyan Jia, Shutao Song, Wei He, Yangzihao Wang, Haidong Rong, Feihu Zhou, Liqiang Xie,
+Zhenyu Guo, Yuanzhou Yang, Liwei Yu, et al. Highly scalable deep learning training system with
+mixed-precision: Training imagenet in four minutes. arXiv preprint arXiv:1807.11205, 2018.
+Chi Jin, Lydia T Liu, Rong Ge, and Michael I Jordan. On the local minima of the empirical risk.
+arXiv preprint arXiv:1803.09357, 2018.
+Nitish Shirish Keskar, Dheevatsa Mudigere, Jorge Nocedal, Mikhail Smelyanskiy, and Ping Tak Pe-
+ter Tang. On large-batch training for deep learning: Generalization gap and sharp minima. arXiv
+preprint arXiv:1609.04836, 2016.
+Sameer Kumar, Yu Wang, Cliff Young, James Bradbury, Naveen Kumar, Dehao Chen, and Andy
+Swing. Exploring the limits of concurrency in ml training on google tpus. Machine Learning and
+Systems, 2021.
+Jungmin Kwon, Jeongseop Kim, Hyunseo Park, and In Kwon Choi. Asam: Adaptive sharpness-
+aware minimization for scale-invariant learning of deep neural networks. arXiv preprint
+arXiv:2102.11600, 2021.
+Beatrice Laurent and Pascal Massart. Adaptive estimation of a quadratic functional by model selec-
+tion. Annals of Statistics, pp. 1302-1338, 2000.
+Hao Li, Zheng Xu, Gavin Taylor, Christoph Studer, and Tom Goldstein. Visualizing the loss land-
+scape of neural nets. arXiv preprint arXiv:1712.09913, 2017.
+Mu Li. Scaling distributed machine learning with system and algorithm co-design. PhD thesis, PhD
+thesis, Intel, 2017.
+Yong Liu, Xiangning Chen, Minhao Cheng, Cho-Jui Hsieh, and Yang You. Concurrent adversarial
+learning for large-batch training. arXiv preprint arXiv:2106.00221, 2021.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. arXiv preprint
+arXiv:1711.05101, 2017.
+11
+Under review as a conference paper at ICLR 2022
+James Martens and Roger Grosse. Optimizing neural networks with kronecker-factored approximate
+curvature. In International conference on machine learning. PMLR, 2015.
+Kazuki Osawa, Yohei Tsuji, Yuichiro Ueno, Akira Naruse, Rio Yokota, and Satoshi Matsuoka.
+Second-order optimization method for large mini-batch: Training resnet-50 on imagenet in 35
+epochs. arXiv preprint arXiv:1811.12019, 2018.
+S Reddi, Manzil Zaheer, Devendra Sachan, Satyen Kale, and Sanjiv Kumar. Adaptive methods for
+nonconvex optimization. In Proceeding of 32nd Conference on Neural Information Processing
+Systems (NIPS 2018), 2018.
+Sashank J Reddi, Satyen Kale, and Sanjiv Kumar. On the convergence of adam and beyond. arXiv
+preprint arXiv:1904.09237, 2019.
+Christopher J Shallue, Jaehoon Lee, Joseph Antognini, Jascha Sohl-Dickstein, Roy Frostig, and
+George E Dahl. Measuring the effects of data parallelism on neural network training. arXiv
+preprint arXiv:1811.03600, 2018.
+Samuel L Smith and Quoc V Le. A bayesian perspective on generalization and stochastic gradient
+descent. arXiv preprint arXiv:1710.06451, 2017.
+Samuel L Smith, Pieter-Jan Kindermans, Chris Ying, and Quoc V Le. Don’t decay the learning rate,
+increase the batch size. arXiv preprint arXiv:1711.00489, 2017.
+Yusuke Tsuzuku, Issei Sato, and Masashi Sugiyama. Normalized flat minima: Exploring scale in-
+variant definition of flat minima for neural networks using pac-bayesian analysis. In International
+Conference on Machine Learning, pp. 9636-9647. PMLR, 2020.
+Wei Wen, Yandan Wang, Feng Yan, Cong Xu, Chunpeng Wu, Yiran Chen, and Hai Li. Smoothout:
+Smoothing out sharp minima to improve generalization in deep learning. arXiv preprint
+arXiv:1805.07898, 2018.
+Masafumi Yamazaki, Akihiko Kasagi, Akihiro Tabuchi, Takumi Honda, Masahiro Miwa, Naoto
+Fukumoto, Tsuguchika Tabaru, Atsushi Ike, and Kohta Nakashima. Yet another accelerated sgd:
+Resnet-50 training on imagenet in 74.7 seconds. arXiv preprint arXiv:1903.12650, 2019.
+Mingyang Yi, Qi Meng, Wei Chen, Zhi-ming Ma, and Tie-Yan Liu. Positively scale-invariant flat-
+ness of relu neural networks. arXiv preprint arXiv:1903.02237, 2019.
+Chris Ying, Sameer Kumar, Dehao Chen, Tao Wang, and Youlong Cheng. Image classification at
+supercomputer scale. arXiv preprint arXiv:1811.06992, 2018.
+Yang You, Igor Gitman, and Boris Ginsburg. Scaling sgd batch size to 32k for imagenet training.
+arXiv preprint arXiv:1708.03888, 2017.
+Yang You, Zhao Zhang, Cho-Jui Hsieh, James Demmel, and Kurt Keutzer. Imagenet training in
+minutes. In International Conference on Parallel Processing, 2018.
+Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan
+Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization for deep
+learning: Training bert in 76 minutes. arXiv preprint arXiv:1904.00962, 2019.
+Hongyi Zhang, Moustapha Cisse, Yann N Dauphin, and David Lopez-Paz. mixup: Beyond empirical
+risk minimization. arXiv preprint arXiv:1710.09412, 2017.
+Jingzhao Zhang, Sai Praneeth Karimireddy, Andreas Veit, Seungyeon Kim, Sashank J Reddi, Sanjiv
+Kumar, and Suvrit Sra. Why adam beats sgd for attention models. 2019.
+12
+Under review as a conference paper at ICLR 2022
+A Appendix
+A. 1 Theoretical Analysis of Projected Gradient
+For SAM loss function LS(W + ^), based on Taylor Expansion, We Can obtain:
+LS(W + ^) ≈ LS(W) + 式WLS(W)
+(8)
+Therefore, We can reWrite Equation 3 as folloWs:
+Vw LS (W)∣w+^ = Vw+⅞LS (w + e)
+≈ Vw+,[LS(w)+ eVwLS(w)]
+=Vw LS (w)+ eVw LS (w)
+In this section, We Will analyse the distance of gv Within several steps k, Which is given by,
+gv = ^VwLS(w) - λo 5w Ls(w)
+(9)
+(10)
+Note that gv is vertical to the SGD gradient on original Weight W, Which gives us the folloWing
+constraint:
+(^VWLS(w) - λo 5w LS(w)) 5w Ls(w) = 0
+(11)
+We can use Lagrange function to describe and solve this problem. Let’s introduce a neW variable λ
+and define the Lagrangian L With all the parameters W , λ0 and λ as variable as folloWs,
+L(w, λo, λ) =^VWLS(W)- λo 5w LS(W)
++ λ(^VWLS(W)- λo 5w Ls(W)) 5 LS(W)
+(12)
+The partial derivative of L With respect to W, λ0 and λ are as folloWs,
+h/ 、、、	∂e De,、 八 Qc/、 、	De,、
+Lw(W, λ0, λ) = ∂W 5w LS(w) + ^ 5w ls(w) - λo 5w LS(w)
+一∂e c_,、	.q_,、	、	c_,、、	一,、
++ λ(∂W 5w Ls(w) + e 5w LS(w) - λο 5w LS(w)) 5w LS(w)
++ λ(e 5w Ls(w) - λ° 5w LS(w)) 5w LS(w)
+(13)
+Lλ0 (W, λ0, λ) = -5wLS(W)
+Lλ(W, λo, λ) = (eVWLS(w) - λo Nw LS(w)) Nw LS(w)
+(14)
+(15)
+We omit some high order terms that are close to 0 in the calculation and set all of the partial deriva-
+tives equal to 0. This gives,
+h /	、、、	∂ e	De,、 、	De,、 C
+Lw(w, λ0, λ) ≈ ∂W 5w ls(W) - λ0 5w ls(W) = 0
+Lλ0 (W, λ0, λ) = - Nw LS (W) = 0
+Lλ(W, λo, λ) = (eVwLS(w) - λo 5w LS(w)) 5w LS(w) = 0
+(16)
+SinCe 焉=ρ( ∣∣5WLS(w)∣∣ - 5wLS(w∣)5⅛(w⅞WLS(w) ) and from EqUatiOn 16 we have
+∂^ = λ0, then
+λ0 = ρ(
+▽wLs (W)
+l∣5w Ls(w)||
+5wLS(w) 5w LS(w) 5w LS(w)
+l∣5w LS(w)||3
+(17)
+In addition, from Equation 16, we have,
+(2VwLS(w) - λo 5w Ls(w)) 5w LS(w) = 0
+(18)
+13
+Under review as a conference paper at ICLR 2022
+Then λ0 can be written as:
+With Equation 14 and 19,
+λ0 = ρ
+5w LS (w) 5w LS (w) 5w LS (w)
+||5wLS(w)||3
+(19)
+5WLS(W)	5wLS(W) 5W LS(W) 5w LS(W))	5wLS(W) 5W LS(W) 5w LS(W)
+l∣5w LS(w)ll	l∣5w LS(W)II3	) = P	l∣5w LS(w)II3
+1	5WLS (W)	_ 5w LS (W) 5W LS (W) 5w LS (W)
+2ρ II5W LS (W)II = P	II5W LS (W)II3
+(20)
+Using the relationship in Equation 20, we can write λ0 in this way:
+1	5W LS(W)
+2ρII 5w LS(w)II
+(21)
+Substituting the value of λ0 back to Equation 12 gives us the maximum of the Lagrangian.
+L(W, λo, λ) = ^VWLS(W) - λo 5w Ls(w)
+5W LS (W)	2	1	5WLS (W)
+PII 5w LS(W)II 5w Ls(W)- 2PII5w LS(W)II 5w LS(W)
+(22)
+Using this relationship in Equation 22 gives us:
+gv
+1	2	5WLS (W)
+L(W,λ0,λ) = 2P5w LS(w) H 5w LS(w)II
+(23)
+We can use Equation 23 to derive the distance of gv within k steps,
+IIgv,t - gv,t+k II = IILt (Wt, λ0 , λ) - Lt+k (Wt+k , λ0, λ)II
+
+ii 1P5Wt LS(Wt)
+5 Wt LS (Wt)
+1I5WtLS (Wt) H
+(24)
+12
+-2P 5wt+k
+5Wt+k LS (Wt+k)
+LS(Wt+k) II5wt+k LS(wt+k)∣∣11
+A.2 LAYERSAM
+Algorithm 3 Layer-wise SAM (LayerSAM)
+Input: x ∈ Rd , learning rate ηt , update frequency k .
+for t — 1 to T do
+Sample Minibatch B = {(xi, yi),…，(χ∣B∣,y∣B∣)} from X.
+Compute gradient g = VWLB(W) on minibatch B.
+Compute e(i) = P ∣∣Ww∣∣l ∙ sign(g)
+Compute gradient approximation for the SAM objective: gs = VWLB(W)IW+
+Update weights: w(?i = Wti) - η(i) ∙ g(i)
+end for
+14
+Under review as a conference paper at ICLR 2022
+A.3 ResNet and WideResNet
+In this section, we try to conduct some experiments for training ResNet and WideResNet on CIFAR-
+10 and CIFAR-100 to evaluate the performance of our proposed algorithms. The experimental
+results are shown in Table 7 and 8. We can find that LookSAM can obtain a better accuracy than
+SAM-5 and meanwhile achieve a similar accuracy compared with SAM.
+Table 7: Accuracy of different Models on CIFAR10
+Model	AdamW	SAM-5	SAM-10	SAM-20	LookSAM-5	LookSAM-10	LookSAM-20	SAM
+WRN-28-10	96.5	97.2	97.0	968	97.3	97.1	97.0	97.3
+ResNet-18	95.6	96.2	96.0	96.0	96.2	96.1	96.1	96.4
+ResNet-50	95.7	96.6	96.5	96.2	96.8	96.6	96.4	96.9
+Table 8: Accuracy of Different Models on CIFAR100
+Model	AdamW SAM-5 SAM-10 SAM-20	LookSAM-5	LookSAM-10	LookSAM-20	SAM
+wrn-28-10	81.7	83.8	833	829	844	843	836 ResNet-18	78.9	80.4	80.0	79.7	80.7	80.4	80.0 ResNet-50	81.4	82.5	82.3	82.1	83.3	82.8	82.4	84.4 80.7 83.3
+A.4 Parameter Settings
+In this section, we will introduce the architectures of ViTs in this paper (Table 9). Next, we provide
+the hyperparameters in Table 10 for ViT training, including learning rate, warmup, optimizer, gradi-
+ent clipping, epoch, etc. In addition, Table 11 gives us the parameter settings of ViT for large-batch
+training in this paper.
+Table 9: Architectures of ViTs
+Model	Params	Patch Resolution	Sequence Length	Hidden Size	Heads	Layers
+ViT-B-16	87M	16×16	196	768	12	12
+ViT-B-32	88M	32 × 32	49	768	12	12
+ViT-S-16	22M	16×16	196	384	6	12
+ViT-S-32	23M	32 × 32	49	384	6	12
+15
+Under review as a conference paper at ICLR 2022
+Table 10: Parameter Settings of ViT for Vanilla Training
+Model	Input Resolution	Batch Size	Epoch	Warmup Steps	Peak LR	LR Decay	Optimizer	ρ	Weight Decay	Gradient Clipping
+ViT-B-16	224	4096	200	10000	3e-3	cosine	AdamW	/	0.3	1.0
+ViT-B-32	224	4096	200	10000	3e-3	cosine	AdamW	/	0.3	1.0
+ViT-S-16	224	4096	200	10000	3e-3	cosine	AdamW	/	0.3	1.0
+ViT-S-32	224	4096	200	10000	3e-3	cosine	AdamW	/	0.3	1.0
+ViT-B-16 + SAM	224	4096	200	10000	3e-3	cosine	AdamW	0.18	0.3	1.0
+ViT-B-32 + SAM	224	4096	200	10000	3e-3	cosine	AdamW	0.15	0.3	1.0
+ViT-S-16 + SAM	224	4096	200	10000	3e-3	cosine	AdamW	0.1	0.3	1.0
+ViT-S-32 + SAM	224	4096	200	10000	3e-3	cosine	AdamW	0.05	0.3	1.0
+ViT-B-16 + LookSAM	224	4096	200	10000	3e-3	cosine	AdamW	0.18	0.3	1.0
+ViT-B-32 + LookSAM	224	4096	200	10000	3e-3	cosine	AdamW	0.15	0.3	1.0
+ViT-S-16 + LookSAM	224	4096	200	10000	3e-3	cosine	AdamW	0.1	0.3	1.0
+ViT-S-32 + LookSAM	224	4096	200	10000	3e-3	cosine	AdamW	0.05	0.3	1.0
+Table 11: Parameter Settings of ViT for Large-Batch Training
+Model	Batch Size	Epoch	Warmup Steps	Peak LR	LR Decay	Optimizer	ρ	α	Weight Decay	Gradient Clipping
+ViT-B-16 + SAM	4096	200	10000	1e-2	linear	LAMB	0.18	/	0.1	1.0
+ViT-B-16 + SAM	8192	200	10000	1.7e-2	linear	LAMB	0.18	/	0.1	1.0
+ViT-B-16 + SAM	16834	200	7000	1.8e-2	linear	LAMB	0.18	/	0.1	1.0
+ViT-B-16 + SAM	32768	200	6000	1.8e-2	linear	LAMB	0.18	/	0.1	1.0
+ViT-B-16 + LayerSAM	4096	200	10000	1e-2	linear	LAMB	1.0	/	0.1	1.0
+ViT-B-16 + LayerSAM	8192	200	10000	1.7e-2	linear	LAMB	1.0	/	0.1	1.0
+ViT-B-16 + LayerSAM	16384	200	7000	1.8e-2	linear	LAMB	1.0	/	0.1	1.0
+ViT-B-16 + LayerSAM	32768	200	6000	1.8e-2	linear	LAMB	1.0	/	0.1	1.0
+ViT-B-16 + LayerSAM	65536	200	3500	2e-2	linear	LAMB	1.0	/	0.2	1.0
+ViT-B-16 + Look-LayerSAM	4096	200	10000	1e-2	linear	LAMB	1.0	0.7	0.1	1.0
+ViT-B-16 + Look-LayerSAM	8192	200	10000	1.7e-2	linear	LAMB	1.0	0.7	0.1	1.0
+ViT-B-16 + Look-LayerSAM	16384	200	7000	1.8e-2	linear	LAMB	1.0	0.7	0.1	1.0
+ViT-B-16 + Look-LayerSAM	32768	200	6000	1.8e-2	linear	LAMB	1.0	0.7	0.1	1.0
+ViT-B-16 + Look-LayerSAM	65536	200	3500	2e-2	linear	LAMB	1.0	0.7	0.2	1.0
+A.5 Generalization bound
+We firstly introduce Theorem 1 regarding generalization bound based on sharpness of LookSAM
+and then give a proof for it. Note that a similar bound was also established in the original SAM
+paper Foret et al. (2020).
+Theorem 1. With probability 1 -δ over the choice the training set S 〜 D, we have
+LD(W) ≤N≡max ρoLS (W+C
++
+k log(1 + %2 (1 + √logk(n) )2 )+4log δ + O(1)
+n-1
+(25)
+where n = |S | and ρ02 = ρ2 + ρ20.
+Proof. We start by illustrating the PAC-Bayesian Generation Bound theorem, which gives a bound
+on the generalization error of any posterior distribution Q on parameters that can be achieved using
+16
+Under review as a conference paper at ICLR 2022
+a selected prior distribution P over parameters training with data set S. Let KL(Q||P) denote the
+KL divergence between two Bernoulli distributions P and Q, we have:
+∕kl(qi∣p ) + iog n
+Ew~L[LD(W)] ≤ Ew~L[LS(W)] + V	2(n — 1) δ
+(26)
+In order to accelerate the training process, LookSAM calculate the SAM gradient only at every k step
+and try to reuse the projected components to imitate the weight perturbations introduced from SAM
+procedure in the subsequent steps. We use 0 to indicate the difference between our imitated weight
+perturbation, 0, from LookSAM and the real weight perturbation, , from SAM. As the optimiza-
+tion is in fact regarding the distribution of e0, We assume that LD(W) ≤ Ee0〜N(op)[Ld(W + e0)],
+which indicates adding Gaussian perturbation should not decrease the test error(Foret et al., 2020).
+FolloWing Foret et al., the generalization bound can be Written as folloWs:
+Eei〜N(0,σ0)[LD (W + CO)] ≤ Eei〜N(0,σ0)[LS (W + €0)]
++
+/ɪ k log(1 + ∣kWσ22-) + 1 + logn + 2log(6n + 3k)
+V	n - 1
+(27)
+Where 0i = i + i0
+In Equation (27), We assume that i and i0 are independent normal variables With mean 0,
+and corresponding variance σ and σ0 respectively. Let {0i }, Where 0i = i + i0, be the independent
+normal variable With mean 0 and variance σ02 = σ2 + σ02 . In particular, at the time When LookSAM
+can perfectly imitate the SAM procedure by reusing the projected gradient, σ02 becomes zero and
+σ02 equals to σ2. As ||C0||22 has chi-square distribution in this case and based on concentration
+inequality from Lemma 1 in (Laurent & Massart, 2000), We obtain the folloWing for any positive x:
+P(||€ + €o||2 - k(σ2 + σ0) ≥ 2(σ2 + σ2)√kx + 2x(σ2 + σ0)) ≤ exp(-x)	(28)
+Let X = ln √n, then we have that
+P(||c + €01|2 ≥ (σ2 + σ0)(k + 2 Jkln√n + 2ln√n)) ≤ √=	(29)
+With probability of (1 - √^), we have,
+l∣c0∣∣2 = l|€ + €o||2 ≤ (σ2 + σ0)(k + 2,kln√ +2ln√n) ≤ (σ2 + σ2)k(1+Jlnn)2 ≤ P + ρ0,
+(30)
+where ρ0 = σ0k(1 + Jlnn )2.
+After substituting the value for σ0 back to Equation (27), we can generate the following
+bounds:
+LD(W) ≤ (1-------ɛ) max LS(W + €0) +---------F
+√n ιeι∣p≤ρo	√n
+1 k log(1 + l⅛j2 (1 + J* ))2 +log δ +2log(6n + 3k))
++ ∖ -----------P-------y------；----------------------
+n-1
+≤ max LS(W + €0)
+ιι0ιιp≤ρ0
+(31)
+klog(1 + 皆(1 + 产触)2) + 4log ⅞ +8log(6n + 3k))
+n-1
+where ρ02 = ρ2 + ρ20 .
+17

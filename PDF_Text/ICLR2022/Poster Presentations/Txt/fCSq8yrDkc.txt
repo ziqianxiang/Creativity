@@ -1,0 +1,942 @@
+﻿Published as a conference paper at ICLR 2022
+A fast and accurate splitting method for op-
+timal transport: analysis and implementation
+Vien V. Mai *	Jacob Lindback t	Mikael Johansson t
+Ab stract
+We develop a fast and reliable method for solving large-scale optimal transport
+(OT) problems at an unprecedented combination of speed and accuracy. Built on
+the celebrated Douglas-Rachford splitting technique, our method tackles the orig-
+inal OT problem directly instead of solving an approximate regularized problem,
+as many state-of-the-art techniques do. This allows us to provide sparse trans-
+port plans and avoid numerical issues of methods that use entropic regularization.
+The algorithm has the same cost per iteration as the popular Sinkhorn method,
+and each iteration can be executed efficiently, in parallel. The proposed method
+enjoys an iteration complexity O(1/) compared to the best-known O(1/2) of
+the Sinkhorn method. In addition, we establish a linear convergence rate for our
+formulation of the OT problem. We detail an efficient GPU implementation of
+the proposed method that maintains a primal-dual stopping criterion at no extra
+cost. Substantial experiments demonstrate the effectiveness of our method, both
+in terms of computation times and robustness.
+1	Introduction
+We study the discrete optimal transport (OT) problem:
+minimize	hC, Xi
+X≥0	>	(1)
+subject to X1n = p and X>1m = q,
+where X ∈ R+m×n is the transport plan, C ∈ R+m×n is the cost matrix, and p ∈ R+m and q ∈ Rn+
+are two discrete probability measures. OT has a rich history in mathematics and operations research
+dating back to at least the 18th century. By exploiting geometric properties of the underlying ground
+space, OT provides a powerful and flexible way to compare probability measures. It has quickly
+become a central topic in machine learning and has found applications in countless learning tasks,
+including deep generative models (Arjovsky et al., 2017), domain adaptation (Courty et al., 2016),
+and inference of high-dimensional cell trajectories in genomics (Schiebinger et al., 2019); we refer
+to Peyre & Cuturi (2019) for a more comprehensive survey of OT theory and applications. However,
+the power of OT comes at the price of an enormous computational cost for determining the optimal
+transport plan. Standard methods for solving linear programs (LPs) suffer from a super-linear time
+complexity in term of the problem size. Such methods are also very challenging to parallelize on
+modern processing hardware. Therefore, there has been substantial research in developing new
+efficient methods for OT. This paper advances the state of the art in this direction.
+1.1	Related work
+Below we review some of the topics most closely related to our work.
+Sinkhorn method The Sinkhorn (SK) method (Cuturi, 2013) aims to solve an approximation of
+(1) in which the objective is replaced by a regularized version of the formhC, Xi - ηH(X). Here,
+H(X) = - Pij Xij log(Xij ) is an entropy function and η > 0 is a regularization parameter. The
+Sinkhorn method defines the quantity K = exp(-C∕η) and repeats the following steps
+uk = p/(K vk-1 ) and vk = q/(K uk ),
+* Ericsson AB, vien.mai@ericsson.com
+tKTH Royal Institute of Technology, { jlindbac,mikaelj }@kth.se
+1
+Published as a conference paper at ICLR 2022
+until kuk (Kvk) - pk+kvk-1 (K>uk) - qk becomes small, then returns diag(uk)K diag(vk).
+The division (/) and multiplication () operators between two vectors are to be understood entry-
+wise. Each SK iteration is built from matrix-vector multiplies and element-wise arithmetic opera-
+tions, and is hence readily parallelized on multi-core CPUs and GPUs. However, due to the entropic
+regularization, SK suffers from numerical issues and can struggle to find even moderately accurate
+solutions. This problem is even more prevalent in GPU implementations as most modern GPUs are
+built and optimized for single-precision arithmetic (Kirk & Wen-Mei, 2016; Cheng et al., 2014).
+Substantial care is therefore needed to select an appropriate η that is small enough to provide a
+meaningful approximation, and large enough to avoid numerical issues. In addition, the entropy
+term enforces a dense solution, which can be undesirable when the optimal transportation plan itself
+is of interest (Blondel et al., 2018). We mention that there has been substantial research in improving
+the performance of SK (Alaya et al., 2019; Altschuler et al., 2017; Blondel et al., 2018; Lin et al.,
+2019). Most of these contributions improve certain aspects of SK: some result in more stable but
+much slower methods, while others allow to produce sparse solutions but at a much higher cost per
+iteration. Some of these sophisticated changes make parallelization challenging due to the many
+branching conditions that they introduce.
+Operator splitting solvers for general LP With a relatively low per-iteration cost and the ability
+to exploit sparsity in the problem data, operator splitting methods such as Douglas-Rachford split-
+ting (Douglas & Rachford, 1956) and ADMM (Gabay & Mercier, 1976) have gained widespread
+popularity in large-scale optimization. Such algorithms can quickly produce solutions of moder-
+ate accuracy and are the engine of several successful first-order solvers (O’donoghue et al., 2016;
+Stellato et al., 2020; Garstka et al., 2021). As OT can be cast as an LP, it can, in principle, be
+solved by these splitting-based solvers. However, there has not been much success reported in this
+context, probably due to the memory-bound nature of large-scale OTs. For OTs, the main bot-
+tleneck is not floating-point computations, but rather time-consuming memory operations on large
+two-dimensional arrays. Even an innocent update like X J X 一 C is more expensive than the
+two matrix-vector multiplies in SK. To design a high-performance splitting method, it is thus crucial
+to minimize the memory operations associated with large arrays. In addition, since most existing
+splitting solvers target general LPs, they often solve a linear system at each iteration, which is pro-
+hibitively expensive for many OT applications.
+Convergence rates of DR for LP Many splitting methods, including Douglas-Rachford, are
+known to converge linearly under strong convexity (see e.g. Giselsson & Boyd (2016)). Recently,
+it has been shown that algorithms based on DR/ADMM often enjoy similar convergence proper-
+ties also in the absence of strong convexity. For example, Liang et al. (2017) derived local linear
+convergence guarantees under mild assumptions; Applegate et al. (2021) established global linear
+convergence for Primal-Dual methods for LPs using restart strategies; and Wang & Shroff (2017) es-
+tablished linear convergence for an ADMM-based algorithm on general LPs. Yet, these frameworks
+quickly become intractable on large OT problems, due to the many memory operations required.
+1.2	Contributions
+We demonstrate that DR splitting, when properly designed and implemented, can solve large-scale
+OT problems reliably and quickly, while retaining the excellent memory footprint and parallelization
+properties of the Sinkhorn method. Specifically, we make the following contributions:
+•	We develop a DR splitting algorithm that solves the original OT directly, avoiding the numerical
+issues of SK and forgoing the need for solving linear systems of general solvers. We perform
+simplifications to eliminate variables so that the final algorithm can be executed with only one
+matrix variable, while maintaining the same degree of parallelization. Our method implicitly
+maintains a primal-dual pair, which facilitates a simple evaluation of stopping criteria.
+•	We derive an iteration complexity O(1/) for our method. This is a significant improvement
+over the best-known estimate O(1/2) for the Sinkhorn method (cf. Lin et al. (2019)). We also
+provide a global linear convergence rate that holds independently of the initialization, despite the
+absence of strong convexity in the OT problem.
+•	We detail an efficient GPU implementation that fuses many immediate steps into one and per-
+forms several on-the-fly reductions between a read and write of the matrix variable. We also show
+how a primal-dual stopping criterion can be evaluated at no extra cost. The implementation is
+2
+Published as a conference paper at ICLR 2022
+available as open source and gives practitioners a fast and robust OT solver also for applications
+where regularized OT is not suitable.
+As a by-product of solving the original OT problem, our approximate solution is guaranteed to be
+sparse. Indeed, it is known that DR can identify an optimal support in a finite time, even before
+reaching a solution Iutzeler & Malick (2020). To avoid cluttering the presentation, we focus on
+the primal OT, but note that the approach applies equally well to the dual form. Moreover, our
+implementation is readily extended to other splitting schemes (e.g. Chambolle & Pock (2011)).
+2	Background
+Notation For any x,y ∈ Rn,(x, yiis the Euclidean inner product of X and y, and ∣∣∙k2 denotes
+the '2-norm. For matrices X, Y ∈ Rm×n, (X,Yi = tr(X>Y) denotes their inner product and
+∣∣∙∣f = (J(∙, ∙i is the the induced Frobenius norm. We use ∣∣∙∣ to indicate either ∣∣∙∣2 or ∣∣∙∣f.
+For a closed and convex set X, the distance and the projection map are given by dist(x, X ) =
+minz∈X ∣z - x∣ and PX (x) = argminz∈X ∣z - x∣, respectively. Further, we denote the proximal
+operator of a closed convex function f by ProxPf (x) = argmi% f (Z) + 2p ∣∣z 一 x∣2, ρ > 0. The
+Euclidean projection of x ∈ Rn onto the nonnegative orthant is denoted by [x]+ = max(x, 0), and
+∆n = {x ∈ Rn+ : Pin=1 xi = 1} is the (n 一 1) dimensional probability simplex.
+OT and optimality conditions Let e = 1n and f = 1m, and consider the linear mapping
+A : Rm×n → Rm+n : X 7→ (Xe,X>f),
+and its adjoint A* : Rm+n → Rm×n : (y, x) → ye> + fx>. The projection onto the range of A
+is PranA((y, x)) = (y, x) 一 α(f, -e), where α = (f >y 一 e>x)∕(m + n) (Bauschke et al., 2021).
+With b = (p, q) ∈ Rm+n, Problem (1) can be written as a linear program on the form
+minimize hC, Xi subject to A(X) = b, X ≥ 0.
+X ∈Rm×n
+(2)
+Let (μ, V) ∈ Rm+n be the dual variable associated the affine constraint in (2). Then, using the
+definition of A* , the dual problem of (2), or equivalently of (1), reads
+maximize p>μ + q>ν subject to μe> + fν> ≤ C.
+μ,ν
+(3)
+OT is a bounded program and always admits a feasible solution. It is thus guaranteed to have an
+optimal solution, and the optimality conditions can be summarized as follows.
+Proposition 1. A pair X and (μ, V) are primal and dual optimal ifand only if: (i) Xe = p, X> f =
+q, X ≥ 0, (ii) μe> + fν> — C ≤ 0,(iii) (X, C — μe> — f >ν)= 0.
+These conditions mean that: (i) X is primal feasible; (ii) μ, V are dual feasible, and (iii) the duality
+gap is zero (C, X)= p>μ + q>ν, or equivalently, complementary slackness holds. Thus, solving
+the OT problem amounts to (approximately) finding such a primal-dual pair. To this end, we rely on
+the celebrated Douglas-Rachford splitting method (Lions & Mercier, 1979; Eckstein & Bertsekas,
+1992; Fukushima, 1996; Bauschke & Combettes, 2017).
+Douglas-Rachford splitting Consider composite convex optimization problems on the form
+minimize f(x) + g(x),
+x∈Rn
+(4)
+where f and g are proper closed and convex functions. To solve Problem (4), the DR splitting
+algorithm starts from y0 ∈ Rn and repeats the following steps:
+xk+1 = Proxρf (yk ) , zk+1 = Proxρg (2xk+1 一 yk ) , yk+1 = yk + zk+1 一 xk+1 ,	(5)
+where ρ > 0 is a penalty parameter; ProxPf (∙) and ProxPg (∙) are the proximal operator of f and g,
+respectively. Procedure (5) can be viewed as a fixed-point iteration yk+1 = T(yk) for the mapping
+T⑹=y + ProXPg (2Proχρf (y) 一 y) 一 ProXPf (y).
+(6)
+3
+Published as a conference paper at ICLR 2022
+The DR iterations (5) can also be derived from the ADMM method applied to an equivalent problem
+to (4) (see, Appendix C). Indeed, they are both special instances of the classical proximal point
+method in Rockafellar (1976). As for convergence, Lions & Mercier (1979) showed that T is a
+firmly-nonexpansive mapping, from which they obtained convergence ofyk. Moreover, the sequence
+xk is guaranteed to converge to a minimizer of f + g (assuming a minimizer exists) for any choice
+ofρ > 0. In particular, we have the following general convergence result, whose proof can be found
+in Bauschke & Combettes (2017, Corollary 28.3).
+Lemma 2.1. Consider the Composite problem (4) and its Fenchel-Rockafellar dual defined as
+maximize -f M-U) — g*(u).
+(7)
+Let P? and D? be the sets of solutions to the primal (4) and dual (7) problems, respectively. Let
+Xk ,yk, and Zk be generated by procedure (5) and let Uk := (yk-ι — Xk )∕ρ. Then, there exists
+y? ∈ Rn such that yk → y?. Setting x? = ProxPf (y?) and u? = (y? — x?)/p, then it holds that (i)
+X? ∈ P? and U? ∈ D?; (ii) Xk - zk → 0, Xk → X? and zk → X?; (iii) Uk → U?.
+3	Douglas-Rachford splitting for optimal transport
+To efficiently apply DR to OT, we need to specify the functions f and g as well as how to evaluate
+their proximal operations. We begin by introducing a result for computing the projection onto the
+set of real-valued matrices with prescribed row and column sums (Romero, 1990; Bauschke et al.,
+2021).
+Lemma 3.1. Let e = 1n and f = 1m. Letp ∈ ∆m and q ∈ ∆n. Then, the set X defined by:
+X := {X ∈ Rm×n ∣Xe = P and X>f = q}
+is non-empty, and for every given X ∈ Rm×n, we have
+PX (X ) = X- n ((Xe- P) e>- γfe>)- m1 (以X >f - q)>- γfe>
+where γ = f> (Xe - P) /(m + n) = e> X>f - q /(m + n).
+The lemma follows immediately from Bauschke et al. (2021, Corollary 3.4) and the fact that (P, q) =
+PranA((P, q)). It implies that PX(X) can be carried out by basic linear algebra operations, such as
+matrix-vector multiplies and rank-one updates, that can be effectively parallelized.
+3.1	Algorithm derivation
+Our algorithm is based on re-writing (2) on the standard form for DR-splitting (4) using a carefully
+selected f and g that ensures a rapid convergence of the iterates and an efficient execution of the
+iterations. In particular, we propose to select f and g as follows:
+f(X)=hC,Xi+IRm×n(X) and g(X) = I{Y:A(Y)=b}(X).
+(8)
+By Lemma 3.1, we readily have the explicit formula for the proximal operator of g, namely,
+ProxPg (∙) = PX(∙). The proximal operator of f can also be evaluated explicitly as:
+Proxρf (X) = PRm×n (X - ρC) = [X - ρC]+.
+The Douglas-Rachford splitting applied to this formulation of the OT problem then reads:
+Xk+1 =	[Yk	-ρC]+,	Zk+1 =	PX (2Xk+1 -Yk),	Yk+1 =Yk+Zk+1	- Xk+1.	(9)
+Despite their apparent simplicity, the updates in (9) are inefficient to execute in practice due to the
+many memory operations needed to operate on the large arrays Xk, Yk, Zk and C. To reduce the
+memory access, we will now perform several simplifications to eliminate variables from (9). The
+resulting algorithm can be executed with only one matrix variable while maintaining the same degree
+of parallelization.
+We first note that the linearity of PX (∙) allows Us to eliminate Z, yielding the Y-update
+Yk+1 = Xk+1 - n 1 (2Xk+1e - Yk e - P - Ykf )e> - m 1f (2X>+ιf - Y> f - q - Yk e),
+4
+Published as a conference paper at ICLR 2022
+Algorithm 1 Douglas-Rachford Splitting for Optimal Transport (DROT)
+Input: OT(C, p, q), initial point X0, penalty parameter ρ
+1:	φo = 0,20 = 0
+2:	a0 = X0e - p, b0 = X0>f - q, α0 = f>a0/(m + n)
+3:	for k = 0, 1, 2, . . . do
+4:	Xk + 1 = [Xk + φke> + fψ> - PC] +
+5:	rk+1 = Xk+1e - p, sk+1 = Xk>+1f - q, βk+1 = f >rk+1/(m + n)
+6:	φk+1 =	(ak	- 2rk+1	+ (2βk+1	- αk)f) /n
+7:	ψk + 1 =	(bk	- 2sk + l	+ (2βk+i	- αk )e) /m
+8:	ak+1 = ak - rk+1 , bk+1 =bk - sk+1, αk+1 = αk - βk+1
+9:	end for
+Output: XK
+where γk	=	f> (2Xk+1e	- Yke -p) /(m	+ n)	= e>	2Xk>+1f - Yk>f - q	/(m	+ n).	We also
+define the following quantities that capture how Yk affects the update of Yk+1
+ak = Yke - p, bk = Yk>f - q, αk = f>ak/(m + n) = e>bk/(m + n).
+Similarly, for Xk, we let:
+rk = Xke -p, sk = Xk>f - q, βk = f>rk/(m + n) = e>sk/(m + n).
+Recall that the pair (rk, sk) represents the primal residual at Xk. Now, the preceding update can be
+written compactly as
+Yk+1 = Xk+1 + φk+1e> + fφ> + i,	(IO)
+where
+φk+1 = (ak - 2rk+1 + (2βk+1 - αk)f) /n
+夕k+1 = (bk - 2sk+1 + (2βk + 1 - αk)e) /m.
+We can see that the Y -update can be implemented using 4 matrix-vector multiples (for computing
+ak,bk, rk+1, sk+1), followed by 2 rank-one updates. As a rank-one update requires a read from
+an input matrix and a write to an output matrix, it is typically twice as costly as a matrix-vector
+multiply (which only writes the output to a vector). Thus, it would involve 8 memory operations of
+large arrays, which is still significant.
+Next, we show that the Y -update can be removed too. Noticing that updating Yk+1 from Yk and
+Xk+1 does not need the full matrix Yk, but only the ability to compute ak and bk. This allows us
+to use a single physical memory array to represent both the sequences Xk and Yk. Suppose that we
+overwrite the matrix Xk+1 as:
+Xk + 1 J Xk+1 + φk+1e> + fΨk+1,
+then after the two rank-one updates, the X -array holds the value of Yk+1. We can access the actual
+X -value again in the next update, which now reads: Xk+2 J Xk+1 - ρC + . It thus remains
+to show that ak and bk can be computed efficiently. By multiplying both sides of (10) by e and
+subtracting the result from p, we obtain
+Yk+ιe - P = Xk+ιe - P + Φk+ιe>e + (2>+ιe)f.
+Since e>e = n and (bk 一 2sk+ι)>e = (m + n)(αk — 2βk+ι), it holds that (夕>+ιe)f = (αk 一
+2βk+1)f. We also have φk+1e>e = ak - 2rk+1 + (2βk+1 - αk)f. Therefore, we end up with an
+extremely simple recursive form for updating ak:
+ak+1 = ak 一 rk+1 .
+Similarly, we have bk+1 = bk 一 sk+1 and αk+1 = αk 一 βk+1. In summary, the DROT method can
+be implemented with a single matrix variable as summarized in Algorithm 1.
+5
+Published as a conference paper at ICLR 2022
+Stopping criteria It is interesting to note that while DROT directly solves to the primal prob-
+lem (1), it maintains a pair of vectors that implicitly plays the role of the dual variables μ and V in
+the dual problem (3). To get a feel for this, we note that the optimality conditions in Proposition 1
+are equivalent to the existence of a pair X? and (μ?, ν?) such that
+(X*e,X?>f) = (p,q) and X? = [X? + μ*e> + fv?> - C] +.
+Here, the later condition encodes the nonnegativity constraint, the dual feasibility, and the zero
+duality gap. The result follows by invoking Deutsch (2001, Theorem 5.6(ii)) with the convex cone
+C = Rm×n, y = X * ∈ C and Z = μ*e> + fν*> - C ∈ C °. Now, compared to Step 4 in DROT, the
+second condition above suggests that φk∕ρ and Wk/ρ are such implicit variables. To see why this is
+indeed the case, let Uk = (Yk-ι - Xk)∕ρ. Then it is easy to verify that
+(Zk - Xk )/P = (Xk - Yk-1 + φk e> + fW> )/P = -Uk + (0k/P) e> + f (Wk/P) >∙
+By Lemma 2.1, we have Zk - Xk → 0 and Uk → U* ∈ Rm×n, by which it follows that
+(Φk/P)e> + f(Wk/P)> → U*.
+Finally, by evaluating the conjugate functions f * and g* in Lemma 2.1, it can be shown that U *
+must have the form μ*e> + fν*>, where μ* ∈ Rm and V* ∈ Rn satisfying μ*e> + fν*> ≤ C;
+see Appendix D for details. With such primal-dual pairs at our disposal, we can now explicitly
+evaluate their distance to the set of solutions laid out in Proposition 1 by considering: rprimal =
+(k『k『+ l∣sk『)1/2,『dual = k[(φk/ρ)e> + f(Wk/ρ)> - C] + k, and gap = ∣ (C,Xki - (p>φk +
+Wk>q)/P. As problem (1) is feasible and bounded, Lemma 2.1 and strong duality guarantees that all
+the three terms will converge to zero. Thus, we terminate DROT when these become smaller than
+some user-specified tolerances.
+3.2	Convergence rates
+In this section, we state the main convergence results of the paper, namely a sublinear and a linear
+rate of convergence of the given splitting algorithm. In order to establish the sublinear rate, we need
+the following function:
+V(X,Z,U) =f(X)+g(Z)+ hU,Z-Xi,
+which is defined for X ∈ R+m×n , Z ∈ X and U ∈ Rm×n . We can now state the first result.
+Theorem 1.	Let Xk, Yk, Zk be the generated by procedure (9). Then, for any X ∈ R+m×n, Z ∈ X,
+and Y ∈ Rm×n, we have
+V (Xk+1, Zk+1, (Y - Z)/P) - V (X, Z, (Yk - Xk+1)/P) ≤ lYk - Yl2 - lYk+1 - Yl2 /(2P).
+Furthermore, let Y* be a fixed-point of T in (6) and let X* be a solution of (1) defined from Y* in
+the manner of Lemma 2.1. Then, it holds that
+S, Xk〉-hC,X*i ≤ (伍k2/(2ρ)+2 kX*k 伍-Y*k /p /k
+IlZk - XkIl = kYk - Y0k∕k ≤ 2 ∣∣Y0 - Y*k∕k,
+where Xk = Pk=I Xi/k and Zk = Pk=I Zi/k.
+The theorem implies that one can compute a solution satisfying hC, Xi - hC, X*i ≤ in O(1/)
+iterations. This is a significant improvement over the best-known iteration complexity O(1/2) of
+the Sinkhorn method (cf. Lin et al. (2019)). Note that the linearity of hC, •〉allows to update the
+scalar value(C, XQ recursively without ever needing to form the ergodic sequence Xk. Yet, in
+terms of rate, this result is still conservative, as the next theorem shows.
+Theorem 2.	Let Xk and Yk be generated by (9). Let G* be the set of fixed points of T in (6) and let
+X* be the set of primal solutions to (1). Then, {Yk} is bounded, lYkl ≤ M for all k, and
+dist(Yk,G*) ≤ dist(Y0,G*) × rk and dist(Xk,X*) ≤ dist(Y0,G*) × rk-1,
+where r = c/Jc2 + 1 < 1, C = γ(1+ P(Ilek + IlflI)) ≥ 1, and Y = θs ? (1 + PT(M + 1)). Here,
+θS? > 0 is a problem-dependent constant characterized by the primal-dual solution sets only.
+6
+Published as a conference paper at ICLR 2022
+
+v = Xrf I
+atomicAdd
+二一 afomicAdC
+〈c,x)
+Global memory (off-chip)
+Shared memory (on-chip)
+Thread register (on-chip)
+□ □□
+Figure 1: Left: Logical view of the main kernel. To expose sufficient parallelism to GPU, we organize threads
+into a 2D grid of blocks (3 × 2 in the figure), which allows several threads per row. The threads are then
+grouped in 1D blocks (shown in red) along the columns of X. This ensures that global memory access is
+aligned and coalesced to maximize bandwidth utilization. We use the parameter work-size ws to indicate how
+many elements of a row each thread should handle. For simplicity, this parameter represents multiples of the
+block size bs. Each arrow denotes the activity of a single thread in a thread block. Memory storage is assumed
+to be column-major. Right: Activity of a normal working block, which handles a submatrix of size bs X (ws∙ bs).
+This means that an -optimal solution can be computed in O(log 1/) iterations. However, it is, in
+general, difficult to estimate the convergence factor r, and it may in the worst case be close to one. In
+such settings, the sublinear rate will typically dominate for the first iterations. In either case, DROT
+always satisfies the better of the two bounds at each k.
+3.3	Implementation
+In this section, we detail our implementation of DROT to exploit parallel processing on GPUs. We
+review only the most basic concepts of GPU programming necessary to describe our kernel and refer
+to Kirk & Wen-Mei (2016); Cheng et al. (2014) for comprehensive treatments.
+Thread hierarchy When a kernel function is launched, a large number of threads are generated to
+execute its statements. These threads are organized into a two-level hierarchy. A grid contains mul-
+tiple blocks and a block contains multiple threads. Each block is scheduled to one of the streaming
+multiprocessors (SMs) on the GPU concurrently or sequentially, depending on available hardware.
+While all threads in a thread block run logically in parallel, not all of them can run physically at the
+same time. As a result, different threads in a thread block may progress at a different pace. Once a
+thread block is scheduled to an SM, its threads are further partitioned into warps. A warp consists of
+32 consecutive threads that execute the same instruction at the same time. Each thread has its own
+instruction address counter and register state, and carries out the current instruction on its own data.
+Memory hierarchy Registers and shared memory (“on-chip”) are the fastest memory spaces on a
+GPU. Registers are private to each thread, while shared memory is visible to all threads in the same
+thread block. An automatic variable declared in a kernel is generally stored in a register. Shared
+memory is programmable, and users have full control over when data is moved into or evicted
+from the shared memory. It enables block-level communication, facilitates reuse of on-chip data,
+and can greatly reduce the global memory access of a kernel. However, there are typically only
+a couple dozen registers per thread and a couple of kBs shared memory per thread block. The
+largest memory on a GPU card is global memory, physically separated from the compute chip (“off-
+chip”). All threads can access global memory, but its latency is much higher, typically hundreds
+of clock cycles.1 Therefore, minimizing global memory transactions is vital to a high-performance
+kernel. When all threads of a warp execute a load (store) instruction that access consecutive memory
+locations, these will be coalesced into as few transactions as possible. For example, if they access
+consecutive 4-byte words such as float32 values, four coalesced 32-byte transactions will service
+that memory access.
+Before proceeding further, we state the main result of the section.
+Claim 3.1. On average, an iteration of DROT, including all the stopping criteria, can be done using
+2.5 memory operations of m × n arrays. In particular, this includes one read from and write to X,
+and one read from C in every other iteration.
+1https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html
+7
+Published as a conference paper at ICLR 2022
+Main kernel Steps 4-5 and the stopping criteria are the main computational components of DROT,
+since they involve matrix operations. We will design an efficient kernel that: (i) updates Xk to
+Xk+1, (ii) computes uk+1 := Xk+1e and vk+1 := Xk>+1 f, (iii) evaluates hC, Xk+1i in the duality
+gap expression. The kernel fuses many immediate steps into one and performs several on-the-fly
+reductions while updating Xk, thereby minimizing global memory access.
+Our kernel is designed so that each thread block handles a submatrix X of size bs X (Ws ∙ bs), except
+for the corner blocks which will have fewer rows and/or columns. Since all threads in a block need
+the same values of 夕，it is best to read these into shared memory once per block and then let threads
+access them from there. We, therefore, divide 夕 into chunks of the block size and set UP a loop to
+let the threads collaborate in reading chunks in a coalesced fashion into shared memory. Since each
+thread works on a single row, it accesses the same element of φ throughout, and we can thus load
+and store that value directly in a register. These allow maximum reuse of 夕 and φ.
+In the j -th step, the working block loads column j of x to the chip in a coalesced fashion. Each
+thread i ∈ {0, 1, . . . , bs - 1} uses the loaded xij to compute and store xi+j in a register:
+Xj = max(x j + φi + 2j - Pcij 0),
+where c is the corresponding submatrix ofC. As sum reduction is order-independent, it can be done
+locally at various levels, and local results can then be combined to produce the final value. We,
+therefore, reuse Xi+j and perform several such partial reductions. First, to compute the local value
+for uk+1, at column j, thread i simply adds Xi+j to a running sum kept in a register. The reduction
+leading to hC, Xk+1 i can be done in the same way. The vertical reduction to compute vk+1 is more
+challenging as coordination between threads is needed. We rely on warp-level reduction in which
+the data exchange is performed between registers. This way, we can also leverage efficient CUDA’s
+built-in functions for collective communication at warp-level.2 When done, the first thread in a warp
+holds the total reduced value and simply adds it atomically to a proper coordinate of vk+1. Finally,
+all threads write Xi+j to the global memory. The process is repeated by moving to the next column.
+When the block finishes processing the last column of the submatrix X, each thread adds its running
+sum atomically to a proper coordinate of uk+1. They then perform one vertical (warp-level) reduc-
+tion to collect their private sums to obtain the partial cost value hc, Xi. When all the submatrices
+have been processed, we are granted all the quantities described in (i)-(iii), as desired. It is essen-
+tial to notice that each entry of X is only read and written once during this process. To conclude
+Claim 3.1, we note that one can skip the load of C in every other iteration. Indeed, if in iteration
+k, instead of writing Xk+1, one writes the value of Xk+1 - ρC, then the next update is simply
+Xk+2 = [Xk+ι + φk+ιe> + f^>+ι] + . Finally, all the remaining updates in DrOt only involve
+vector and scalar operations, and can thus be finished off with a simple auxiliary kernel.
+4 Experimental results
+In this section, we perform experiments to validate our method and to demonstrate its efficiency
+both in terms of accuracy and speed. We focus on comparisons with the Sinkhorn method, as
+implemented in the POT toolbox3 , due to its minimal per-iteration cost and its publicly available
+GPU implementation. All runtime tests were carried out on an NVIDIA Tesla T4 GPU with 16GB of
+global memory. The CUDA C++ implementation of DROT is open source and available at https:
+//github.com/vienmai/drot.
+We consider six instances of SK and its log-domain variant, called SK1-SK6 and SK-Log-1-SK-
+Log-6, corresponding to η = 10-4, 10-3, 5 × 10-3, 10-2, 5 × 10-2, 10-1, in that order. Given
+m and n, we generate source and target samples as Xs and Xt , whose entries are drawn from a 2D
+Gaussian distribution with randomized means and covariances (μs, ∑s) and (μt, ∑t). Here, μs ∈ R2
+has normal distributed entries, and Σs =AsAs>, where As ∈ R2×2 is a matrix with random entries in
+[0,1]; μt ∈ R2 has entries formed from N(5, σt) for σt > 0, and ∑t ∈ R2×2 is generated similarly
+to Σs . Given Xs and Xt , the cost matrix C represents pair-wise squared distance between samples:
+Cij = kXs[i] - Xt[j]k22 for i ∈ {1, . . . , m} andj ∈ {1, . . . , n} and is normalized to have kCk∞ = 1.
+The marginals p and q are set to p = 1m/m and q = 1n/n. DROT always starts at X0 = pq>.
+2https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/
+3https://pythonot.github.io
+8
+Published as a conference paper at ICLR 2022
+0--e- 8ueuu£ad
+ιo"∙ ι<r, IO-Z ιo^l
+Accuracy
+(a) Float 32, σt = 5
+0--e- 8ueuu£ad
+ιo"∙ ι<r, IO-Z ιo^l
+Accuracy
+(b) Float 64, σt = 5
+8 6 4 2
+■ I I I
+Oooo
+0-e- 8ueuu£ad
+(c) Float 64, σt = 10
+ιo"∙ ι<r, IbZ ιo^l
+Accuracy
+Figure 2:	The percentage of problems solved up to various accuracy levels for σt = 5, 10.
+Performance profile For each method, we evaluate for each > 0 the percentage of experiments
+for which |f(XK) - f(X?)| /f(X?) ≤ , where f(X?) is the optimal value and f(XK) is the
+objective value at termination. An algorithm is terminated as soon as the constraint violation goes
+below 10-4 or 1000 iterations have been executed. Figure 2 depicts the fraction of problems that
+are successfully solved up to an accuracy level given on the x-axis. Each subplot shows the result
+on 100 random problems with m = n = 512 and ρ = 2/(m + n). We can see that DROT is
+consistently more accurate and robust. It reinforces that substantial care is needed to select the right
+η for SK. The method is extremely vulnerable in single-precision and even in double-precision, an
+SK instance that seems to work in one setting can run into numerical issues in another. For example,
+by slightly changing a statistical properties of the underlying data, nearly 40% of the problems in
+Fig. 2(c) cannot be solved by SK2 due to numerical errors, even though it works well in Fig. 2(b).
+Runtime As we strive for the excellent per-iteration cost of SK, this work would be incomplete
+if we do not compare these. Figure 3(a) shows the median of the per-iteration runtime and the
+95% confidence interval, as a function of the dimensions. Here, m and n range from 100 to 20000
+and each plot is obtained by performing 10 runs; in each run, the per-iteration runtime is averaged
+over 100 iterations. Since evaluating the termination criterion in SK is very expensive, we follow
+the POT default and only do so once every 10 iterations. The result confirms the efficiency of
+our kernel, and for very large problems the per-iteration runtimes of the two methods are almost
+identical. It is also clear that DROT and SK can execute an iteration much faster than the log-domain
+SK implementation. Finally, Figs 3(b)-(c) show the median times required for the total error (the
+sum of function gap and constraint violation) to reach different values. Since SK struggles to find
+even moderately accurate solutions in single precision, we drop these from the remaining runtime
+comparisons. Note also that by design, all methods start from different initial points.4 We can
+see that DROT can quickly and consistently find good approximates, while SK-Log is significantly
+slower for small η and may not attain the desired accuracy with higher η.
+*"∙∙m,∙j0
+WIaulF
+O 2500 5000 7500 IOOM 12500 150∞ 17500 200∞
+Dimensian m-n
+(a) Runtime per iteration
+*0,*0∙*r,
+_aulF
+Dimension n>-n
+(b) Time to ε = 0.01
+10 17
+*∙*∙b∙'
+1 1
+一 UEF
+Dimension m≡π
+(c) Time to ε = 0.005
+Figure 3:	Wall-clock runtime performance versus the dimensions m = n for σt = 5.
+The experiments confirm the strength of DROT both in speed and robustness: (i) each DROT itera-
+tion can be executed efficiently as in SK, and (ii) it can find high accuracy solutions as a well-tuned
+log-domain SK does, but at a much faster speed.
+4The SKmethods have their own matrices K = exp(-C∕η) and Xo = diag(uo)K diag(vo). For DROT,
+since Xk+ι = [Xk + φke>f夕> —PC] + , where Xo = pq> = 1∕(mn), ∣∣C∣∣∞ = 1, P = po/(m + n),
+φo = 夕o = 0, the term inside [•]+ is of the order O(1∕(mn) — po/(m + n)) 4 0. This makes the first few
+iterations of DROT identically zeros. To keep the canonical Xo, we just simply set Po to 0.5/ log(m) to reduce
+the warm-up period as m increases, which is certainly suboptimal for DROT performance.
+9
+Published as a conference paper at ICLR 2022
+Acknowledgement
+This work was supported in part by the Knut and Alice Wallenberg Foundation, the Swedish Re-
+search Council and the Swedish Foundation for Strategic Research, and the Wallenberg AI, Au-
+tonomous Systems and Software Program (WASP). The computations were enabled by resources
+provided by the Swedish National Infrastructure for Computing (SNIC), partially funded by the
+Swedish Research Council through grant agreement no. 2018-05973.
+References
+Mokhtar Z. Alaya, Maxime Berar, Gilles Gasso, and Alain Rakotomamonjy. Screening Sinkhorn al-
+gorithm for regularized optimal transport. In Advances in Neural Information Processing Systems,
+volume 32, 2019.
+Jason Altschuler, Jonathan Weed, and Philippe Rigollet. Near-linear time approximation algorithms
+for optimal transport via Sinkhorn iteration. In Advances in Neural Information Processing Sys-
+tems,pp.1964-1974, 2017.
+David Applegate, Oliver Hinder, Haihao Lu, and Miles Lubin. Faster first-order primal-dual methods
+for linear programming using restarts and sharpness. arXiv preprint arXiv:2105.12715, 2021.
+Martin Arjovsky, Soumith Chintala, and Leon Bottou. Wasserstein generative adversarial networks.
+In International conference on machine learning, pp. 214-223. PMLR, 2017.
+Heinz H Bauschke and Patrick L Combettes. Convex analysis and monotone operator theory in
+Hilbert spaces. Springer, 2nd edition, 2017.
+Heinz H Bauschke, Shambhavi Singh, and Xianfu Wang. Projecting onto rectangular matrices with
+prescribed row and column sums. arXiv preprint arXiv:2105.12222, 2021.
+Amir Beck. First-order methods in optimization, volume 25. SIAM, 2017.
+Mathieu Blondel, Vivien Seguy, and Antoine Rolet. Smooth and sparse optimal transport. In Inter-
+national Conference on Artificial Intelligence and Statistics, pp. 880-889. PMLR, 2018.
+Antonin Chambolle and Thomas Pock. A first-order primal-dual algorithm for convex problems
+with applications to imaging. Journal of mathematical imaging and vision, 40(1):120-145, 2011.
+John Cheng, Max Grossman, and Ty McKercher. Professional CUDA C programming. John Wiley
+& Sons, 2014.
+Nicolas Courty, Remi Flamary, Devis Tuia, and Alain Rakotomamonjy. Optimal transport for do-
+main adaptation. IEEE transactions on pattern analysis and machine intelligence, 39(9):1853-
+1865, 2016.
+Marco Cuturi. Sinkhorn distances: Lightspeed computation of optimal transport. Advances in neural
+information processing systems, 26:2292-2300, 2013.
+Frank Deutsch. Best approximation in inner product spaces, volume 7. Springer, 2001.
+Jim Douglas and Henry H Rachford. On the numerical solution of heat conduction problems in two
+and three space variables. Transactions of the American mathematical Society, 82(2):421-439,
+1956.
+Jonathan Eckstein and Dimitri P Bertsekas. On the Douglas-Rachford splitting method and the
+proximal point algorithm for maximal monotone operators. Mathematical Programming, 55(1):
+293-318, 1992.
+Masao Fukushima. The primal Douglas-Rachford splitting algorithm for a class of monotone map-
+pings with application to the traffic equilibrium problem. Mathematical Programming, 72(1):
+1-15, 1996.
+10
+Published as a conference paper at ICLR 2022
+Daniel Gabay and Bertrand Mercier. A dual algorithm for the solution of nonlinear variational
+problems via finite element approximation. Computers & mathematics with applications, 2(1):
+17-40,1976.
+Michael Garstka, Mark Cannon, and Paul Goulart. COSMO: A conic operator splitting method for
+convex conic problems. Journal of Optimization Theory and Applications, pp. 1-32, 2021.
+Pontus Giselsson and Stephen Boyd. Linear convergence and metric selection for Douglas-Rachford
+splitting and admm. IEEE Transactions on Automatic Control, 62(2):532-544, 2016.
+Bingsheng He and Xiaoming Yuan. On the O(1/n) convergence rate of the Douglas-Rachford
+alternating direction method. SIAM Journal on Numerical Analysis, 50(2):700-709, 2012.
+Franck Iutzeler and Jerome Malick. Nonsmoothness in machine learning: specific structure, Proxi-
+mal identification, and applications. Set-Valued and Variational Analysis, 28(4):661-678, 2020.
+David B Kirk and W Hwu Wen-Mei. Programming massively parallel processors: a hands-on
+approach. Morgan kaufmann, 2016.
+Wu Li. Sharp Lipschitz constants for basic optimal solutions and basic feasible solutions of linear
+programs. SIAM journal on control and optimization, 32(1):140-153, 1994.
+Jingwei Liang, Jalal Fadili, and Gabriel Peyre. Local convergence properties of Douglas-Rachford
+and alternating direction method of multipliers. Journal of Optimization Theory and Applications,
+172(3):874-913, 2017.
+Tianyi Lin, Nhat Ho, and Michael Jordan. On efficient optimal transport: An analysis of greedy
+and accelerated mirror descent algorithms. In International Conference on Machine Learning,
+pp. 3982-3991. PMLR, 2019.
+Pierre-Louis Lions and Bertrand Mercier. Splitting algorithms for the sum of two nonlinear opera-
+tors. SIAM Journal on Numerical Analysis, 16(6):964-979, 1979.
+Brendan O’donoghue, Eric Chu, Neal Parikh, and Stephen Boyd. Conic optimization via operator
+splitting and homogeneous self-dual embedding. Journal of Optimization Theory and Applica-
+tions, 169(3):1042-1068, 2016.
+Gabriel Peyre and Marco Cuturi. Computational optimal transport. Foundations and Trends® in
+Machine Learning, 11(5-6):355-607, 2019.
+R Tyrrell Rockafellar. Monotone operators and the proximal point algorithm. SIAM journal on
+control and optimization, 14(5):877-898, 1976.
+David Romero. Easy transportation-like problems onk-dimensional arrays. Journal of optimization
+theory and applications, 66(1):137-147, 1990.
+Geoffrey Schiebinger, Jian Shu, Marcin Tabaka, Brian Cleary, Vidya Subramanian, Aryeh Solomon,
+Joshua Gould, Siyan Liu, Stacie Lin, Peter Berube, et al. Optimal-transport analysis of single-cell
+gene expression identifies developmental trajectories in reprogramming. Cell, 176(4):928-943,
+2019.
+Bartolomeo Stellato, Goran Banjac, Paul Goulart, Alberto Bemporad, and Stephen Boyd. OSQP:
+An operator splitting solver for quadratic programs. Mathematical Programming Computation,
+pp. 1-36, 2020.
+Sinong Wang and Ness Shroff. A new alternating direction method for linear programming. In
+Proceedings of the 31st International Conference on Neural Information Processing Systems, pp.
+1479-1487, 2017.
+11
+Published as a conference paper at ICLR 2022
+A	Extra experiments
+This section complements the experimental results in the main paper with further experiments for
+DROT, SK and SK-Log in various settings.
+Performance profile for MNIST We follow the construction in Cuturi (2013) and generate the cost
+matrix C ∈ R784×784 as the normalized matrix of squared Euclidean distances between 28 × 28 bins
+in the grid. For each pair of source and target digits, we convert an image into a vector of intensity of
+28 × 28 and normalize it to form the probability vectors p and q, respectively. Similarly to Figure 2,
+Figure 4 shows the fraction of problems that are successfully solved up to an accuracy level ε given
+on the x-axis. Here, each subplot is obtained by comparing 300 random pairs of images.
+O-UE BUUeUuot∂d
+--DROT
+一SKl
+一SK2
+—SK3
+--SK4
+—Sk5
+—SK6
+--DROT
+一SKl
+一SK2
+—SK3
+--SK4
+—Sk5
+—SK6
+Io-3	10-2	10-1	10°	IO1
+Accuracy
+Io-3	10-2	lθ-ɪ	IO0	IO1
+Accuracy
+(a) Float 32
+(b) Float 64
+Figure 4:	The percentage of problems solved up to various accuracy levels for MNIST.
+Performance profile for SK-Log Figure 5 shows the fraction of problems that are successfully
+solved by DROT and the log-domain implementation of SK. We can see that even with a simple
+stepsize rule, DROT achieves similar performance of a well-tuned log-domain SK method.
+Figure 5: The percentage of problems solved up to various accuracy for σt = 5 and ρ = 2/(m + n).
+Single runs performance Figure 6 depicts the actual performance of different algorithms for ran-
+dom OT instances used to produce the performance profile in Figure 2. In addition, Figure 7 high-
+lights the linear convergence phenomenon predicted by our theory.
+Sparsity of transportation By design, DROT efficiently finds sparse transport plans. To illustrate
+this, we apply DROT to a color transfer problem between two images (see Blondel et al. (2018)).
+By doing so, we obtain a highly sparse plan (approximately 99% zeros), and in turn, a high-quality
+12
+Published as a conference paper at ICLR 2022
+0 12 3 4
+O----
+Ioooo
+Illl
+duo-un
+O	200	400	600	800 IOOO
+Iteration
+(a) Float 32, σt = 5
+droωUo-t3unL
+200	400	600	800 IOOO
+Iteration
+(b) Float 64, σt = 5
+IO-15 -
+00-3τ-9-12
+1ɪ0101010
+duo-un
+Figure 6: Objective suboptimality versus iteration for random OT instances with m = n = 512.
+0	1000	2000	3000	4000	5000	0	2000	4000	6000	8000	10000	12000
+Iteration	Iteration
+(a) m = n = 32, ρ = 1.25	(b) m = n = 64, ρ = 1.33
+Figure 7: Objective suboptimality versus iteration for random OT instances with σt = 1.
+artificial image, visualized in Figure 8. In the experiment, we quantize each image with KMeans
+to reduce the number of distinct colors to 750. We subsequently use DROT to estimate an optimal
+color transfer between color distributions of the two images.
+Figure 8: Color transfer via DROT: The left-most image is a KMeans compressed source image (750
+centroids), the right-most is a compressed target image (also obtained via 750 KMeans centroids).
+The middle panel displays an artificial image generated by mapping the pixel values of each centroid
+in the source to a weighted mean of the target centroid. The weights are determined by the sparse
+transportation plan computed via DROT.
+13
+Published as a conference paper at ICLR 2022
+B Proofs of convergence rates
+In order to establish the convergence rates for DROT, we first collect some useful results associated
+with the mapping that underpins the DR splitting:
+T⑻=y + ProXPg (2proχρf (y) - y) - proxρf (y).
+DR corresponds to finding a fixed point to T, i.e. a point y? : y? = T(y?), or equivalently finding a
+point in the nullspace of G, where G(y) = y - T(y). The operator T, and thereby also G, are firmly
+non-expansive (see e.g. Lions & Mercier (1979)). That is, for all y, y0 ∈ dom(T):
+hT(y)-T(y0),y-y0i≥kT(y)-T(y0)k2
+hG(y)-G(y0),y-y0i≥ kG(y) - G(y0)k2.	(11)
+Let G? be the set of all fixed points to T, i.e. G? = {y ∈ dom(T)| G(y) = 0}. Then (11) implies
+the following bound:
+Lemma B.1. Let y? ∈ G? and yk+1 = T(yk), it holds that
+kyk+1 - y?k2 ≤ kyk - y?k2 - kyk+1 - ykk2.
+Proof. We have
+kyk+1 - y? k2 = kyk+1 - yk + yk - y? k2
+= kyk - y?k2 + 2 hyk+1 - yk, yk - y?i + kyk - y?k2
+= kyk-y?k2-2hG(yk)-G(y?),yk-y?i+kyk-y?k2
+≤ kyk - y?k2 - 2kG(yk) - G(y?)k2 + kyk - y?k2
+= kyk - y? k2 - kyk+1 - yk k2 .
+□
+Corollary B.1. Lemma B.1 implies that
+kyk+1 - ykk ≤ kyk - y?k	(12a)
+(dist(yk+1, G?))2 ≤ (dist(yk,G?))2-kyk+1-ykk2.	(12b)
+Proof. The first inequality follows directly from the non-negativity of the left-hand side of
+Lemma B.1. The latter inequality follows from:
+(dist(yk+1, G?))2 = kyk+1 - PG? (yk+1)k2 ≤ kyk+1 - PG? (yk)k2.
+Applying Lemma B.1 to the right-hand side with y? = Pg? (yk) yields the desired result. □
+B.1 Proof of Theorem 1
+Since DR is equivalent to ADMM up to changes of variables and swapping of the iteration order, it
+is expected that DR can attain the ergodic rate O(1/k) of ADMM, both for the objective gap and
+the constraint violation (He & Yuan, 2012; Beck, 2017). However, mapping the convergence proof
+of ADMM to a specific instance of DR is tedious and error-prone. We thus give a direct proof here
+instead. We first recall the DROT method:
+Xk+1 = Yk - ρC+	(13a)
+Zk+1 = PX (2Xk+1 - Yk)	(13b)
+Yk+1 = Yk + Zk+1 - Xk+1 .	(13c)
+Since Xk+1 is the projection of Yk - ρC onto R+m×n , it holds that
+hXk+1 -Yk+ρC,X-Xk+1i ≥ 0 ∀X ∈ R+m×n.	(14)
+Also, since X is a closed affine subspace, we have
+hZk+1 - 2Xk+1 + Yk, Z - Zk+1i = 0 ∀Z ∈ X .	(15)
+14
+Published as a conference paper at ICLR 2022
+Next, for X ∈ R?xn, Z ∈ X and U ∈ Rm×n We define the function:
+V(X, ZU)= f (X) + g(Z) +〈U,Z - X).
+Let Uk+ι = (Yk - Xk+ι)∕ρ, it holds that
+V(Xk+1, Zk+ι,Uk+ι) - V(X, Z, Uk+1)
+=f (Xk+1) + g(Zk+1) + hUk+1, zk+1 - Xk+ 1i-f(X) - g(Z)- hUk + 1,Z - Xi
+=hC, Xk+1)-hC, Xi + hYk - Xk+1, Zk+1 - Z + X - Xk+1〉.
+P
+By (14), we have Qk — Xk+1,X — Xk+1) /p ≤ hC,X) - hC,Xk+1), we thus arrive at
+V (Xk+1, Zk+1,Uk+1) - V (X, Z, Uk+1) ≤fk - Xk+1, Zk+1 - Z)
+P
+=—hXk + 1 - Zk+1, Zk + 1 - Z)= IlXk+1 - Zk + 1『+ hXk+1 - Zk + 1, Xk+1 - Z),
+P	P	P
+(16)
+where the second step follows from (15). Now, for any Y ∈ Rm×n, we also have
+V (Xk+1, Zk+1, Y-Z) - V(Xk+1, Zk+1, Uk+1)
+P
+=p hY - Z, Zk+1 - Xk + 1)- p hYk - Xk+1, Zk+1 - Xk + 1)
+=p hY - γk, Zk+1 - Xk+1)+ p hXk+1 - Z, Zk+1 - Xk + 1). (17)
+Therefore, by adding both sides of (16) and (17), we obtain
+V (Xk + 1, Zk + 1, -) - V (X, Z,Uk+1) ≤ 一 hY - Yk , Zk+1 - Xk+1)-IlXk+1 - Zk + 1『.
+pp	p
+(18)
+Since Zk+1 - Xk+1 = Yk+1 — Yk, it holds that
+1 _	_ r	一、 1	,一 一,2	1	,一 _,,2	1	,一 …,2
+P hY	- Yk, Zk+1	- Xk+1)= 2p	IlYk	- YIl	- 2p	IlYk+1	- YIl	+ 2p	IlYk+1	- YkIl	.	(19)
+Plugging (19) into (18) yields
+V(Xk+1, Zk+1,	) - V(X, z, Uk+1) ≤ 歹 IIYk - Y∣∣2 - k l∣K+1 - Yl∣2 -7 IlYk+1 - Yk∣∣2,
+p	2p	2p	2p
+(20)
+which by dropping the last term on the right-hand side gives the first claim in the theorem.
+Let Y? be a fixed-point of the mapping T and let X? be a solution of (1) defined from Y? in the
+manner of Lemma 2.1. Invoking (20) with Z = X = X? ∈ Rm×n ∩ X and summing both sides of
+(20) over the iterations 0,..., k - 1 gives
+〈C,Xk〉-hC,X*) +(Y-X?,Zk - Xk; ≤ 1 (2P	- YI2 - 2P IK - YI2) , (21)
+where Xk = Pk=1 Xi/k and Zk = £：=1 Zi∕k. Since
+2P 恒-YI2 - 2PIK - YI2 = 2P 冈2 - 2PIKI2 + p 0K - W,
+it follows that
+〈C,Xk)-	hC,X *)+-(y,Zk	-	Xk--k-j-~_0 ∖ ≤ 7~j-	∣∣Y0∣∣2 -	IlYk ∣∣2 +-〈X ? ,Zk	- Xk).
+p ∖	k /	2pk	2pk	P
+15
+Published as a conference paper at ICLR 2022
+Since Y is arbitrary in the preceding inequality, we must have that
+Yk - Y0
+Zk - Xk----=---- = 0,	(22)
+k
+from which we deduce that
+GX〉-hC,χ?i ≤ 2pk 伍『-2pk kYk『+ P〈X?,Zk - Xk〉
+≤ 2pk kYok2+p kχ"z- Xku
+=1 kY0k2 + 4 kX?kkK - Y0k .	(23)
+2ρk	ρk
+By Lemma B.1, we have
+kYk - Y*『≤ IM-1 - Y*『≤ …≤ kY0 - Y*『,
+which implies that
+kK - Y0k ≤ kκ - Y?k + kY0 - Y?k ≤ 2 IlK - Y?k.	(24)
+Finally, plugging (24) into (23) and (22) yields
+1 (ɪ kY0k2 + 2 kX?kkY - Y?k)
+k 2ρ	ρ
+kK - Y0k ≤ 2 kY0 - Y?k
+k _ k ,
+which concludes the proof.
+〈C,Xk〉-〈C,X?i ≤
+IlZk- Xkil =
+B.2	Proof of Theorem 2
+We will employ a similar technique for proving linear convergence as Wang & Shroff (2017) used
+for ADMM on LPs. Although they, in contrast to our approach, handled the linear constraints via
+relaxation, we show that the linear convergence also holds for our OT-customized splitting algorithm
+which relies on polytope projections. The main difference is that the dual variables are given implic-
+itly, rather than explicitly via the multipliers defined in the ADMM framework. As a consequence,
+their proof needs to be adjusted to apply to our proposed algorithm.
+To facilitate the analysis of the given splitting algorithm, we let e = 1n and f = 1m and consider
+the following equivalent LP:
+minimize
+X,Z∈Rm×n
+subject to
+hC, Xi
+Ze=p
+Z>f=q
+X≥0
+Z = X.
+(25)
+The optimality conditions can be written on the form
+Z?e	=p	(26a)
+Z?>f	=q	(26b)
+X?	≥0	(26c)
+Z?	= X?	(26d)
+μ?e> + fv?>	≤C	(26e)
+hC,X?i- p>μ? - q>ν?	= 0.	(26f)
+This means that set of optimal solutions, S? , is a polyhedron
+S ? = {Z =(X, Z, μ, V) | Meq(Z )= 0, Mm(Z) ≤ 0}.
+16
+Published as a conference paper at ICLR 2022
+where Meq and Min denote the equality and inequality constraints of (26), respectively. Li (1994)
+proposed a uniform bound of the distance between a point such a polyhedron in terms of the con-
+straint violation given by:
+dist(Z, S?) ≤ θS?
+(27)
+For the (X, Z)-variables generated by (9), (26a), (26b), and (26c) will always hold due to the projec-
+tions carried out in the subproblems. As a consequence, only (26d), (26e), and (26f) will contribute
+to the bound (27). In particular:
+dist((Xk,Zk,μk,Vk), S?) ≤ θs?
+Zk - Xk
+hC, Xki - p>μk - q>νk
+[μk e> + fνk - C] +
+(28)
+The following Lemma allows us to express the right-hand side of (28) in terms of Yk+1 - Yk.
+Lemma B.2. Let Xk , Zk and Yk be a sequence generated by (9). It then holds that
+Zk+1 - Xk+1 = Yk+1 - Yk
+μk+1e> + fν> + 1 - C ≤ P-I(Yk+1 - Yk)
+hC, Xk+1i - p>μk+1 - q>νk+1 = -P 1 hYk+1, Yk+1 - Yk i ∙
+Proof. The first equality follows directly from the Y -update in (9). Let
+μk = φk/ρ,	νk = ψk /ρ	(29)
+the Y -update in (10) yields
+Yk+1 = Yk + Zk + 1 - Xk+1 = Xk + 1 + PMk+1e> + Pfν]l∙	(30)
+In addition, the X -update
+Xk+1 = max(Yk - PC, 0)	(31)
+can be combined with the first equality in (30) to obtain
+Yk+1 = min(Yk + Zk+1, Zk+1 + PC),
+or equivalently
+Yk+1 - Zk+1 - PC = min(Yk - PC, 0).	(32)
+By (30), the left-hand-side in (32) can be written as
+Yk+1 - Zk+1 - PC = Xk+1 - Zk+1 + PMk + 1e> + Pfν.ι - PC
+=ρ(μk + 1e> + fνk + 1 - C - ρ-1(γk+1 - Yk )).
+Substituting this in (32) gives
+μk + 1e> + fνk + 1	- C -	P-1(γk+1 - Yk ))	=	P-1 min(Yk	- PC,	0)	≤	0,	(33)
+which gives the second relation in the lemma. Moreover, (31) and (33) implies that Xk+1 and
+μk+1e> + fν>+1 - P-I(Yk+1 - Yk) - C cannot be nonzero simultaneously. As a consequence,
+〈Xk+1, μk+1e> + fνk+1 - P I(Yk+1 - Yk ) - C)= 0
+or
+hC, Xk+1i =(Xk+1, μk+1e> + fν>+1 - P-1(Yk+1 - Yk ))
+=(Zk+1 - (Yk+ 1 - Yk), μk+1e> + fν> + 1 - P-1(Yk+1 - Yk ))
+=(Zk+1, μk+1e> + fVk+1)- (P 1Zk + 1 + μk+1e> + fvk + 1,Yk + 1 - Yk)
++ P-1 kYk+1 - Yk k2 .
+17
+Published as a conference paper at ICLR 2022
+By (3O), p-1Zk+1 + μk+ιe> + fνk+1 = p-1(Zk + 1 + Yk+1 - Xk + 1) = p-1(2Yk+1 - Yk), hence
+hC, Xk+1i =(Zk + 1, μk+1 e> + fνk+1) - P 1 h2γk+1 - Yk, Yk+1 - Yk i + P 1 kYk + 1 - Yk『
+=<Zk + 1,μk+1 e> + fν>+1) - PT hγk+1, Yk+1 — Yk i ∙	(34)
+Note that
+(Zk + 1,μk + 1eT + fνk+1) = tr(Zk+1μk+1eT ) + tr(Zk+ιfνk+1)
+=tr(eτZk+ιμk+ι) + tr(νk+ιzk+ιf)
+= tr(p>μk+ι)+tr(V>+ιG
+=p>μk+ι + q> Vk+ι.	(35)
+Substituting (35) into (34), We get the third equality of the lemma:
+hC, Xk+1i - p>μk+1 + q>νk+1 = -P 1 hYk+1, Yk+1 - Yk i .
+□
+By combining Lemma B.2 and (28), we obtain the following result:
+Lemma B.3. Let Xk, Zk and Yk be a SeqUenCe generated by (9) and μk, Vk be defined by (29).
+Then, there is a γ > 0 such that:
+dist((Xk,Zk,μk,Vk), S?) ≤ Y IlK - K-1∣∣.
+Proof. Let Y? ∈ G?, then Lemma B.1 asserts that
+再-Y*∣∣≤∣∣K-1- Y*k≤ …≤ 恒-Y*k,
+which implies that IYk I ≤ M for some positive constant M. In fact, {Yk } belongs to a ball centered
+at Y ? with the radius ∣∣Y0 - Y ? ∣. From the bound of (28) and Lemma B.2, we have
+Zk - Xk
+dist((Xk, Zk,μk, Vk), S?) ≤θs?	hC,χki - p>μk - q>νk
+[μk e> + fν> - C] +
+≤θS*(∣IZk- Xk Il + I hC, Xki - pτμk - q>νk I
++ Il [μke> + fνk - C] + k)
+≤θS? (IlYk - Yk-1∣∣ + P 1 1 hYk, Yk - Yk-1il + P 1 ∣∣ IYk - Yk-1]+ Il)
+≤θS*(l + P-1 + P-IlIYk Il) IlYk - Yk-Ill
+≤θs*(1 + P-1(M + 1)) IlK - K-1∣∣.
+By letting Y = θs? (1 + PT (M + 1)) we obtain the desired result.	□
+Recall that for DROT, prox0∕ (∙) = P肽m×n (∙ - PC) and prox°g (∙) = PX(∙). The following Lemma
+bridges the optimality conditions stated in (26) with G?.
+Lemma B.4. If Y ? = X ? + P(μ*e> + fν ?>), where X ?, μ?, and ν? satisfy (26), then G(Y ?) = 0.
+Proof. We need to prove that
+G(Y?) = PRm×n(Y? - PC) - PX(2P畔×n (Y? - PC) - Y?)
+is equal to zero. Let us start with simplifying Prm×n (Y? - PC). By complementary slackness,
+〈X?,〃?eτ + fν?> - Ci =0,
+and by dual feasibility
+μ*eτ + fν?> - C ≤ 0.
+18
+Published as a conference paper at ICLR 2022
+Consequentially, we have:
+hμ?e> + fν?> - C,X - X?i ≤ 0, ∀X ∈ Rm×n,
+which defines a normal cone of Rm×n, i.e. μ?e> + fv?> - C ∈ %m×n(X?). By using the
+definition of Y ? , and that ρ > 0, this implies that
+Y? -X? -ρC ∈ NRm×n(X?),
+which corresponds to optimality condition of the projection
+X? = PRm×n(Y? -ρC).
+We thus have PX 2PRm×n (Y? - ρC) - Y? = PX (2X? - Y?). But by the definition of Y?,
+0 = Y? - X? - ρ(μ?e> + fν?>) = X? - (2X? - Y?) - ρμ*e> - ρfν*>,
+which means that X? = PX(2X? - Y?) (following from the optimality condition of the projection).
+Substituting all these quantities into the formula for G(Y?), We obtain G(Y?) = 0.	□
+Lemma B.5. There exists a constant c ≥ 1 such that
+dist(Yk,G?) ≤ckYk-Yk-1k.
+Proof. Let Y? = X? + ρμ*e> + PfV?>, where (X?,X*,μ?,ν?) = PS? ((Xk,Zk,μk,νk)). Ac-
+cording to Lemma B.4, we have that Y? ∈ G?. Then
+dist(K, G?) ≤ kYk - Y?k = kYk - X? - P(μ?e> + fν?>)k.
+Since Yk = Xk + ρμke> + ρfν>, it holds that
+dist(Yk, G?) ≤ IlXk - X? + P(μk - M?)e> + Pf(Vk - V?)>k
+≤kXk- X ?k + PlleIIl∣μk- μ?k+ PkfkkVk-V ?||
+≤ Pι + P2kek2 + ρ2kfk2PkXk-X*k2 + kμk-μ?k2 + B-v?k2
+≤ P1 + P2kek2 + ρ2kfk2 q k(Xk - X ?, Zk- X *, μk- μ?, Vk- ν?)∣∣2
+=P1 + P2kek2 + P2kfk2 dist((Xk,Zk,μk,Vk), S ?)
+≤ γ(1 + P(kek + kfk))kYk - Yk-1k,
+where the last inequality follows from Lemma B.3. The fact that
+C = Y(I + P(Iek + kfk)) ≥ 1	(36)
+follows from (12a) in Corollary B.1.	□
+B.3	Proof of linear convergence
+By combining Lemma B.5 with (12b) in Corollary B.1, we obtain:
+c2
+(dist(K+ι, G?))2 ≤ τ-2(dist(K, G?))2
+or equivalently
+c
+dist(Yk+ι, G?) ≤ -7== dist(Yk, G?).
+1 + c2
+Letting r = c/ √1 + c2 < 1 and iterating the inequality k times gives
+dist(Yk, G?) ≤ dist(Y0, G*)rk.
+Let Y? := PG? (Yk). Since proxρf (Y?) ∈ X? and Xk+1 = proxρf (Yk), we have
+dist(Xk+1, X?) ≤ proxρf (Yk) - proxρf (Y?) ≤ kYk - Y?k = dist(Yk,G?) ≤ dist(Y0, G?)rk,
+where the second inequality follows from the non-expansiveness of ProxPf (∙) This completes the
+proof of Theorem 2.
+19
+Published as a conference paper at ICLR 2022
+C DR and its connection to ADMM
+The Douglas-Rachford updates given in (5) can equivalently be formulated as:
+xk+1 = proxρf (yk)
+zk+1 = proxρg (2xk+1 + yk)
+yk+1 = yk + zk+1 - xk+1
+⇔
+zk+1 = proxρg (2xk+1 + yk)
+yk+1 = yk + zk+1 - xk+1
+xk+2 = proxρf (yk+1)
+⇔
+zk+1 = proxρg (2xk+1 + yk)
+xk+2 = proxρf (yk + zk+1 - xk+1)
+yk+1 = yk + zk+1 - xk+1.
+If we let Wk+1 = ρ1 (yk - χk+ι),weget.
+zk+1 = proxρg (xk+1 + ρwk+1)
+xk+2 = proxρf (zk+1 - ρwk+1)
+1
+wk+2 = wk+1 + P (Zk+1 - xk+2).
+By re-indexing the x and the w variables, we get:
+zk+1 = proxρg (xk + ρwk)
+xk+1 = proxρf (zk+1 - ρwk)
+1
+wk+1 = wk + ρ (Zk+1 - xk+1).
+This is exactly ADMM applied to the composite convex problem on the form (4).
+D Fenchel-Rockafellar duality of OT
+Recall that
+f(X) = hC,Xi+IRm×n(X) and g(X) = I{Y:A(Y)=b}(X) =IX(X).
+Recall also that the conjugate of the indicator function IC ofa closed and convex set C is the support
+function σC of the same set (Beck, 2017, Chapter 4). For a non-empty affine set X = {Y : A(Y ) =
+b}, its support function can be computed as:
+σχ(U) = hU,Xθi + IranA* (U),
+where X0 is a point in X (Beck, 2017, Example 2.30). By letting X0 = pq> ∈ X, it follows that
+g* (U) = hU,pq>i + IranA* (U).
+Since A* : Rm+n → Rm×n : (y, x) → ye> + fx>, any matrix U ∈ ranA* must have the form
+μe> + fν> for some μ ∈ Rm and V ∈ Rn. The function g*(U) can thus be evaluated as:
+g*(U) = p>μ + q>ν.
+We also have
+f* (-U) = max{h-U, Xi - hC, Xi - IRm×n (X)}
+X+
+= max{h-U - C, Xi - IRm×n (X)}
+X+
+= σRm×n (-U - C)
+0 if - U - C ≤ 0,
++∞	otherwise.
+20
+Published as a conference paper at ICLR 2022
+The Fenchel-Rockafellar dual of problem 4 in Lemma 2.1 thus becomes
+maximize —p>μ — q>ν
+μ∈Rm ,ν∈Rn
+subject to	—μe> — fν> — C ≤ 0,
+which is identical to (3) upon replacing μ by —μ and V by —ν.
+21

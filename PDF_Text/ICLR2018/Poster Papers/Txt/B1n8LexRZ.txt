@@ -1,0 +1,678 @@
+Published as a conference paper at ICLR 2018
+Generalizing Hamiltonian Monte Carlo with
+Neural Networks
+DanielLevy1; Matthew D. Hoffman2, JaschaSohl-Dickstein3
+1Stanford University, 2Google AI Perception , 3Google Brain
+danilevy@cs.stanford.edu, {mhoffman,jaschasd}@google.com
+Ab stract
+We present a general-purpose method to train Markov chain Monte Carlo ker-
+nels, parameterized by deep neural networks, that converge and mix quickly to
+their target distribution. Our method generalizes Hamiltonian Monte Carlo and is
+trained to maximize expected squared jumped distance, a proxy for mixing speed.
+We demonstrate large empirical gains on a collection of simple but challenging
+distributions, for instance achieving a 106× improvement in effective sample size
+in one case, and mixing when standard HMC makes no measurable progress in a
+second. Finally, we show quantitative and qualitative gains on a real-world task:
+latent-variable generative modeling. We release an open source TensorFlow im-
+plementation of the algorithm.
+1	Introduction
+High-dimensional distributions that are only analytically tractable up to a normalizing constant are
+ubiquitous in many fields. For instance, they arise in protein folding (Schutte et al., 1999), physics
+simulations (Olsson, 1995), and machine learning (Andrieu et al., 2003). Sampling from such dis-
+tributions is a critical task for learning and inference (MacKay, 2003), however it is an extremely
+hard problem in general.
+Markov Chain Monte Carlo (MCMC) methods promise a solution to this problem. They operate
+by generating a sequence of correlated samples that converge in distribution to the target. This
+convergence is most often guaranteed through detailed balance, a sufficient condition for the chain
+to have the target equilibrium distribution. In practice, for any proposal distribution, one can ensure
+detailed balance through a Metropolis-Hastings (Hastings, 1970) accept/reject step.
+Despite theoretical guarantees of eventual convergence, in practice convergence and mixing speed
+depend strongly on choosing a proposal that works well for the task at hand. What’s more, it is
+often more art than science to know when an MCMC chain has converged (“burned-in”), and when
+the chain has produced a new uncorrelated sample (“mixed”). Additionally, the reliance on detailed
+balance, which assigns equal probability to the forward and reverse transitions, often encourages
+random-walk behavior and thus slows exploration of the space (Ichiki & Ohzeki, 2013).
+For densities over continuous spaces, Hamiltonian Monte Carlo (HMC; Duane et al., 1987; Neal,
+2011) introduces independent, auxiliary momentum variables, and computes a new state by inte-
+grating Hamiltonian dynamics. This method can traverse long distances in state space with a single
+Metropolis-Hastings test. This is the state-of-the-art method for sampling in many domains. How-
+ever, HMC can perform poorly in a number of settings. While HMC mixes quickly spatially, it
+struggles at mixing across energy levels due to its volume-preserving dynamics. HMC also does
+not work well with multi-modal distributions, as the probability of sampling a large enough mo-
+mentum to traverse a very low-density region is negligibly small. Furthermore, HMC struggles with
+ill-conditioned energy landscapes (Girolami & Calderhead, 2011) and deals poorly with rapidly
+changing gradients (Sohl-Dickstein et al., 2014).
+Recently, probabilistic models parameterized by deep neural networks have achieved great success
+at approximately sampling from highly complex, multi-modal empirical distributions (Kingma &
+*Work was done while the author was at Google Brain.
+1
+Published as a conference paper at ICLR 2018
+Welling, 2013; Rezende et al., 2014; Goodfellow et al., 2014; Bengio et al., 2014; Sohl-Dickstein
+et al., 2015). Building on these successes, we present a method that, given an analytically described
+distribution, automatically returns an exact sampler with good convergence and mixing properties,
+from a class of highly expressive parametric models. The proposed family of samplers is a gen-
+eralization of HMC; it transforms the HMC trajectory using parametric functions (deep networks
+in our experiments), while retaining theoretical guarantees with a tractable Metropolis-Hastings
+accept/reject step. The sampler is trained to minimize a variation on expected squared jumped dis-
+tance (similar in spirit to Pasarica & Gelman (2010)). Our parameterization reduces easily to stan-
+dard HMC. It is further capable of emulating several common extensions of HMC such as within-
+trajectory tempering (Neal, 1996) and diagonal mass matrices (Bennett, 1975).
+We evaluate our method on distributions where HMC usually struggles, as well as on a the real-world
+task of training latent-variable generative models.
+Our contributions are as follows:
+•	We introduce a generic training procedure which takes as input a distribution defined by an
+energy function, and returns a fast-mixing MCMC kernel.
+•	We show significant empirical gains on various distributions where HMC performs poorly.
+•	We finally evaluate our method on the real-world task of training and sampling from a latent
+variable generative model, where we show improvement in the model’s log-likelihood, and
+greater complexity in the distribution of posterior samples.
+2	Related Work
+Adaptively modifying proposal distributions to improve convergence and mixing has been explored
+in the past (Andrieu & Thoms, 2008). In the case of HMC, prior work has reduced the need to
+choose step size (Neal, 2011) or number of leapfrog steps (Hoffman & Gelman, 2014) by adaptively
+tuning those parameters. Salimans et al. (2015) proposed an alternate scheme based on variational
+inference. We adopt the much simpler approach of Pasarica & Gelman (2010), who show that choos-
+ing the hyperparameters of a proposal distribution to maximize expected squared jumped distance
+is both principled and effective in practice.
+Previous work has also explored applying models from machine learning to MCMC tasks. Kernel
+methods have been used both for learning a proposal distribution (Sejdinovic et al., 2014) and for
+approximating the gradient of the energy (Strathmann et al., 2015). In physics, Restricted and semi-
+Restricted Boltzmann machines have been used both to build approximations of the energy function
+which allow more rapid sampling (Liu et al., 2017; Huang & Wang, 2017), and to motivate new
+hand-designed proposals (Wang, 2017).
+Most similar to our approach is recent work from Song et al. (2017), which uses adversarial training
+of a volume-preserving transformation, which is subsequently used as an MCMC proposal distribu-
+tion. While promising, this technique has several limitations. It does not use gradient information,
+which is often crucial to maintaining high acceptance rates, especially in high dimensions. It also
+can only indirectly measure the quality of the generated sample using adversarial training, which
+is notoriously unstable, suffers from “mode collapse” (where only a portion of a target distribution
+is covered), and often requires objective modification to train in practice (Arjovsky et al., 2017).
+Finally, since the proposal transformation preserves volume, it can suffer from the same difficulties
+in mixing across energy levels as HMC, as we illustrate in Section 5.
+To compute the Metropolis-Hastings acceptance probability for a deterministic transition, the oper-
+ator must be invertible and have a tractable Jacobian. Recent work (Dinh et al., 2016), introduces
+RNVP, an invertible transformation that operates by, at each layer, modifying only a subset of the
+variables by a function that depends solely on the remaining variables. This is exactly invertible with
+an efficiently computable Jacobian. Furthermore, by chaining enough of these layers, the model can
+be made arbitrarily expressive. This parameterization will directly motivate our extension of the
+leapfrog integrator in HMC.
+2
+Published as a conference paper at ICLR 2018
+3	Background
+3.1	MCMC methods and Metropolis-Hastings
+Let p be a target distribution, analytically known up to a constant, over a space X. Markov chain
+Monte Carlo (MCMC) methods (Neal, 1993) aim to provide samples from p. To that end, MCMC
+methods construct a Markov Chain whose stationary distribution is the target distribution p. Obtain-
+ing samples then corresponds to simulating a Markov Chain, i.e., given an initial distribution π0 and
+a transition kernel K, constructing the following sequence of random variables:
+Xo 〜∏0,	Xt+1 〜K(∙∣Xt).	⑴
+In order for p to be the stationary distribution of the chain, three conditions must be satisfied: K
+must be irreducible and aperiodic (these are usually mild technical conditions) andp has to be a fixed
+point of K. This last condition can be expressed as: p(x0) = K(x0|x)p(x)dx. This condition is
+most often satisfied by satisfying the stronger detailed balance condition, which can be written as:
+p(x0)K (x|x0) = p(x)K (x0 |x).
+Given any proposal distribution q, satisfying mild conditions, we can easily construct a transition
+kernel that respects detailed balance using Metropolis-Hastings (Hastings, 1970) accept/reject rules.
+More formally, starting from x° 〜∏o, at each step t, We sample x0 〜q(∙∣Xt), and with probability
+A(Xlxt) = min(1, P(Xjq(X0||：'), accept X as the next sample xt+i in the chain. If we reject
+x0, then we retain the previous state and xt+1 = xt . For typical proposals this algorithm has
+strong asymptotic guarantees. But in practice one must often choose between very low acceptance
+probabilities and very cautious proposals, both of which lead to slow mixing. For continuous state
+spaces, Hamiltonian Monte Carlo (HMC; Neal, 2011) tackles this problem by proposing updates
+that move far in state space while staying roughly on iso-probability contours ofp.
+3.2	Hamiltonian Monte Carlo
+Without loss of generality, we assume p (x) to be defined by an energy function U (x), s.t.
+p(x) 8 exp(-U(x)), and where the state x ∈ Rn. HMC extends the state space with an additional
+momentum vector V ∈ Rn, where V is distributed independently from x, as p(v) H exp(-2VTV)
+(i.e., identity-covariance Gaussian). From an augmented state ξ , (x, v), HMC produces a proposed
+state ξ0 = (x0, V0) by approximately integrating Hamiltonian dynamics jointly on x and V, with U (x)
+taken to be the potential energy, and 21 VTV the kinetic energy. Since Hamiltonian dynamics conserve
+the total energy of a system, their approximate integration moves along approximate iso-probability
+contours of p(x, V) = p(x)p(V).
+The dynamics are typically simulated using the leapfrog integrator (Hairer et al., 2003; Leimkuhler
+& Reich, 2004), which for a single time step consists of:
+V2 = V — 2∂χU(x);	X0 = X + EV2 ；	V0 = V — 2∂χU(x0).	(2)
+Following Sohl-Dickstein et al. (2014), we write the action of the leapfrog integrator in terms of
+an operator L: Lξ , L(x, V) , (x0, V0), and introduce a momentum flip operator F: F(x, V) ,
+(x, —V). It is important to note two properties of these operators. First, the transformation FL is
+an involution, i.e. FLFL(x, V) = FL(x0, —V0) = (x, V). Second, the transformations from (x, V)
+to (x, V2), from (x, v 1) to (x0, v2), and from (x0, v 1) to (x0,v0) are all volume-preserving shear
+transformations i.e., only one of the variables (x or V) changes, by an amount determined by the
+other one. The determinant of the Jacobian, ∣ d∂FξTξ] ∣, is thus easy to compute. For vanilla HMC
+I d∂FξTξ] ∣ = 1, but we will leave it in symbolic form for use in Section 4. The Metropolis-Hastings-
+Green (Hastings, 1970; Green, 1995) acceptance probability for the HMC proposal is made simple
+by these two properties, and is *
+A(FLξ∣ξ) =min (1 P(FLξ) I d【FL€ 八
+A(FLξlξ) = min [1, p(ξ) | ∂ξτ ∣J ∙
+(3)
+3
+Published as a conference paper at ICLR 2018
+4	L2HMC: Training MCMC Samplers
+In this section, we describe our proposed method L2HMC (for ‘Learning To Hamiltonian Monte
+Carlo’). Given access to only an energy function U (and not samples), L2HMC learns a parametric
+leapfrog operator Lθ over an augmented state space. We begin by describing what desiderata we
+have for Lθ, then go into detail on how we parameterize our sampler. Finally, we conclude this
+section by describing our training procedure.
+4.1	Augmenting HMC
+HMC is a powerful algorithm, but it can still struggle even on very simple problems. For example, a
+two-dimensional multivariate Gaussian with an ill-conditioned covariance matrix can take arbitrarily
+long to traverse (even if the covariance is diagonal), whereas it is trivial to sample directly from it.
+Another problem is that HMC can only move between energy levels via a random walk (Neal, 2011),
+which leads to slow mixing in some models. Finally, HMC cannot easily traverse low-density zones.
+For example, given a simple Gaussian mixture model, HMC cannot mix between modes without
+recourse to additional tricks, as illustrated in Figure 1b. These observations determine the list of
+desiderata for our learned MCMC kernel: fast mixing, fast burn-in, mixing across energy levels, and
+mixing between modes.
+While pursuing these goals, we must take care to ensure that our proposal operator retains two key
+features of the leapfrog operator used in HMC: it must be invertible, and the determinant of its
+Jacobian must be tractable. The leapfrog operator satisfies these properties by ensuring that each
+sub-update only affects a subset of the variables, and that no sub-update depends nonlinearly on
+any of the variables being updated. We are free to generalize the leapfrog operator in any way that
+preserves these properties. In particular, we are free to translate and rescale each sub-update of the
+leapfrog operator, so long as we are careful to ensure that these translation and scale terms do not
+depend on the variables being updated.
+4.1.1	State Space
+As in HMC, we begin by augmenting the current state x ∈ Rn with a continuous momentum variable
+v ∈ Rn drawn from a standard normal. We also introduce a binary direction variable d ∈ {-1, 1},
+drawn from a uniform distribution. We will denote the complete augmented state as ξ , (x, v, d),
+with probability density p(ξ) = p(x)p(v)p(d). Finally, to each step t of the operator Lθ we assign
+a fixed random binary mask mt ∈ {0, 1}n that will determine which variables are affected by each
+sub-update. We draw mt uniformly from the set of binary vectors satisfying Pn= 1 mt = b 2 C, that
+is, half of the entries of mt are 0 and half are 1. For convenience, we write mt = 1 一 mt and
+xmt = x mt ( denotes element-wise multiplication, and 1 the all ones vector).
+4.1.2	Update Steps
+We now describe the details of our augmented leapfrog integrator Lθ, for a single time-step t, and
+for direction d = 1.
+We first update the momenta v. This update can only depend on a subset ζ1 , (x, ∂x U (x), t) of the
+full state, which excludes v. It takes the form
+V = V Θ exp(WSv(Zι)) — W (∂χU(x) Θ exp(eQv(Zι)) + Tv©)).
+(4)
+We have introduced three new functions ofζ1: Tv, Qv, and Sv. Tv is a translation, exp(Qv) rescales
+the gradient, and exp( f Sv) rescales the momentum. The determinant of the Jacobian of this trans-
+formation is exp 211 ∙ Sv (Zι)). Note that if Tv, Qv, and Sv are all zero, then we recover the standard
+leapfrog momentum update.
+We now update x. As hinted above, to make our transformation more expressive, we first update a
+subset of the coordinates ofx, followed by the complementary subset. The first update, which yields
+χ0 and affects only xm,t, depends on the state subset Q，(Xmt,v,t). Conversely, with x0 defined
+below, the second update only affects Xmt and depends only on Z3，(Xmt, v,t):
+x0 = Xmt + mt Θ [x Θ exp(eSχ(Zι)) + e(v0 Θ exp(eQχ(Zι)) + Tχ(Z2))]
+X0 = Xmt + mt Θ [x0 Θ exp(eSχ(Z3)) + e(v0 Θ exp(eQχ(Z3)) + TχQ))].
+(5)
+4
+Published as a conference paper at ICLR 2018
+Again, Tx is a translation, exp(Qx) rescales the effect of the momenta, exp(Sx) rescales the posi-
+tions x, and we recover the original leapfrog position update ifTx = Qx = Sx = 0. The determinant
+of the Jacobian of the first transformation is exp (Emt ∙ Sχ(Z2)), and the determinant of the Jacobian
+of the second transformation is exp (Emt ∙ Sχ(Z3)).
+Finally, we update v again, based on the subset ζ4 , (x00, ∂xU(x00), t):
+v00 = V Θ exp(f Sv(Z4)) — §(∂χU(x00) Θ exp(eQv(Z4)) + Tv(Z4)).	(6)
+This update has the same form as the momentum update in equation 4.
+To give intuition into these terms, the scaling applied to the momentum can enable, among other
+things, acceleration in low-density zones, to facilitate mixing between modes. The scaling term
+applied to the gradient of the energy may allow better conditioning of the energy landscape (e.g., by
+learning a diagonal inertia tensor), or partial ignoring of the energy gradient for rapidly oscillating
+energies.
+The corresponding integrator for d = —1 is given in Appendix A; it essentially just inverts the
+updates in equations 4, 5 and 6. For all experiments, the functions Q, S, T are implemented using
+multi-layer perceptrons, with shared weights. We encode the current time step in the MLP input.
+Our leapfrog operator Lθ corresponds to running M steps of this modified leapfrog, Lθξ =
+Lθ(x, v, d) = (x00×M, v00×M, d), and our flip operator F reverses the direction variable d, Fξ =
+(x, v, —d). Written in terms of these modified operators, our proposal and acceptance probability
+are identical to those for standard HMC. Note, however, that this parameterization enables learning
+non-volume-preserving transformations, as the determinant of the Jacobian is a function of Sx and
+Sv that does not necessarily evaluate to 1. This quantity is derived in Appendix B.
+4.1.3	MCMC Transitions
+For convenience, we denote by R an operator that re-samples the momentum and direction. I.e.,
+given ξ = (x,v,d), Rξ = (x,v0,d0) where v0 〜N(0, I),d0 〜U ({-1,1}). Sampling thus
+consists of alternating application of the FLθ and R, in the following two steps each of which is a
+Markov transition that satisfies detailed balance with respect to p:
+1.	ξ0 = FLθξ with probability A(FLθξ∣ξ) (Equation 3), otherwise ξ0 = ξ.
+2.	ξ0 = Rξ
+This parameterization is effectively a generalization of standard HMC as it is non-volume preserv-
+ing, with learnable parameters, and easily reduces to standard HMC for Q, S, T = 0.
+4.2	Loss and Training Procedure
+We need some criterion to train the parameters θ that control the functions Q, S, and T. We choose
+a loss designed to reduce mixing time. Specifically, we aim to minimize lag-one autocorrelation.
+This is equivalent to maximizing expected squared jumped distance (Pasarica & Gelman, 2010).
+For ξ, ξ0 in the extended state space, we define δ(ξ0, ξ) = δ((x0, v0, d0), (x, v, d)) = ||x — x0||22.
+Expected squared jumped distance is thus Eξ 〜p(ξ) [δ(FLθ ξ, ξ)A(FLθ ξ∣ξ)]. However, this loss need
+not encourage mixing across the entire state space. Indeed, maximizing this objective can lead
+to regions of state space where almost no mixing occurs, so long as the average squared distance
+traversed remains high. To optimize both for typical and worst case behavior, we include a reciprocal
+term in the loss,
+'λ(ξ,ξ0, A(ξ0∣ξ)) = δ(ξ,ξoλA (ξ0∣ξ) — δ(ξ4A≡，	⑺
+where λ is a scale parameter, capturing the characteristic length scale of the problem. The second
+term encourages typical moves to be large, while the first term strongly penalizes the sampler ifit is
+ever in a state where it cannot move effectively 一 δ(ξ, ξ0) being small resulting in a large loss value.
+We train our sampler by minimizing this loss over both the target distribution and initialization dis-
+tribution. Formally, given an initial distribution π0 over X, we define q(ξ) = π0 (x)N(v; 0, I)p(d),
+and minimize *
+L(θ)，Ep(ξ) ['λ(ξ, FLθξ, A(FLθξ∣ξ))] + λbEq(ξ) ['λ(ξ, FLθξ, A(FLθξ∣ξ))].
+(8)
+5
+Published as a conference paper at ICLR 2018
+The first term of this loss encourages mixing as it considers our operator applied on draws from the
+distribution; the second term rewards fast burn-in; λb controls the strength of the ‘burn-in’ regular-
+ization. Given this loss, we exactly describe our training procedure in Algorithm 1. It is important
+to note that each training iteration can be done with only one pass through the network and can be
+efficiently batched. We further emphasize that this training procedure can be applied to any learn-
+able operator whose Jacobian’s determinant is tractable, making it a general framework for training
+MCMC proposals.
+Algorithm 1 Training L2HMC
+Input: Energy function U : X → R and its gradient NxU : X → X, initial distribution over
+the augmented state space q, number of iterations niters, number of leapfrogs M, learning rate
+schedule (αt)t≤n , batch size N, scale parameter λ and regularization strength λb.
+Initialize the parameters of the sampler θ.
+Initialize {ξp(i) }i≤N from q(ξ).
+for t = 0 to niters - 1 do
+Sample a minibatch {ξq(i)}i≤N from q(ξ).
+LJ 0	一
+for i = 1 to N do
+ξp(i) J Rξp(i)
+LJL + 'λ (ξPi), FLθξPi),A(FLθξPi)∣ξPi))) + λb'λ (ξ(i), FLθξ(i),A(FLθξ(i)∣ξ(i)))
+ξpi J FLθξpi with probability A(FLθξPi)∣ξPi)).
+end for
+θJθ-αtNθL
+end for
+5	Experiments
+We present an empirical evaluation of our trained sampler on a diverse set of energy functions. We
+first present results on a collection of toy distributions capturing common pathologies of energy
+landscapes, followed by results on a task from machine learning: maximum-likelihood training of
+deep generative models. For each, we compare against HMC with well-tuned step length and show
+significant gains in mixing time. Code implementing our algorithm is available online1.
+5.1	Varied Collection of Energy Functions
+We evaluate our L2HMC sampler on a diverse collection of energy functions, each posing different
+challenges for standard HMC.
+Ill-Conditioned Gaussian (ICG): Gaussian distribution with diagonal covariance spaced log-
+linearly between 10-2 and 102 . This demonstrates that L2HMC can learn a diagonal inertia tensor.
+Strongly correlated Gaussian (SCG): We rotate a diagonal Gaussian with variances [102, 10-2] by
+∏4. This is an extreme version of an example from Neal (2011). This problem shows that, although
+our parametric sampler only applies element-wise transformations, it can adapt to structure which is
+not axis-aligned.
+Mixture of Gaussians (MoG): Mixture of two isotropic Gaussians with σ2 = 0.1, and centroids
+separated by distance 4. The means are thus about 12 standard deviations apart, making it almost
+impossible for HMC to mix between modes.
+Rough Well: Similar to an example from Sohl-Dickstein et al. (2014), for a given η > 0, U (x) =
+1XTX + η Pi cos( xηi). For small η the energy itself is altered negligibly, but its gradient is perturbed
+by a high frequency noise oscillating between -1 and 1. In our experiments, we choose η = 10-2.
+For each of these distributions, we compare against HMC with the same number of leapfrog steps
+and a well-tuned step-size. To compare mixing time, we plot auto-correlation for each method and
+1https://github.com/brain-research/l2hmc.
+6
+Published as a conference paper at ICLR 2018
+50-d Ill-conditioned Gaussian
+2-d Strongly Correlated Gaussian
+Rough Well
+(a) Autocorrelation vs. gradient evaluations of energy function U(x)
+Distribution	ESS-L2HMC	ESS-HMC	Ratio
+50-d ICG	7.83 X 10-1	1.65 × 10-2	36.6
+Rough Well	6.25 × 10-1	1.16 × 10-1	5.4
+2-d SCG	4.97 × 10-1	4.69 × 10-3	106.2
+MoG	3.24 × 10-2	2.61 × 10-4	124
+(b) Samples from single MCMC chain
+(C) ESS per MetroPolis-Hastings step
+(d) L2HMC can mix between modes for a MoG with different variances, contrary to A-NICE-MC.
+Figure 1: L2HMC mixes faster than well-tuned HMC, and than A-NICE-MC, on a ColleCtion of toy distribu-
+tions.
+report effeCtive sample size (ESS). We Compute those quantities in the same way as Sohl-DiCkstein
+et al. (2014). We observe that samplers trained with L2HMC show greatly improved autoCorrelation
+and ESS on the presented tasks, providing more than 106× improved ESS on the SCG task. In
+addition, for the MoG, we show that L2HMC Can easily mix between modes while standard HMC
+gets stuCk in a mode, unable to traverse the low density zone. Experimental details, as well as a
+Comparison with LAHMC (Sohl-DiCkstein et al., 2014), are shown in Appendix C.
+Comparison to A-NICE-MC (Song et al., 2017) In addition to the well known Challenges as-
+soCiated with adversarial training (Arjovsky et al., 2017), we note that parameterization using a
+volume-preserving operator Can dramatiCally fail on simple energy landsCapes. We build off of the
+mog2 experiment presented in (Song et al., 2017), whiCh is a 2-d mixture of isotropiC Gaussians
+separated by a distanCe of 10 with varianCes 0.5. We Consider that setup but inCrease the ratio of
+varianCes: σ12 = 3, σ22 = 0.05. We show in Figure 1d sample Chains trained with L2HMC and
+A-NICE-MC; A-NICE-MC Cannot effeCtively mix between the two modes as only a fraCtion of the
+volume of the large mode Can be mapped to the small one, making it highly improbable to traverse.
+This is also an issue for HMC. On the other hand, L2HMC Can both traverse the low-density region
+between modes, and map a larger volume in the left mode to a smaller volume in the right mode. It
+is important to note that the distanCe between both Clusters is less than in the mog2 Case, and it is
+thus a good diagnostiC of the shortComings of volume-preserving transformations.
+5.2	Latent-Variable Generative Model
+We apply our learned sampler to the task of training, and sampling from the posterior of, a latent-
+variable generative model. The model consists of a latent variable Z 〜p(z), where We choose
+p(z) = N (z; 0, I), and a Conditional distribution p(x|z) whiCh generates the image x. Given a
+family of parametric ‘decoders’ {z 7→ p(x|z; φ), φ ∈ Φ}, and a set of samples D = {x(i)}i≤N,
+7
+Published as a conference paper at ICLR 2018
+(S"U) POO-一①-'ωoq
+Figure 2: Training and held-out log-likelihood for models trained with L2HMC, HMC, and the ELBO (VAE).
+training involves finding φ* = argmaxφ∈φp(D; φ). However, the log-likelihood is intractable as
+p(x; φ) = p(x|z; φ)p(z)dz. To remedy that problem, Kingma & Welling (2013) proposed jointly
+training an approximate posterior qψ that maximizes a tractable lower-bound on the log-likelihood:
+LELBO(X, φ, ψ) = Eqψ(z|x) [P(x|z； φ)] - KL(qψ (ZIx川P(Z)) ≤ P(X),	⑼
+where qψ (z∣x) is a tractable conditional distribution with parameters ψ, typically parameterized by
+a neural network. Recently, to improve upon well-known pitfalls like over-pruning (Burda et al.,
+2015) of the VAE, Hoffman (2017) proposed HMC-DLGM. For a data sample x(i), after obtaining
+a sample from the approximate posterior qψ(∙∣x(i)), Hoffman (2017) runs a MCMC algorithm with
+energy function U(Z, x(i)) = - log P(Z) - log P(x(i) |Z; φ) to obtain a more exact posterior sample
+fromP(Z|x(i); φ). Given that better posterior sample Z0, the algorithm maximizes log P(x(i) |Z0; φ).
+To show the benefits of L2HMC, we borrow the method from Hoffman (2017), but replace
+HMC by jointly training an L2HMC sampler to improve the efficiency of the posterior sam-
+pling. We call this model L2HMC-DLGM. A diagram of our model and a formal description
+of our training procedure are presented in Appendix D. We define, for ξ = {z,v, d}, r(ξ∣x; ψ)，
+qψ (z∣x)N (v；0,I) U (d； {-1,1}).
+In the subsequent sections, we compare our method to the standard VAE model from Kingma &
+Welling (2013) and HMC-DGLM from Hoffman (2017). It is important to note that, since our sam-
+pler is trained jointly with Pφ and qψ, it performs exactly the same number of gradient computations
+of the energy function as HMC. We first show that training a latent variable generative model with
+L2HMC results in better generative models both qualitatively and quantitatively. We then show that
+our improved sampler enables a more expressive, non-Gaussian, posterior.
+Implementation details: Our decoder (Pφ) is a neural network with 2 fully connected layers, with
+1024 units each and softplus non-linearities, and outputs Bernoulli activation probabilities for each
+pixel. The encoder (qψ) has the same architecture, returning mean and variance for the approximate
+posterior. Our model was trained for 300 epochs with Adam (Kingma & Ba, 2014) and a learning
+rate α = 10-3 . All experiments were done on the dynamically binarized MNIST dataset (LeCun).
+5.2.1	Sample Quality and Data likelihood
+We first present samples from decoders trained with L2HMC, HMC and the ELBO (i.e. vanilla
+VAE). Although higher log likelihood does not necessarily correspond to better samples (Theis
+et al., 2015), we can see in Figure 5, shown in the Appendix, that the decoder trained with L2HMC
+generates sharper samples than the compared methods.
+We now compare our method to HMC in terms of log-likelihood of the data. As we previously
+stated, the marginal likelihood ofa data point x ∈ X is not tractable as it requires integrating P(x, Z)
+over a high-dimensional space. However, we can estimate it using annealed importance sampling
+(AIS; Neal (2001)). Following Wu et al. (2016), we evaluate our generative models on both training
+and held-out data. In Figure 2, we plot the data’s log-likelihood against the number of gradient
+computation steps for both HMC-DGLM and L2HMC-DGLM. We can see that for a similar number
+of gradient computations, L2HMC-DGLM achieves higher likelihood for both training and held-out
+data. This is a strong indication that L2HMC provides significantly better posterior samples.
+8
+Published as a conference paper at ICLR 2018
+(a) Block Gibbs inpainting of the top half of an MNIST digit, using (top)
+L2HMC as a posterior sampler, and (bottom) qψ as a posterior sampler. (b) Non-Gaussian posterior
+Figure 3: Demonstrations of the value ofa more expressive posterior approximation.
+5.2.2	Increased Expressivity of the posterior
+In the standard VAE framework, approximate posteriors are often parametrized by a Gaussian, thus
+making a strong assumption of uni-modality. In this section, we show that using L2HMC to sample
+from the posterior enables learning of a richer posterior landscape.
+Block Gibbs Sampling To highlight our ability to capture more expressive posteriors, we in-paint
+the top of an image using Block Gibbs Sampling using the approximate posterior or L2HMC. For-
+mally, let x0 be the starting image. We denote top or bottom-half pixels as xt0op and x0bottom . At
+each step t, We sample z(t)〜p(z|xt； θ), sample X 〜p(x|zt； θ). We then set /；& = Xtop and
+xtb+ot1tom = x0bottom. We compare the results obtained by sampling fromp(z|x; θ) using qψ (i.e. the
+approximate posterior) vs. our trained sampler. The results are reported in Figure 3a. We can see that
+L2HMC easily mixes betWeen modes (3, 5, 8, and plausibly 9 in the figure) While the approximate
+posterior gets stuck on the same reconstructed digit (3 in the figure).
+Visualization of the posterior After training a decoder With L2HMC, We randomly choose an
+element X0 ∈ D and run 512 parallel L2HMC chains for 20, 000 Metropolis-Hastings steps. We
+then find the direction of highest variance, project the samples along that direction and shoW a
+histogram in Figure 3b. This plot shoWs non-Gaussianity in the latent space for the posterior. Using
+our improved sampler enables the decoder to make use of a more expressive posterior, and enables
+the encoder to sample from this non-Gaussian posterior.
+6	Future Work
+The loss in Section 4.2 targets lag-one autocorrelation. It should be possible to extend this to also
+target lag-tWo and higher autocorrelations. It should also be possible to extend this loss to reWard
+fast decay in the autocorrelation of other statistics of the samples, for instance the sample energy
+as Well as the sample position. These additional statistics could also include learned statistics of
+the samples, combining benefits of the adversarial approach of (Song et al., 2017) With the current
+Work.
+Our learned generalization of HMC should prove complementary to several other research directions
+related to HMC. It Would be interesting to explore combining our Work With the use of HMC in a
+minibatch setting (Chen et al., 2014); With shadoW Hamiltonians (Izaguirre & Hampton, 2004); With
+gradient pre-conditioning approaches similar to those used in Riemannian HMC (Girolami et al.,
+2009; Betancourt, 2013); With the use of alternative HMC accept-reject rules (Sohl-Dickstein et al.,
+2014; Berger et al., 2015); With the use of non-canonical Hamiltonian dynamics (Tripuraneni et al.,
+2016); With variants of AIS adapted to HMC proposals (Sohl-Dickstein & Culpepper, 2012); With
+the extension of HMC to discrete state spaces (Zhang et al., 2012); and With the use of alternative
+Hamiltonian integrators (Creutz & Gocksch, 1989; Chao et al., 2015).
+Finally, our Work is also complementary to other methods not utilizing gradient information. For
+example, We could incorporate the intuition behind Multiple Try Metropolis schemes (Martino &
+Read, 2013) by having several parametric operators and training each one When used. In addition,
+one could draW inspiration from the adaptive literature (Haario et al., 2001; Andrieu & Thoms, 2008)
+or component-Wise strategies (Gilks & Wild, 1992).
+9
+Published as a conference paper at ICLR 2018
+7	Conclusion
+In this work, we presented a general method to train expressive MCMC kernels parameterized with
+deep neural networks. Given a target distribution p, analytically known up to a constant, our method
+provides a fast-mixing sampler, able to efficiently explore the state space. Our hope is that our
+method can be utilized in a “black-box” manner, in domains where sampling constitutes a huge
+bottleneck such as protein foldings (Schutte et al., 1999) or physics simulations (Olsson, 1995).
+Acknowledgments
+We would like to thank Ben Poole, Aditya Grover, David Belanger, and Colin Raffel for insightful
+comments on the draft, Mohammad Norouzi for support and encouragement launching the project,
+and Jiaming Song for discussions and help running A-NICE-MC.
+References
+Christophe Andrieu and Johannes Thoms. A tutorial on adaptive MCMC. Statistics and computing, 18(4):
+343-373, 2008.
+Christophe Andrieu, Nando De Freitas, Arnaud Doucet, and Michael I Jordan. An introduction to MCMC for
+machine learning. Machine learning, 50(1-2):5-43, 2003.
+Martin Arjovsky, Soumith Chintala, and Leon Bottou. Wasserstein GAN. arXiv preprint arXiv:1701.07875,
+2017.
+Yoshua Bengio, Eric Laufer, Guillaume Alain, and Jason Yosinski. Deep generative stochastic networks train-
+able by backprop. In International Conference on Machine Learning, pp. 226-234, 2014.
+Charles H Bennett. Mass tensor molecular dynamics. Journal of Computational Physics, 19(3):267-279, 1975.
+Andrew B Berger, Mayur Mudigonda, Michael R DeWeese, and Jascha Sohl-Dickstein. A Markov jump
+process for more efficient Hamiltonian Monte Carlo. arXiv preprint arXiv:1509.03808, 2015.
+Michael Betancourt. A general metric for Riemannian manifold Hamiltonian Monte Carlo. In Geometric
+science of information, pp. 327-334. Springer, 2013.
+Yuri Burda, Roger Grosse, and Ruslan Salakhutdinov. Importance weighted autoencoders. arXiv preprint
+arXiv:1509.00519, 2015.
+Wei-Lun Chao, Justin Solomon, Dominik Michels, and Fei Sha. Exponential integration for Hamiltonian
+Monte Carlo. In Proceedings of the 32nd International Conference on Machine Learning (ICML-15), pp.
+1142-1151, 2015.
+Tianqi Chen, Emily Fox, and Carlos Guestrin. Stochastic gradient Hamiltonian Monte Carlo. In International
+Conference on Machine Learning, pp. 1683-1691, 2014.
+Michael Creutz and Andreas Gocksch. Higher-order hybrid Monte Carlo algorithms. Physical Review Letters,
+63(1):9, 1989.
+Laurent Dinh, Jascha Sohl-Dickstein, and Samy Bengio. Density estimation using real NVP. arXiv preprint
+arXiv:1605.08803, 2016.
+Simon Duane, Anthony D Kennedy, Brian J Pendleton, and Duncan Roweth. Hybrid Monte Carlo. Physics
+letters B, 195(2):216-222, 1987.
+Walter R Gilks and Pascal Wild. Adaptive rejection sampling for gibbs sampling. Applied Statistics, pp.
+337-348, 1992.
+Mark Girolami and Ben Calderhead. Riemann manifold Langevin and Hamiltonian Monte Carlo methods.
+Journal of the Royal Statistical Society: Series B (Statistical Methodology), 73(2):123-214, 2011.
+Mark Girolami, Ben Calderhead, and Siu A Chin. Riemannian manifold Hamiltonian Monte Carlo. arXiv
+preprint arXiv:0907.1100, 2009.
+Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair, Aaron
+Courville, and Yoshua Bengio. Generative adversarial nets. In Advances in neural information process-
+ing systems, pp. 2672-2680, 2014.
+10
+Published as a conference paper at ICLR 2018
+Peter J Green. Reversible jump markov chain monte carlo computation and bayesian model determination.
+Biometrika, 82(4):711-732,1995.
+Heikki Haario, Eero Saksman, Johanna Tamminen, et al. An adaptive metropolis algorithm. Bernoulli, 7(2):
+223-242, 2001.
+Ernst Hairer, Christian Lubich, and Gerhard Wanner. Geometric numerical integration illustrated by the
+Stormer-Verlet method. Actanumerica,12:399550, 2003.
+W Keith Hastings. Monte Carlo sampling methods using Markov chains and their applications. Biometrika, 57
+(1):97-109, 1970.
+Matthew D Hoffman. Learning deep latent Gaussian models with Markov chain Monte Carlo. In International
+Conference on Machine Learning, pp. 1510-1519, 2017.
+Matthew D Hoffman and Andrew Gelman. The no-U-turn sampler: adaptively setting path lengths in Hamilto-
+nian Monte Carlo. Journal of Machine Learning Research, 15(1):1593-1623, 2014.
+Li Huang and Lei Wang. Accelerated monte carlo simulations with restricted boltzmann machines. Physical
+Review B, 95(3):035105, 2017.
+Akihisa Ichiki and Masayuki Ohzeki. Violation of detailed balance accelerates relaxation. Physical Review E,
+88(2):020101, 2013.
+Jesus A Izaguirre and SCott S Hampton. Shadow hybrid Monte Carlo: an efficient propagator in phase space of
+macromolecules. Journal of Computational Physics, 200(2):581-604, 2004.
+Diederik Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+arXiv:1412.6980, 2014.
+Diederik P Kingma and Max Welling. Auto-encoding variational Bayes. arXiv preprint arXiv:1312.6114,
+2013.
+Yann LeCun. The MNIST database of handwritten digits. http://yann. lecun. com/exdb/mnist/.
+Benedict Leimkuhler and Sebastian Reich. Simulating Hamiltonian dynamics, volume 14. Cambridge Univer-
+sity Press, 2004.
+Junwei Liu, Yang Qi, Zi Yang Meng, and Liang Fu. Self-learning monte carlo method. Physical Review B, 95
+(4):041101, 2017.
+David JC MacKay. Information theory, inference and learning algorithms. Cambridge university press, 2003.
+Luca Martino and Jesse Read. On the flexibility of the design of multiple try metropolis schemes. Computa-
+tional Statistics, 28(6):2797-2823, 2013.
+Radford M Neal. Probabilistic inference using Markov chain Monte Carlo methods. 1993.
+Radford M Neal. Sampling from multimodal distributions using tempered transitions. Statistics and computing,
+6(4):353-366, 1996.
+Radford M Neal. Annealed importance sampling. Statistics and computing, 11(2):125-139, 2001.
+Radford M Neal. MCMC using Hamiltonian dynamics. Handbook of Markov Chain Monte Carlo, 2(11), 2011.
+Peter Olsson. Two phase transitions in the fully frustrated XY model. Physical review letters, 75(14):2758,
+1995.
+Cristian Pasarica and Andrew Gelman. Adaptively scaling the Metropolis algorithm using expected squared
+jumped distance. Statistica Sinica, pp. 343-364, 2010.
+Danilo Jimenez Rezende, Shakir Mohamed, and Daan Wierstra. Stochastic backpropagation and approximate
+inference in deep generative models. In ICML, 2014.
+Tim Salimans, Diederik Kingma, and Max Welling. Markov chain Monte Carlo and variational inference:
+Bridging the gap. In Proceedings of the 32nd International Conference on Machine Learning (ICML-15),
+pp. 1218-1226, 2015.
+Ch Schutte, Alexander Fischer, Wilhelm Huisinga, and Peter Deuflhard. A direct approach to conformational
+dynamics based on hybrid Monte Carlo. Journal of Computational Physics, 151(1):146-168, 1999.
+11
+Published as a conference paper at ICLR 2018
+Dino Sejdinovic, Heiko Strathmann, Maria Lomeli Garcia, Christophe Andrieu, and Arthur Gretton. Kernel
+adaptive metropolis-hastings. In International Conference on Machine Learning, pp. 1665-1673, 2014.
+Jascha Sohl-Dickstein and Benjamin J Culpepper. Hamiltonian annealed importance sampling for partition
+function estimation. arXiv preprint arXiv:1205.1925, 2012.
+Jascha Sohl-Dickstein, Mayur Mudigonda, and Michael R DeWeese. Hamiltonian Monte Carlo without de-
+tailed balance. pp. 719-726, 2014.
+Jascha Sohl-Dickstein, Eric A Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning
+using nonequilibrium thermodynamics. arXiv preprint arXiv:1503.03585, 2015.
+Jiaming Song, Shengjia Zhao, and Stefano Ermon. A-nice-mc: Adversarial training for mcmc. In Advances in
+Neural Information Processing Systems, pp. 5146-5156, 2017.
+Heiko Strathmann, Dino Sejdinovic, Samuel Livingstone, Zoltan Szabo, and Arthur Gretton. Gradient-free
+hamiltonian monte carlo with efficient kernel exponential families. In Advances in Neural Information
+Processing Systems, pp. 955-963, 2015.
+Lucas Theis, Aaron van den Oord, and Matthias Bethge. A note on the evaluation of generative models. arXiv
+preprint arXiv:1511.01844, 2015.
+Nilesh Tripuraneni, Mark Rowland, Zoubin Ghahramani, and Richard Turner. Magnetic Hamiltonian Monte
+Carlo. arXiv preprint arXiv:1607.02738, 2016.
+Lei Wang. Can boltzmann machines discover cluster updates? arXiv preprint arXiv:1702.08586, 2017.
+Yuhuai Wu, Yuri Burda, Ruslan Salakhutdinov, and Roger Grosse. On the quantitative analysis of decoder-
+based generative models. arXiv preprint arXiv:1611.04273, 2016.
+Yichuan Zhang, Zoubin Ghahramani, Amos J Storkey, and Charles A Sutton. Continuous relaxations for
+discrete hamiltonian monte carlo. In Advances in Neural Information Processing Systems, pp. 3194-3202,
+2012.
+12
+Published as a conference paper at ICLR 2018
+Appendix
+A Reverse leapfrog operator
+Let ξ = {x, v, d} in the extended state space with d = -1. Here, we describe the leapfrog updates
+for a single time step t, this consists of inverting the equations presented in the corresponding section.
+Let ζ1 = {x, v, t}, we have:
+v0 = [v + 2 (∂χU(x) Θ exp(eQv(Zι)) + Tv(Zi))] Θ exp(-Sv(Zι)).	(10)
+With the notation from Section 4, let ζ2 , {xmt , v, t}
+x0 = Xmt + mt Θ [(x - e(exp(eQχ(Z2)) Θ v0 + Tχ(Z2))] Θ exp(-eSv(Z2)).	(11)
+Let us denote Z3，{xmmt ,v,t}:
+X00 = Xmt + mt Θ [(x0 - e(exp(eQχ(Z3)) Θ v0 + Tχ(Z3))] Θ exp(-eSv(Z3)).	(12)
+Finally, the last update, with ζ4 , {x00, ∂xU(x00), t}:
+v0 = [v + 2 (∂χU(x00) Θ exp(eQv(Z4)) + Tv(¢4))] Θ exp(-Sv(Z4)).	(13)
+It is important to note that to invert Lθ, these steps should be ran for t from M to 1.
+B Determinant of the Jacobian
+Given the derivations (and notations) from Section 4, for the forward operator Lθ , we can immedi-
+ately compute the Jacobian:
+log d[FξTθξ] = d Xh 11 ∙ Sv(Zt)+ emt
+∂ξ	t≤M 2
+Sx(Z2) + Emt ∙ Sx(Z3) + $1 ∙ Sv(Z4)] ∙
+(14)
+Where Zit denotes the intermediary variable Zi at time step t and d is the direction of ξ i.e. ξ
+{X, v, d}.
+C Experimental details of Section 5
+C.1 Implementation details
+First of all, we keep separate parameters for the network responsible for updating v and those updat-
+ing X. The architectures are the same. Let us take the example of Qv, Sv, Tv. The time step t is given
+as input to the MLP, encoded as T(t) = (cos(M), sin(2∏t)). σ(∙) denotes the ReLU non-linearity.
+For nh hidden units per layer:
+•	We first compute h1 = σ(W1X + W2v + W3τ(t) + b) (h ∈ Rnh).
+•	h2 =σ(W4h+b4) ∈ Rnh
+•	Sv = λstanh(Wsh2 + bs), Qv = λqtanh(Wqh2 + bq), Tv = Wth2 + bt.
+In Section 5.1, the Q, S, T are neural networks with 2 hidden layers with 10 (100 for the 50-d ICG)
+units and ReLU non-linearities. We train with Adam (Kingma & Ba, 2014) and a learning rate
+α = 10-3. We train for 5, 000 iterations with a batch size of 200.
+λb was set to 0 for ICG and SCG and to 1 for MoG and Rough Well. For the MoG tasks, we train our
+sampler with a temperature parameter that we continuously anneal; we evaluate the trained sampler
+without using temperature.
+13
+Published as a conference paper at ICLR 2018
+Figure 4: Diagram of our L2HMC-DGLM model. Nodes are functions of their parents. Round
+nodes are deterministic, diamond nodes are stochastic and the doubly-circled node is observed.
+C.2 Auto-correlation and ESS
+Let (xτ )τ≤t be a set of correlated samples converging to the distribution P with mean μ and Covari-
+ance Σ. We define auto-correlation at time t as:
+Pt , Trace(Σ)(T - t),＜工_1(XT-MT(XT+t -以	(I5)
+We can now define effective sample size (ESS) as:
+ESS((XT)τ≤T) , [	.∖-----.	(16)
+1 + 2 t ρt
+Similar to Hoffman & Gelman (2014), we truncate the sum when the auto-correlation goes below
+0.05.
+C.3 Comparison with LAHMC
+We compare our trained sampler with LAHMC (Sohl-Dickstein et al., 2014). Results are reported in
+Table 1. L2HMC largely outperforms LAHMC on all task. LAHMC is also unable to mix between
+modes for the MoG task. We also note that L2HMC could be easily combined with LAHMC, by
+replacing the leapfrog integrator of LAHMC with the learned one of L2HMC.
+Distribution	Gradient Evaluations	ESS-L2HMC	ESS-LAHMC	Ratio
+50-d ICG	2000	156.6	21.4	7.3
+Rough Well	200		8.6	1.5
+2-d SCG	5000	12.5 116	16.7	14.9
+MoG	20, 000	65.0	0.53	123.5
+Table 1: ESS for a fixed number of gradient evaluations.
+D L2HMC-DGLM
+D.1 Training algorithm
+In this section, we present our training algorithm as well as a diagram explaining L2HMC-DGLM.
+For conciseness, given our operator Lθ, We denote by Kθ(∙∣χ) the distribution over next state given
+sampling of a momentum and direction and the Metropolis-Hastings step.
+D.2 Implementation details of L2HMC-DGLM
+Similar to our L2HMC training on unconditional sampling, we share weights across Q, S and T.
+In addition, the auxiliary variable X (here the image from MNIST) is first passed through a 2-layer
+neural network, with softplus non-linearities and 52 hidden units. This input is given to both
+14
+Published as a conference paper at ICLR 2018
+Algorithm 2 L2HMC for latent variable generative models
+Input: dataset D, number of iterations niters, number of Metropolis-Hastings step J, number of
+leapfrogs M, and learning rate schedule (αt)t≤n	.
+Randomly initialize the decoder’s parameters φ and the approximate posterior ψ. Initialize the
+parameters of the sampler θ with M leapfrog steps.
+for t = 0 to niters - 1 do
+Randomly sample a minibatch B from the dataset D .
+LELBO, LSamPler, LDeCoder <- 0
+for x(b) ∈ B do
+Sample ξ(b) 〜r(∙∣x(b); ψ).
+LELBO J P(X(I))|z(b)； φ) - KL(qψ(Z|x(b))||p(z))	. With ξ(b) = {z(b), v(b), dOb)}
+Define the energy function Ux(b) (z) = - logp(x(b)|z; θ) - logp(z)
+LSamPler J 0
+λ J ,Var(qψ(z(b)Ix(J))
+for j = 0 to J - 1 do
+ξj(b) J Rξj(b)
+LSamPler J LSamPler + 'λ(ξjb), FLθξ^ ,A(FLθξjb ∣ξjb)))
+Set ξj+1 to FLθξjb) with probability A(FLθξjb) ∣ξjb)).
+end for
+LDeCoder J LDeCoder + logp(x(b)|zJ(s)； φ)	. With ξJ(b) = {zJ(b),vJ(b),d(Jb)}
+end for
+φ J φ + αt VφLDecoder
+ψ J ψ + αtVψLELBO
+θ J θ + αt VθLSamPler
+end for
+7 ozs N < 4 t
+<∕7WI79O7
+50/6 3 夕 50
+3597/ 乎7√
+Qd 7 9 qz∕9
+l46 ©l*ʌ
+I Ul ⅜r 77 / O a/ 7
+72a∖3 勺 7N5
+7%÷75cs21
+4 2 6 .“3吁 C 4
+M əN66b
+. 6 7 S / V f ɔ.
+6S6 7∕75f)
+SJG 4q6xβv
+7 Q P A∙ 6 ,z⅛ V cσ
+72337夕35
+0707 3 520
+76 Zf 46。&
+∖b'6b 0 5 16
+64c∙G0oy∕t 7
+33i2>47c 3
+(a) L2HMC	(b) HMC	(c) VAE
+Figure 5: L2HMC-DGLM decoder produces sharper mean activations.
+networks {∙}x and {∙}v. The architecture then consists of 2 hidden layers of 200 units and ReLU
+non-linearities. For λ (scale parameter of the loss), we use the standard deviation of the approximate
+posterior.
+AIS Evaluation For each data point, we run 20 Markov Chains in parallel, 10, 000 annealing steps
+with 10 leapfrogs per step and choose the step size for an acceptance rate of 0.65.
+D.3 MNIST SAMPLES
+We show in Figure 5 samples from the three evaluated models: VAE (Kingma & Welling, 2013),
+HMC-DGLM (Hoffman, 2017) and L2HMC-DGLM.
+15

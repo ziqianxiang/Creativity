@@ -1,0 +1,1056 @@
+﻿Under review as a conference paper at ICLR 2022
+ScaLA: Speeding-Up Fine-tuning of Pre-
+trained Transformer Networks via Efficient
+and Scalable Adversarial Perturbation
+Anonymous authors
+Paper under double-blind review
+Ab stract
+The size of transformer networks is growing at an unprecedented rate and has
+increased by three orders of magnitude in recent years, approaching the trillions.
+To train models of increasing sizes, researchers and practitioners have employed
+large-batch optimization to leverage massive distributed deep learning systems and
+resources. However, increasing the batch size changes the training dynamics, often
+leading to generalization gap and training instability issues that require extensive
+hyperparameter turning to maintain the same level of accuracy. In this paper, we
+explore the steepness of the loss landscape of large-batch optimization and find that
+it tends to be highly complex and irregular, posing challenges to generalization. To
+address this challenge, we propose ScaLA, a scalable and robust method for large-
+batch optimization of transformer networks via adversarial perturbation. Moreover,
+we perform several optimizations to reduce the computational cost of performing
+the adversarial perturbation, thereby improving its performance and scalability
+in the distributed training environment. We provide a theoretical convergence
+rate analysis for ScaLA using techniques for analyzing non-convex saddle-point
+problems. Finally, we perform an extensive evaluation of our method using BERT
+and RoBERTa on GLUE datasets. Our results show that our method attains up
+to 18 × fine-tuning speedups on 2 DGX-2 nodes, while achieving comparable
+and sometimes higher accuracy than the state-of-the-art large-batch optimization
+methods. When using the same number of hardware resources, ScaLA is 2.7-9.8 ×
+faster than the baselines.
+1	Introduction
+We have seen exponential growth in DL model size since the debut of the transformer net-
+work (Vaswani et al., 2017). For example, while BERTbase has around 100M parameters, the
+model size has increased to multi-billion parameters such as Megatron-LM (8B) (Shoeybi et al.,
+2019), T5 (11B) (Raffel et al., 2019), Turing-NLG (17B) (tur), and with GPT-3 hitting a new stagger-
+ing record of 175B parameters. With the three orders of magnitude growth, these large models also
+have powered accuracy breakthroughs in many challenging Natural Language Processing (NLP) tasks
+such as the General Language Understanding Evaluation (GLUE) benchmark (Wang et al., 2019a).
+Recent studies show that the performance of these models continues to scale with their sizes (Kaplan
+et al., 2020). As a result, we expect that the model size would continue to grow in the future.
+To accelerate the training speed of large models, the most common way is to increase the batch size
+in the optimization algorithm in order to leverage multi-GPU training (Li et al., 2020; Liu et al., 2019;
+Huang et al., 2019; Shazeer et al., 2018; Shoeybi et al., 2019; Rajbhandari et al., 2019). By increasing
+the batch size, a mini-batch of size B can be divided across more workers (GPUs), where the gradients
+are computed locally on each worker using back-propagation and then aggregated. Furthermore,
+most of the operations used in transformer networks are highly optimized in modern linear algebra
+frameworks on GPUs and can scale to larger batch sizes without significantly increasing the time
+per step (Wang et al., 2019c; Kaplan et al., 2020). If researchers can train each neural network with
+more GPUs and increased throughput, then it makes it possible for them to achieve better results by
+training even larger models, using larger datasets and exploring new ideas more rapidly.
+1
+Under review as a conference paper at ICLR 2022
+However, changing the batch size is not always straightforward, as it often impacts the training
+dynamics. You et al. propose LAMB (You et al., 2019a) to exploit large-batch optimization for
+transformer networks. LAMB is a variant of Adam (Kingma & Ba, 2015) that applies layer-wise
+normalization before applying each gradient update, which has been used to successfully train BERT
+on 1024 TPU chips in 76 minutes. Despite showing promising results, prior work (You et al.,
+2019a) primarily focuses on pre-training. On the other hand, the fine-tuning stage starts to become a
+bottleneck (e.g., it takes tens of hours to fine-tune RoBERTa-large on MNLI (Wang et al., 2019a))
+and becomes more expensive as model size increases. If we can speed-up pre-training by increasing
+batch sizes, why do we not also increase the batch size during fine-tuning in the interest of making
+fine-tuning more efficient as well? Contemporary experience is that fine-tuning with large batch sizes
+is harder to train, often reaching lower accuracy than the baseline accuracy using small batch sizes.
+To address these challenges, we develop new approaches to improving the scalability and generaliz-
+ability in fine-tuning pre-trained transformer networks by making the following contributions: (1)
+We present an adversarial perturbation based large batch optimization algorithm ScaLA (Scalable
+Large-batch Adversarial Perturbation) for training transformer networks, in the distributed training
+setting. We show how adversarial perturbation helps improve the generalization and more importantly
+how we reduce the cost of injecting adversarial perturbations to improve computational efficiency. (2)
+We also present a theoretical convergence rate analysis using techniques for analyzing non-convex
+saddle-point problems. (3) We conduct evaluation on a wide range of natural language understanding
+(NLU) tasks and assess the impact of adversarial perturbations on both the scalability and the general-
+izability in large batch task-specific fine-tuning. (4) We evaluate our approach against BERT (Devlin
+et al., 2019) and RoBERTa (Liu et al., 2019) and show that ScaLA obtains significant improvements
+over the state-of-the-art algorithms, such as LAMB, for the large batch optimization of fine-tuning
+tasks. Concretely, while LAMB leads to 1 point accuracy drop on average (e.g., GLUE) as we
+increase the batch size, our approach achieves the same and sometimes higher accuracy (up to 0.9
+points) after drastically increasing the batch size. Furthermore, with our cost-efficient optimizations,
+ScaLA achieves up to 18× speedups on 2 NVIDIA DGX-2 nodes over the baseline fine-tuning time
+and is up to 9.8× faster than the baseline when using the same number of GPUs.
+2	Background and Related Work
+Despite the great success of pre-trained transformer networks such as BERT (Devlin et al., 2019),
+a big challenge, in general, comes from the training efficiency - even with self-attention and par-
+allelizable recurrence (Vaswani et al., 2017), and high-performance hardware (Jouppi et al., 2017),
+training transformer networks can still take a significant amount of time. One effective approach to
+reducing training time is through data parallelism (Devlin et al., 2019; Liu et al., 2019; Shoeybi et al.,
+2019), which motivates studies on large-batch stochastic non-convex optimizations for transformer
+networks (You et al., 2019a). These studies have raised concerns with respect to its convergence,
+generalizability, and training stability by observing that training with a large batch could be diffi-
+cult (Keskar et al., 2017; Hoffer et al., 2017; Nado et al., 2021). Furthermore, prior works mostly
+focus on reducing the pre-training time (You et al., 2019a; Zhang & He, 2020; Gong et al., 2019;
+Clark et al., 2020) instead of the adaptation time at the fine-tuning stage.
+While many researchers and practitioners focus on how to reduce the pre-training time, few attention
+has been paid to accelerate the fine-tuning stage, which gradually becomes a bottleneck as model
+sizes increase (e.g., it takes tens of hours to fine-tune MNLI on RoBERTa-large). Therefore, in
+contrast to previous works, our goal in this paper is to speed-up task-specific fine-tuning without
+hurting model accuracy. Different from pre-training, the fine-tuning stage often employs a much
+smaller batch size (e.g., log2 B = {4, 5}) than pre-training (e.g., log2 B ≥ 10) (Devlin et al.,
+2019; Liu et al., 2019). The small batch size results in inefficient data parallelism (i.e., sub-optimal
+computation-communication ratio), making it difficult for fine-tuning to benefit from multi-GPU
+training. Moreover, a common understanding is that small-batch sizes provide implicit regularization
+effects (e.g., from gradient noise) that help improve generalization of downstream tasks. In contrast,
+our goal is to speed-up the fine-tuning process with large batch sizes while preserving model accuracy.
+On a separate line of research, adversarial training was first proposed in the computer vision literature
+to improve a model’s robustness against adversarial attacks (Goodfellow et al., 2015; Madry et al.,
+2018). Recently, there has been some work that shows that adversarial training helps improve model
+generalizability (Cheng et al., 2019; Wang et al., 2019b; Jiang et al., 2020; Liu et al., 2020; Yao et al.,
+2
+Under review as a conference paper at ICLR 2022
+2018a; Zhu et al., 2020). However, very few works examine large-batch optimization of transformer
+networks and NLP tasks with adversarial perturbations from a computational efficiency and scalability
+perspective. The work most similar to ours is Zhu et al. (2020), who study adversarial training for
+NLP tasks by accumulating the gradient of the parameters from each of the ascent steps and updates
+the parameters only once after K inner ascent steps with the accumulated gradients. Unlike Zhu
+et al. (2020), we consider accelerating the fine-tuning speed by parallel adversarial training and by
+adjusting the number of inner maximization steps, which offers much higher speedups.
+3	The Proposed Method
+In this section, we present a principled method for large batch optimization that is highly scalable
+while maintaining the quality of the solutions as measured by task-appropriate accuracy metrics.
+3.1	A Sequential Game-theoretic Method via Adversarial Perturbation Oracle
+Formulation: Let X denote the parameter space and Y denote the data (mini-batch/sample) space and
+Q denote a distribution supported on Y. To improve the generalizability of transformer fine-tuning
+while retaining the scalability, we augment the usual stochastic optimization objective by constructing
+an adversarial (Keskar et al., 2017; Madry et al., 2018) regularization. In particular, we solve the
+following robust optimization problem, which is a stochastic minimax (Lin et al., 2020) optimization
+problem augmented with a regularization term involving a deterministic adversarial perturbation,
+instead of vanilla risk minimization:
+min Eξ 〜Q [g(x, ξ)] = min Eξ 〜Q [f (x, ξ) + λr(X)]
+x∈X	x∈X	—
+=min max Eξ〜Q[f(x,ξ) + λr(x,y)] := min max Eξ〜q[∕(x,y,ξ)]	(1)
+x∈X y∈Y	x∈X y∈Y
+where g : X X Y → R denotes the robust training objective, f : X X Y → R denotes the standard
+training objective, f : X X Y X Y → R denotes the augmented objective, r : X → R denotes
+a deterministic regularization term on the parameters controlled by a strength factor λ ∈ (0, ∞),
+r : X → R denotes the augmented regularization and ξ denotes samples drawn from Q (for simplicity,
+we slightly abuse the notation in using ξ to denote the random variable, e.g. Eξ [g(x, ξ)], or its
+empirical realizations, e.g.* PK=I g(x, ξk) for any K; the meaning is clear from the context). The
+overall (outer) training objective involves a minimization problem in the parameter space while being
+stochastic with respect to the data space. The adversarial regularization (inner) term is a deterministic
+maximization problem operating in the data space conditioned on a fixed parameter configuration. We
+wish to emphasize that this formulation is a two-player sequential (Jin et al., 2020), not simultaneous,
+game wherein the goal is to optimize a transformer network that is robust to adversarial perturbation.
+In a given round, the first player (associated with the outer minimization) proposes a parameter
+configuration, and the second player (associated with the inner maximization) responds with a penalty
+to capture the effect of label errors due to perturbations in a large data batch size to undermine the
+performance of the transformer parameter configuration chosen by the first player.
+Practical Considerations: Language expressions are quite sensitive to individual words or clauses,
+where perturbations against those would likely generate incorrect or biased training data with wrong
+labels (Zhang & Yang, 2018). Following prior success in applying adversarial training to NLP
+models (Miyato et al., 2017; Zhu et al., 2020), we apply perturbations to the continuous word
+embeddings instead of directly to discrete words or tokens. The term r captures the prediction
+deviation from the perturbation. In a given round of the game, with respect to the first player’s
+proposal, let Φ denote the transformer network under consideration (specifically, Φ is BERT in this
+paper) and ξ be a large batch of data sampled from Q. We construct a label for the second player as
+γ := Φ(x, ξ). Next, for classification tasks, we choose r to be the symmetric KL divergence (Jiang
+et al., 2020), i.e., r(x, y) := KLsym(γ, Φ(x, y)). We use symmetric KL divergence to measure the
+distributional divergence to generate adversarial perturbation. For regression tasks, we choose r to be
+the squared loss, i.e., r(x, y) := (γ 一 Φ(x, y))2. In practice, We add an '∞ constraint on y, which is
+achieved by simple clipping with a radius of ω (projection). Intuitively, a large r corresponds to a
+situation wherein the transformer is highly sensitive to a given perturbation in the input, suggesting
+that the model parameters are close to a sharp minimum. Augmenting the original training objective
+with r makes the first player incur an additional penalty if the outer minimization solution veers
+closer to sharp minima, thereby encouraging flatter solutions and better generalizability.
+3
+Under review as a conference paper at ICLR 2022
+Minimize loss ----------
+(	OUtpUt layer	)
+I ConteXt embeddings ∣
+〔Transformer encoder ]
+InpUt embeddings ∣ + ∣ Adv. noise ∣
+4	:	:	4
+Lexicon encoder )	∣ NoiSe generator 6
+MaXimize
+prediction
+deviation
+(Delayed
+PGA-1)
+SentenCe inputs
+FigureLThearchitectureofthepro-Figure 2： Time bre
+posed method.	with and with PGA-1.
+Figure 3: Impact of perturba-
+tion steps.
+Inner Maximization: For any given outer step t, let xt denote the parameter proposed by the first
+player. Since the exact inner maximization in Equation equation 1 is intractable for non-convex
+models such as transformers, we adopt truncated methods as in prior works. Specifically, we use
+Projected Gradient Ascent (PGA) (Madry et al., 2018; Jiang et al., 2020) to solve this problem, i.e.,
+yτ +1 = ∏ω(yτ + PτVyr(xt,y)) where ρτ for T ∈ [T] is the step size sequence and Π projects
+the result of the gradient ascent update into an '∞ ball of diameter 2ω around the original input
+embeddings, ξ, considered by the first player.
+Outer Minimization via Groupwise Adaptive Learning Rates: Inspired by prior works that
+stabilize large-batch training and improve its convergence quality, we employ algorithms with
+groupwise adaptive learning rates (You et al., 2019a) to solve the outer minimization. Specifically, we
+solve the minimization problem in Equation equation 1 by x* it+1 = xit-ηtν(kxitk)Vb ixg(x)/kVb ixg(x)k,
+∀i ∈ [h] where i denotes the ith-layer of the transformer. The normalized gradient descent mitigates
+issues due to exploding gradients. The learning rate sequence ηt, ∀t ∈ [T] is scaled by a clipping
+function ν(c) := max(L, min(c, U)) where L < U (e.g., L = 0 and U = 10), which ensures the
+norm of the update is of the same order as that of the weights. Note that we use gradient averaging
+on ξ, i.e., gradient accumulation and all-reduce, over a batch size B distributed across P workers in
+i
+order to obtain a noisy gradient estimate Vixg(x) at epoch t.
+Computational Cost: Given that the primary interest of using a large batch size is to improve
+hardware efficiency, we are motivated to look carefully into the computational cost of adversarial
+perturbation. Adversarial perturbation requires an extra PGA inner loop that standard training does
+not have. Figure 2 provides the time breakdown of adversarial training using PGA with T = 1
+(denoted as PGA-1). PGA-1 performs the perturbation and takes approximately the same time as
+making three forward passes (Fwd) through the network. This is because one step of PGA requires
+to make one forward and backward pass (Bwd) over the entire network. The backward pass of
+adversarial training takes roughly twice the amount of time as the standard backward step because the
+back-propagation is triggered twice to calculate the perturbation noise and the gradients. The time
+spent on the optimizer step function (step) remains the same. In total, adversarial training slows down
+training by at least 2 times, even with T=1. This motivates us to look at the effectiveness of different
+perturbation steps as well as the usefulness of perturbation from the initial epochs in practice.
+Impact of Perturbation Steps, T: Prior works often do multiple gradient computation steps
+(T > 1) and take several times longer training time to produce adversaries (Madry et al., 2018;
+Zhu et al., 2020), because their focus is not on computational efficiency. Subsequently, researchers
+presented Curriculum Adversarial Training (CAT) (Cai et al., 2018) and Annealing-based Adversarial
+Training (Amata) (Ye et al., 2020), which progressively increase the perturbation with various
+strengths, cutting the adversarial training cost while maintaining good accuracy. To investigate how
+CAT and similar methods affect large-scale NLP problems involving transformers, we evaluate the
+final fine-tuning accuracy and training cost of QNLI, varying the number of perturbation steps T
+and report the results in Figure 3. Interestingly, although using a large T helps to produce stronger
+adversaries, we find that this does not lead to improved fine-tuning accuracy, despite the fact that the
+training overhead still increases almost linearly. In fact, the best accuracy is achieved with T = 1.
+Our hypothesis to this phenomenon is below. The model has two components, namely, the parameter
+space and data space. First, unlike the minimization in the parameter space, which is stochastic,
+the maximization in the data space is deterministic. Second, with respect to the testing phase,
+4
+Under review as a conference paper at ICLR 2022
+the numerical convergence in the model’s parameter space is of primary importance rather than
+the numerical convergence in the data space, i.e., the maximization is an auxiliary procedure that
+augments the training phase to make the parameter space ”aware” of effects of the batch size across
+epochs. Due to these two points, at a certain epoch, for a given batch, the marginal utility of an
+additional PGA step is low, and we are able to get away with inexact deterministic maximization.
+Therefore, we apply PGA-1 in our large-batch optimization scheme, given that it produces sufficiently
+good solutions while being much more computationally efficient.
+Delayed Perturbation Injection: Given that even PGA-1 still adds an overhead factor of 2, we
+are motivated to investigate how useful adversarial perturbations are in the initial phase of large-
+batch optimization. We conduct additional experiments to measure the final accuracy corresponding
+to starting from a regular fine-tuning and then enabling PGA-1 for t ≥ ts where ts ∈ [T]. Our
+observation is that enabling PGA-1 from the beginning does not offer much improvement in accuracy,
+whereas adversarial perturbation becomes more potent as the model begins to stabilize towards
+the end of training. Intuitively, this makes sense because generally, at initialization, the model’s
+parameters are relatively far from their final values and are less likely to get stuck at local minima.
+Therefore the adversarial perturbations generated in the initial training iterations are quite different
+from the perturbations towards the end of training because they would not maximize the adversarial
+loss in Equation 1. We remark that a similar phenomenon has been observed in computer vision
+tasks (Cai et al., 2018; Ye et al., 2020; Gupta et al., 2020). We show that it is possible to delay the
+injection of adversarial perturbations for large-batch optimization of transformers for NLP tasks.
+The Algorithm, ScaLA: Combining the formulation with the above investigations, we construct
+our distributed large-batch transformer fine-tuning algorithm, named ScaLA (Algorithm 1), whose
+convergence rate is characterized in Theorem 1.
+Algorithm 1, ScaLA, Scalable Large-batch Adversarial Perturbation
+1:	Input: Epochs T , delay ts , perturbation (inner) step size ρ, clipping radius ω, regularization
+strength λ, (outer) learning rate η
+2:	Output: h-layer transformer model Φ with converged robust parameters X := XT
+3:	for t ∈ [T] do	. Loop through epochs
+4:	for worker p ∈ [P] do	. In parallel across homogeneous workers
+5:	for mini-batch ξp 〜 Q do	. Subsample B data instances on each worker
+6:	r(xt) J 0, Y J Φ(x, ξp), select yo	. Initialize regularization and label
+7:	if t ≥ ts then	. Check delay condition
+8:	yι J ∏ω (yo + Nyr(xt, y)) . Perform adversarial perturbation with PGA-1
+9:	r(xt) J KLSym(γ, Φ(χt-ι,yι))	. Calculate the adversarial regularization
+10:	g(xt, ξp) J f (χt-ι, ξp) + λr(xt)	. Calculate the augmented loss
+11:	Vxg(χt, ξp) J Backward pass on Φ . Compute local gradients using accumulation
+P
+12:	Vχg(χt) J B Ep=I Vχg(χt, ξp)	. Gradient averaging using all-reduce
+bi
+13:	Xt J χi-ι 一 ηtV(kxtk) ∣∣bx；；/：1, ∀i ∈ [h]	. Update model parameters
+Theorem 1 (Complexity of Algorithm 1; Informal - Details in Appendix D). Consider the problem
+in Equation 1. Let t§ = 0. Setting the outer learning rate as η = O (l∕√T) and scaling batch
+size as b = O(T), for Algorithm 1, we have E [∣∣Vgι∕2α(X)∣∣2] ≤ O(E + Kɑ∕√T) where X is the
+estimator obtained from running T steps of Algorithm 1 and picking Xt uniformly at random for
+t ∈ [T]. Here, E is the error due to the approximate inner maximization oracle, α characterizes the
+smoothness of f (x,.), gι∕2a is the Moreau-envelope of g and Ka = maxi ai∕ mini ai.
+4	Evaluation
+We evaluate the effectiveness of ScaLA in training transformer networks over a set of NLP tasks.
+Hardware: We study the efficiency of computation using 2 NVIDIA DGX-2 nodes. Each node
+consists of 16 NVIDIA V100 GPUs. The nodes are connected with InfiniBand using a 648-port
+Mellanox MLNX-OS CS7500 switch. We vary the number of workers (i.e., from 1 GPU to 32 GPUs)
+in the experiments to evaluate the scalability. Software: We use PyTorch Distributed Data Parallel to
+5
+Under review as a conference paper at ICLR 2022
+scale the fine-tuning from a single GPU to multiple GPUs, which uses all-reduce (Proficz, 2018) to
+compute the average of the gradients across all workers for a parameter update. We use NCCL V2.4
+as the underlying all-reduce implementation. Model/Dataset: We use pre-trained BERTbase model
+released by HuggingFace (Wolf et al., 2020). We use the GLUE benchmark (Wang et al., 2019a),
+which is a collection of sentence or sentence-pair natural language understanding tasks including
+question answering, sentiment analysis, and textual entailment. Given that large models normally
+require days or even weeks (e.g., RoBERTa) if trained from scratch, it is not cost-efficient to evaluate
+from scratch using large-scale pretraining. Therefore, experiments presented in this section focus on
+fine-tuning pre-trained models, e.g., BERT (Devlin et al., 2019) and RoBERTa (Liu et al., 2019), and
+exclude fine-tuning tasks that have very small datasets (e.g.,CoLA, RTE). We report the details about
+the hyperparameters in Appendix B.
+4.1	MAIN RESULTS - TRAINING TIME ACCELERATION AND ACCURACY IMPROVEMENT
+We first compare the following schemes: (1) Single GPU + SB: This is the existing PyTorch
+implementation of Transformer fine-tuning from HuggingFace (HF), using small batch (SB) sizes
+(e.g., 32). Our fine-tuning results on single GPU achieves higher accuracy than what was reported
+by (Devlin et al., 2019), (2) Multi-GPU + SB: This is multi-node multi-GPU PyTorch fine-tuning
+implementation using DistributedDataParallel (Li et al., 2020), and (3) Multi-GPU + LB + ScaLA:
+This is our approach as described in Algorithm 1, using large minibatches (LB), e.g., 1K. Table 2
+shows results on MNLI, QNLI, QQP, and SST2, which are larger datasets and less sensitive to
+random seeds. n × g refers to Pn nodes each with Pg GPUs for a total of P = PnPg homogeneous
+workers (e.g., 32 GPUs on 2 NVIDIA DGX-2 nodes). For a fair comparison, we reproduce BERT
+and RoBERTa baseline. Our reproduced baseline achieves the same or slightly higher accuracy than
+the originally reported results in (Devlin et al., 2019) and (Liu et al., 2019). We now discuss our
+results and observations.
+Table 1: The training time and accuracy results on GLUE benchmark. Results show that ScaLA is
+able to achieve the same average accuracy as the baseline while providing up to 18× speedups than
+single GPU, and up to 9.8× speedups when using the same amount of hardware resources.
+BERTbase	n×g	bsz	MNLI-m 				QNLI			QQP			SST-2			[Avg.
+			Steps	Time	Acc	Steps	Time	Acc.	Steps	Time	Acc∕F1	Steps	Time	,Acc	
+Devlin et al. 20Γ9					84.4			884			-			-927	-
+Baseline (B=32)	-TxT	-32	'73632	；19635	848	19644	[5535	90.6	68226	16494	91/88.0	12630	'2736	-931	89.4
+BaSeline (B=32)	-2x16	-32	'73632	:^8848	84.8	19644	[2408	丽	68226	TT3TT	91/88.0	"12630	'1494	-931	89.4
+ScaLA (B=1Ky	^2xT6	JTk	↑23θr	T323	851	~615^	132	900	2133	4229	90.9/87.7	~396~	T5Γ	935	J89.4
+RoBERTalarge	n×g	bsz	MNLI-m一			QNLI 一			QQP			SST-2 一			Avg.
+			Steps	Time	Acc.	Steps	Time	Acc.	Steps	Time	Acc∕F1	Steps	Time	Acc.	
+Liu et al. 2020					90.2			947			92.2/-			96.4	-
+Baseline (B=32)	Txr	32	73632	43090	90.5	19644	14188	947	68226	40945	92.0/89.4	12630	4940	96.4	92.5
+BaSeline (B=32)	2x16	32	73632	18114	90.5	19644	4842	947	68226	16614	92.0/89.4	12630	3072	96.4	92.5
+SCaLA (B=IKy	2x16	Tk	^2301	3363~	909	~615^	U68	95J	2133	^404	92.3/89.8	^W-	40Γ	96.7	92.9
+Improving scalability with ScaLA: Compared with single-GPU training, baseline fine-tuning on
+multi-GPU leads to only modest training speedup improvements, e.g., with 1.5 - 2.4× faster training
+speed for both BERT and RoBERTa, even with 32× more compute resources. The speedup is limited
+because of the small mini-batches (e.g., 32) used for fine-tuning, which do not provide sufficient
+workload to fully utilize the underlying hardware (e.g., many cores stay idle). Thus, communication
+overhead becomes the dominant part, and fine-tuning tasks struggle to obtain speedups with more
+than 4 GPUs (see detailed analysis results later). In contrast, ScaLA achieves up to 18× speedups
+with 32 GPUs. When using the same number of GPUs (e.g., 32), ScaLA is 2.7-9.8× faster than
+Baseline (B = 32). The speedup is significant because (1) large batches prevent hardware from
+under-utilization and enables processing more samples per second; (2) it takes fewer iterations to
+process an epoch, hence the reduced all-reduce operations to exchange gradients and the overall
+increased computation-vs-communication ratio; (3) PGA-1 significantly reduces the cost to generate
+adversarial perturbations; and (4) With delayed perturbation injection, PGA-1 is only added to later
+iterations instead of throughout the entire training process, further reducing the training cost. Finally,
+ScaLA obtain the speedups while achieving the same accuracy (88.4 vs. 88.4) average accuracy for
+BERT and higher accuracy (92.9 vs. 92.5) for RoBERTa as the baselines.
+6
+Under review as a conference paper at ICLR 2022
+Closing generalization gap with ScaLA: We also compare alternative methods that perform large-
+batch optimizations: (1) Multi-GPU + LB: This configuration uses large mini-batches (e.g., 1K),
+and applies heuristic-based scheduling rule (e.g., square root) and grid search for learning rates;
+(2) Multi-GPU + LB + LAMB: Applies the large-batch optimizer LAMB (You et al., 2019a) to
+fine-tuning tasks. First, compared with the baseline, the accuracy of Multi-GPU + LB drops by close
+to 1 point (88.4 vs. 89.4, and 92.1 vs. 92.9) in average and close to 2 points for some tasks (e.g., QQP
+on BERT), indicating that it is challenging to obtain on-par accuracy with large-batch optimizations
+for fine-tuning tasks. Second, LAMB leads to only marginal improvements (88.6 vs. 88.4, and
+92.1 vs. 92.1) than the baseline and is 0.8 points lower than the small-batch baseline. Since LAMB
+performs no explicit regularization to model complexity, it may still lead to overfitting on downstream
+tasks. With ScaLA, we are able to close the generalization gap from large-batch optimization (89.4
+vs. 89.4, and 92.5 vs. 92.9) and achieve 0.8 points higher accuracy (89.4 vs. 88.6, 92.9 vs. 92.1)
+than LAMB on both BERT and RoBERTa. ScaLA improves generalizability because it introduces
+adversarial perturbations, which serves as a regularizer. By training the network to be robust to such
+perturbations, the model loss landscape is smoothed out, leading to improved generalization.
+Table 2: The comparison results of the GLUE benchmark. ScaLA outperforms large-batch optimiza-
+tion baselines by achieving higher accuracy after training the same number of samples.
+BERTbase	n×g	Batch size	MNLI-m			I QNLI 1				QQP	I			SST-2		Avg.
+			Steps	Time	Acc.	Steps	Time	Acc.	Steps	Time	Acc∕F1	Steps	Time	Acc.	
+BaSeline (B=IK)	2x16	IK-	230Γ	T148	83^	^6Γ5^	-349^	89.3	2133	2892	89.6/86.1	-396^	T34^	^93^	88.4
+LAMB (B=IK)	2x16	IK-	230Γ	TW	^84Γ	^6Γ5^	-359^	^896	2133	2978	90.5/87.0	-396^	T39^	^9Σ4	88.6
+SCaLA (B=IKr	2x16	~TK~	230Γ	1323	85.1	~6Γ5^	~432~	90.0	2133	4229	90.9/87.7	-396~	J5Γ	93.5	89.4
+RoBERTalarge	n×g	Batch size	MNLI-m			QNLI 一			QQP 一			SST-2 一			Avg.
+			Steps	Time	Acc.	Steps	Time	Acc.	Steps	Time	Acc∕F1	Steps	Time	Acc.	
+BaSeline (B=IK)	2x16		2301	2514	WT	^6ry	^936^	94.3	^2133	^1874	91.7/89.1	-396^	^^17^	^959	^92Γ
+LAMB (B=IK)	2x16		2301	2646	^905	^6ry	^973	93	^2133	T998	91.3/88.5	-396^	^324	^962	^92Γ
+SCaLA (B=IKr	^2x16	~TK~	^230T	^3363	90.9	~6Γ5"	IΓ68	95.1	^2Γ33	^2404	92.3/89.8	^39Γ	^40T	^6T7	92.9
+4.2	Experiment - Analysis Results
+Ablation analysis: In this part, we study the importance of components in ScaLA. We set ts to 0,
+which denotes as w/o Delaying PGA-1. We replace the outer minimization to use ADAM (Kingma &
+Ba, 2015), which is noted as w/o Groupwise LR. We set λ to 0, which denotes as w/o PGA-1. The
+results are reported in Table 3.
+Table 3: Ablation study of scaLA using BERTbase on GLUE tasks.
+	MNLI-m		QNLI		QQP		SST-2		Avg.
+	Time	Acc.	Time	Acc.	Time	Acc/F1	Time	Acc.	
+BERT	19635	84.8	5535	90.6	16494	91/88.0-	2736	93.1	ɪr
+SCaLA	1323	85.1	432	90	4229	90.9/87.7	151	93.5	ɪr
+w/o Delaying PGA-1	2503	85.2	726	90.2	6407	91.3/88.3	272	93.1	ɪr
+w/o Groupwise LR	1290	85.0	422	89.9	4212	90.7/87.6	146	93.0	ɪr
+w/o PGA-1	1180	84.1	359	89.6	2978	90.5/87.0	139	92.4	~886^
+The results show that the removal of either design element would result in a performance drop.
+For example, removing groupwise learning rates leads to 0.2 points accuracy drop (89.2 vs. 89.4),
+while completely removing PGA-1 leads to 0.8 points accuracy drop (88.6 vs. 89.4). This result
+demonstrates that these two components are complementary to each other. if we perform PGA-1
+without delayed injection, the average accuracy increases by 0.1 point (89.5 vs. 89.4), but the
+execution time is increased significantly. This difference will be particularly felt during pre-training
+or training larger models. With our delayed PGA-1 approach, we save the training time by 1.5-1.9×
+while retaining high accuracy.
+Scalability analysis varying GPUs. We carry out a scalability test by varying the number of GPUs
+from 1 to 32, with and without communication. We choose a batch size 32, and divide the samples
+among P GPUs. if the per-GPU batch size (e.g., 16) is larger than the maximum admissible per-GPU
+batch size (e.g., 8), we use local gradient accumulation (Goyal et al., 2017) to avoid running out of
+memory. Figure 4a shows the scalability results. For batch size 32, the training time decreases when
+the number of workers increases. However, it quickly plateaus and increases slightly after 4 GPUs.
+This is because small-batch leads to more frequent communication among workers. As a result, the
+7
+Under review as a conference paper at ICLR 2022
+84.8 84.5
+83.6 83.7
+84.3 84.4 83.7
+84,1 80.1
+76,5 81.0
+83,7 83.7 84.1 84.1
+83,8 81.8
+73.0 79.8
+83.6 83 7 83.8 84.0
+83.7 82.6
+66.0 76.8 79.7 80.7
+83.4 83.5 83.5 83.5 83.4 82.0
+,oŋ .ʌoɔ 一g -a q卜一心一心 Ca _B
+(a) Scalability
+(b) Generalizability
+(c) Sharpness
+80.0 32.7 32.7 32.7 35.
+Figure 4: Scalability and generalizability results by fine-tuning BERTbase using ADAM with different
+batch sizes on the MNLI task from the GLUE benchmark.
+communication overhead dominates the total execution time and hinders the scalability of multi-GPU
+training. In contrast, by increasing the batch size, the training time keeps decreasing as the number of
+GPUs increases because a large batch not only reduces the number of expensive all-reduce operations
+for exchanging gradients (i.e., increased computation-vs-communication ratio) but also increases the
+training throughput per GPU due to increased computation granularity. Figure 5 shows the scalability
+comparison on SST-2 after optimizations. While the speedup still plateaus at 4 GPUs with a small
+batch size (e.g., B = 32), the four large-batch configurations are able to scale well up to 32 GPUs
+and take a similar amount of time with 32 GPUs. ScaLA scales better than ScaLA without delaying
+PGA-1, and achieves a much faster training speed, especially in the 1-16 GPU range.
+Batch sizes vs. learning rates for fine-tuning tasks. Figure 4b reports the learning rate scaling
+effects on fine-tuning Transformer networks. We observe that the learning rate scales roughly with
+the the square root of the increase of the mini-batch size (That said, the Appendix C provides analysis
+to show that the best learning rates do not always follow sqrt rule). This is consistent with prior
+findings in pre-training (You et al., 2019a) and simplifies the hyperparameter tuning effort for ScaLA.
+Curvature analysis. Prior work (Keskar et al., 2017) correlates the low generalization with sharp
+minima (which are characterized by a positive curvature of large magnitude in the parameter space).
+To verify this hypothesis, we quantitatively measure the steepness of loss landscape by loading the
+checkpoint of a converged model and computing the curvature, i.e., properties of the second derivative
+of the model, with respect to its parameters, for a fixed batch of samples. In particular, following
+(Yao et al., 2018b), for a model Φ(x), we compute the largest eigenvalue of the model’s Hessian,
+Lmax[VXΦ(x)],using the Hessian-vector product primitive and the power method. We use the largest
+eigenvalue as a measure of sharpness since the corresponding (top) eigenvector characterizes the
+direction of the largest change in gradient at a given point in the parameter space. From Figure 4c,
+the largest eigenvalue of the model trained with large batch (e.g., 1K) is much larger (e.g., 2.6x)
+with higher deviations (e.g., 3.9x) compared to the small batch baseline. Thus, we empirically find
+that large-batch optimization makes the loss landscape of the model more prone to ill-conditioning
+and less robust to perturbation, which may explain the loss in generalization. We then measure
+the steepness of the loss landscape again after applying ScaLA. As shown in Fig. 4c, the largest
+eigenvalue of the model becomes much smaller (6.9×) with lower deviations with ScaLA and is
+slightly better than the small batch baseline, which is a strong indication that our approach enforces
+the smoothness of the model that leads to the accuracy improvement.
+Comparison with random noise. We have performed additional experiments by creating pertur-
+bations through adding Gaussian noise to the embeddings. Table 5 that random noise indeed can
+improve the accuracy for MNLI-m (84.3 vs. 84.5), QNLI (89.3 vs. 89.4), and QQP (90.3/87.0 vs.
+89.6/86.1) over the baseline, but it also leads to worse results on SST-2 (93. vs. 92.6). Compared
+with ScaLA, random noise consistently falls behind ScaLA in its ability to reduce the generalization
+error on all tested tasks and is on average 0.7 points lower than ScaLA (88.7 vs. 89.4).
+Perturbations via ground-truth vs. label probability. We also create one-hot labels and use those
+to generate perturbations instead of using label probability generated by the network. Table 5 shows
+that using label probability (LP) consistently leads to higher accuracy than using the ground-truth
+(GT), e.g., 89.4 vs. 89.0 on average. Label probability leads to better generalization, probably because
+it provides a better measurement of the adversarial direction, which is the direction in the input space
+in which the label probability of the model is most sensitive to small perturbations.
+8
+Under review as a conference paper at ICLR 2022
+Table 4: Evaluation results on alternative methods to generate per- Table 5: Comparison results
+turbations using random noise, ground-truth, and label probability. with FreeLb.
+Model	MNLI-m	QNLI	QQP	SST-2	Avg
+Baseline	84.3	-893^	89.6/86.1	-93-	88.4
+Gaussian noise	84.5	-891^	90.3/87.0	92.6	88.7
+-ScaLA (GT)	84.1-	~96Γ	90.7/87.6	93.2	M0
+ScaLA (LPy	85.1	~90~	90.9/87.7	93.5	^94
+	MNLI-m ISST-2			
+	Acc.	Time	Acc.	Time
+Baseline	^848	^8848	^93T	2736^
+FreeLb	^85T	3773	MT	^389^
+ScaLA	^85T	!323	^35	~15T
+Comparison with FreeLb. We also compare ScaLA with FreeLb. The original FreeLb does not
+support multi-node training. We extend it with PyTorch DDP to train in a multi-node distributed
+training environment. We observe that although both FreeLb and ScaLA achieve similar accuracy,
+ScaLA is much faster than FreeLb. ScaLA is faster because FreeLb still performs multiple ascent
+steps to calculate adversaries cross the entire training. In contrast, ScaLA takes several optimizations
+to reduce the adversarial perturbation cost as well as leveraging group-wise adaptive learning rates to
+enable training with larger batch sizes, which improves the computational efficiency.
+Baseline B=2K
+ScaLA B=2K
+#epochs
+Figure 5: Comparison of Figure 6： Comparison of
+scalability using different test accuracy by training the
+large-batch optimization baseline longer.
+methods on SST-2.
+(a) MNLI-m	(b) SST-2
+Figure 7: Comparison of accuracy under
+even larger batch sizes.
+Train longer, generalize better? Despite improved training speed and accuracy, one may still
+wonder whether the generalization gap can be mitigated by training the downstream tasks longer.
+(Figure 6 shows the comparison results between ScaLA and the baseline on a batch size of 2K. ScaLA
+obtains an accuracy of 85.2 after 6 epochs of training, whereas the baseline has difficulty to reach 84
+after training twice longer (e.g., 12 epochs). ScaLA achieves better accuracy because it explicitly
+penalizes model weights from getting stuck at sharp minima, leading to better generalizability.
+Generalizability under different batch sizes. In this part, we evaluate how different batch sizes
+affect the generalizability of fine-tuning transformer tasks. Figure 7 shows the results on MNLI-m and
+SST-2. We make two major observations: (1) The accuracy tends to drop as the batch size increases.
+(2) While both the baseline and LAMB suffer from significant accuracy drop by drastically increasing
+the batch size (e.g., from 32 to 8K), ScaLA is able to mitigate the generalization gap and consistently
+achieves higher accuracy than the baseline (e.g., 84.4 vs. 83.5 for MNLI, and 92.6 vs. 91.3 for SST-2
+at batch size 8K) and LAMB (e.g., 84.4 vs. 83.9 for MNLI, and 92.6 vs. 91.7 for SST-2 at batch size
+8K). These results indicate the benefit of ScaLA is maintained by further increasing the batch size,
+which could bring even greater speedups when increasing the data parallelism degree.
+5	Conclusions and Future Directions
+In this paper, we study how to add adversarial perturbations to improve the scalability and gener-
+alizability of training large transformer networks in a principled manner. We introduce ScaLA, a
+scalable and generalizable large-batch optimization method using adversarial perturbations. The
+experiment results show that ScaLA obtains up to 18× speedups on fine-tuning transformer networks
+and outperforms the state-of-the-art large-batch optimization methods in accuracy. Despite offering
+great speedups without losing accuracy, ScaLA is limited in that it currently has only been evaluated
+against fine-tuning tasks of pre-trained transformer networks due to the expensive pre-training cost.
+Furthermore, it has not been tested on emerging pre-trained transformer networks for computer vision
+tasks, such as ViT, so it is unclear about the effectiveness of ScaLA on those tasks. We plan to
+explore how to generalize our proposed method to improve the generalization of the pre-training of
+large-scale language models as well as tasks in other domains in future work.
+9
+Under review as a conference paper at ICLR 2022
+References
+Turing-NLG:	A 17-billion-parameter language model by Microsoft.
+https : / / www . microsoft . com / en-us / research / blog /
+turing-nlg-a- 17- billion- parameter- language- model- by- microsoft/.
+Accessed: 19-May-2020.
+Qi-Zhi Cai, Chang Liu, and DaWn Song. Curriculum adversarial training. In Jerome Lang (ed.),
+Proceedings of the Twenty-Seventh International Joint Conference on Artificial Intelligence, IJCAI
+2018, July 13-19, 2018, Stockholm, Sweden,pp. 3740-3747. ijcai.org, 2018.
+Yong Cheng, Lu Jiang, and Wolfgang Macherey. Robust neural machine translation With doubly
+adversarial inputs. In Anna Korhonen, David R. Traum, and Lluls Marquez (eds.), Proceedings of
+the 57th Conference of the Association for Computational Linguistics, ACL 2019, Florence, Italy,
+July 28- August 2, 2019, Volume 1: Long Papers, pp. 4324-4333. Association for Computational
+Linguistics, 2019.
+Kevin Clark, Minh-Thang Luong, Quoc V. Le, and Christopher D. Manning. ELECTRA: pre-training
+text encoders as discriminators rather than generators. In 8th International Conference on Learning
+Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020. OpenRevieW.net, 2020.
+Damek Davis and Dmitriy Drusvyatskiy. Stochastic subgradient method converges at the rate
+o(k^{-1∕4}) on weakly convex functions. arXivpreprint arXiv:1802.02988, 2018.
+Damek Davis and Dmitriy Drusvyatskiy. Stochastic model-based minimization of Weakly convex
+functions. SIAM Journal on Optimization, 29(1):207-239, 2019.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: pre-training of deep
+bidirectional transformers for language understanding. In Proceedings of the 2019 Conference of
+the North American Chapter of the Association for Computational Linguistics: Human Language
+Technologies, NAACL-HLT 2019), pp. 4171-4186, 2019.
+Saeed Ghadimi and Guanghui Lan. Stochastic first-and zeroth-order methods for nonconvex stochastic
+programming. SIAM Journal on Optimization, 23(4):2341-2368, 2013.
+Linyuan Gong, Di He, Zhuohan Li, Tao Qin, Liwei Wang, and Tie-Yan Liu. Efficient training of
+BERT by progressively stacking. In Proceedings of the 36th International Conference on Machine
+Learning, ICML 2019, 9-15 June 2019, Long Beach, California, USA, pp. 2337-2346, 2019. URL
+http://proceedings.mlr.press/v97/gong19a.html.
+Ian J. Goodfellow, Jonathon Shlens, and Christian Szegedy. Explaining and harnessing adversarial
+examples. In Yoshua Bengio and Yann LeCun (eds.), 3rd International Conference on Learning
+Representations, ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings,
+2015.
+Priya Goyal, Piotr Dollar, Ross B. Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo Kyrola,
+Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch SGD: training imagenet
+in 1 hour. CoRR, abs/1706.02677, 2017.
+Sidharth Gupta, Parijat Dube, and Ashish Verma. Improving the affordability of robustness training
+for dnns. In 2020 IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR
+Workshops 2020, Seattle, WA, USA, June 14-19, 2020, pp. 3383-3392. IEEE, 2020.
+Elad Hoffer, Itay Hubara, and Daniel Soudry. Train longer, generalize better: closing the general-
+ization gap in large batch training of neural networks. In Isabelle Guyon, Ulrike von Luxburg,
+Samy Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, and Roman Garnett (eds.),
+Advances in Neural Information Processing Systems 30: Annual Conference on Neural Information
+Processing Systems 2017, December 4-9, 2017, Long Beach, CA, USA, pp. 1731-1741, 2017.
+Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Xu Chen, HyoukJoong
+Lee, Jiquan Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng Chen. Gpipe: Efficient training of giant
+neural networks using pipeline parallelism. In Advances in Neural Information Processing Systems
+32: Annual Conference on Neural Information Processing Systems 2019, pp. 103-112, 2019.
+10
+Under review as a conference paper at ICLR 2022
+Prateek Jain and Purushottam Kar. Non-convex optimization for machine learning. arXiv preprint
+arXiv:1712.07897, 2017.
+Haoming Jiang, Pengcheng He, Weizhu Chen, Xiaodong Liu, Jianfeng Gao, and Tuo Zhao. SMART:
+robust and efficient fine-tuning for pre-trained natural language models through principled regu-
+larized optimization. In Dan Jurafsky, Joyce Chai, Natalie Schluter, and Joel R. Tetreault (eds.),
+Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, ACL
+2020, Online, July 5-10, 2020,pp. 2177-2190. Association for Computational Linguistics, 2020.
+Chi Jin, Praneeth Netrapalli, and Michael Jordan. What is local optimality in nonconvex-nonconcave
+minimax optimization? In International Conference on Machine Learning, pp. 4880-4889. PMLR,
+2020.
+Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gaurav Agrawal, Raminder Bajwa,
+Sarah Bates, Suresh Bhatia, Nan Boden, Al Borchers, Rick Boyle, Pierre-luc Cantin, Clifford
+Chao, Chris Clark, Jeremy Coriell, Mike Daley, Matt Dau, Jeffrey Dean, Ben Gelb, Tara Vazir
+Ghaemmaghami, Rajendra Gottipati, William Gulland, Robert Hagmann, C. Richard Ho, Doug
+Hogberg, John Hu, Robert Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Jaworski, Alexander
+Kaplan, Harshit Khaitan, Daniel Killebrew, Andy Koch, Naveen Kumar, Steve Lacy, James Laudon,
+James Law, Diemthu Le, Chris Leary, Zhuyuan Liu, Kyle Lucke, Alan Lundin, Gordon MacKean,
+Adriana Maggiore, Maire Mahony, Kieran Miller, Rahul Nagarajan, Ravi Narayanaswami, Ray
+Ni, Kathy Nix, Thomas Norrie, Mark Omernick, Narayana Penukonda, Andy Phelps, Jonathan
+Ross, Matt Ross, Amir Salek, Emad Samadiani, Chris Severn, Gregory Sizikov, Matthew Snelham,
+Jed Souter, Dan Steinberg, Andy Swing, Mercedes Tan, Gregory Thorson, Bo Tian, Horia Toma,
+Erick Tuttle, Vijay Vasudevan, Richard Walter, Walter Wang, Eric Wilcox, and Doe Hyun Yoon.
+In-Datacenter Performance Analysis of a Tensor Processing Unit. In Proceedings of the 44th
+Annual International Symposium on Computer Architecture, ISCA ’17, pp. 1-12, 2017. ISBN
+978-1-4503-4892-8. doi: 10. 1145/3079856.3080246. URL http://doi.acm.org/10.
+1145/3079856.3080246.
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess, Rewon Child,
+Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language models.
+CoRR, abs/2001.08361, 2020. URL https://arxiv.org/abs/2001.08361.
+Nitish Shirish Keskar, Dheevatsa Mudigere, Jorge Nocedal, Mikhail Smelyanskiy, and Ping Tak Peter
+Tang. On large-batch training for deep learning: Generalization gap and sharp minima. In 5th
+International Conference on Learning Representations, ICLR 2017, Toulon, France, April 24-26,
+2017, Conference Track Proceedings, 2017. URL https://openreview.net/forum?id=
+H1oyRlYgg.
+Diederik P. Kingma and Jimmy Ba. Adam: A Method for Stochastic Optimization. In 3rd Interna-
+tional Conference on Learning Representations, ICLR 2015, 2015.
+Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke, Jeff
+Smith, Brian Vaughan, Pritam Damania, and Soumith Chintala. Pytorch distributed: Experiences
+on accelerating data parallel training. Proc. VLDB Endow., 13(12):3005-3018, 2020.
+Tianyi Lin, Chi Jin, and Michael Jordan. On gradient descent ascent for nonconvex-concave minimax
+problems. In International Conference on Machine Learning, pp. 6083-6093. PMLR, 2020.
+Xiaodong Liu, Hao Cheng, Pengcheng He, Weizhu Chen, Yu Wang, Hoifung Poon, and Jianfeng
+Gao. Adversarial training for large neural language models. CoRR, abs/2004.08994, 2020.
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike
+Lewis, Luke Zettlemoyer, and Veselin Stoyanov. Roberta: A robustly optimized BERT pretraining
+approach. CoRR, abs/1907.11692, 2019.
+Aleksander Madry, Aleksandar Makelov, Ludwig Schmidt, Dimitris Tsipras, and Adrian Vladu.
+Towards deep learning models resistant to adversarial attacks. In 6th International Conference on
+Learning Representations, ICLR 2018, Vancouver, BC, Canada, April 30 -May 3, 2018, Conference
+Track Proceedings. OpenReview.net, 2018.
+11
+Under review as a conference paper at ICLR 2022
+Takeru Miyato, Andrew M. Dai, and Ian J. Goodfellow. Adversarial training methods for semi-
+supervised text classification. In 5th International Conference on Learning Representations, ICLR
+2017, Toulon, France, April 24-26, 2017, Conference Track Proceedings. OpenReview.net, 2017.
+Zachary Nado, Justin Gilmer, Christopher J. Shallue, Rohan Anil, and George E. Dahl. A large
+batch optimizer reality check: Traditional, generic optimizers suffice across batch sizes. CoRR,
+abs/2102.06356, 2021.
+Jerzy Proficz. Improving all-reduce collective operations for imbalanced process arrival patterns. The
+Journal of Supercomputing, 74(7):3071-3092, 2018.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text
+transformer. CoRR, abs/1910.10683, 2019. URL http://arxiv.org/abs/1910.10683.
+Hassan Rafique, Mingrui Liu, Qihang Lin, and Tianbao Yang. Weakly-convex-concave min-max
+optimization: provable algorithms and applications in machine learning. Optimization Methods
+and Software, pp. 1-35, 2021.
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimization
+towards training A trillion parameter models. CoRR, abs/1910.02054, 2019.
+Ralph Tyrell Rockafellar. Convex analysis. Princeton university press, 2015.
+Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin Tran, Ashish Vaswani, Penporn Koanantakool,
+Peter Hawkins, HyoukJoong Lee, Mingsheng Hong, Cliff Young, Ryan Sepassi, and Blake A.
+Hechtman. Mesh-tensorflow: Deep learning for supercomputers. In Advances in Neural Informa-
+tion Processing Systems 31: Annual Conference on Neural Information Processing Systems 2018,
+pp. 10435-10444, 2018.
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catan-
+zaro. Megatron-lm: Training multi-billion parameter language models using model parallelism.
+CoRR, abs/1909.08053, 2019.
+Leslie N. Smith. A disciplined approach to neural network hyper-parameters: Part 1 - learning
+rate, batch size, momentum, and weight decay. CoRR, abs/1803.09820, 2018. URL http:
+//arxiv.org/abs/1803.09820.
+Samuel L. Smith, Pieter-Jan Kindermans, Chris Ying, and Quoc V. Le. Don’t decay the learning rate,
+increase the batch size. In 6th International Conference on Learning Representations, ICLR 2018,
+Vancouver, BC, Canada, April 30 - May 3, 2018, Conference Track Proceedings. OpenReview.net,
+2018.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information
+Processing Systems 30: Annual Conference on Neural Information Processing Systems 2017, pp.
+5998-6008, 2017.
+Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel R. Bowman.
+GLUE: A multi-task benchmark and analysis platform for natural language understanding. In 7th
+International Conference on Learning Representations, 2019a.
+Dilin Wang, ChengYue Gong, and Qiang Liu. Improving neural language modeling via adversarial
+training. In Kamalika Chaudhuri and Ruslan Salakhutdinov (eds.), Proceedings of the 36th Inter-
+national Conference on Machine Learning, ICML 2019, 9-15 June 2019, Long Beach, California,
+USA, volume 97 of Proceedings of Machine Learning Research, pp. 6555-6565. PMLR, 2019b.
+Yu Wang, Gu-Yeon Wei, and David Brooks. Benchmarking tpu, gpu, and CPU platforms for deep
+learning. CoRR, abs/1907.10701, 2019c.
+12
+Under review as a conference paper at ICLR 2022
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+Pierric Cistac, Tim Rault, Remi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick
+von Platen, Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain Gugger,
+Mariama Drame, Quentin Lhoest, and Alexander M. Rush. Transformers: State-of-the-art natural
+language processing. In Qun Liu and David Schlangen (eds.), Proceedings of the 2020 Conference
+on Empirical Methods in Natural Language Processing: System Demonstrations, EMNLP 2020 -
+Demos, Online, November 16-20, 2020, pp. 38-45. Association for Computational Linguistics,
+2020.
+Zhewei Yao, Amir Gholami, Qi Lei, Kurt Keutzer, and Michael W. Mahoney. Hessian-based analysis
+of large batch training and robustness to adversaries. In Samy Bengio, Hanna M. Wallach, Hugo
+Larochelle, Kristen Grauman, Nicolo Cesa-Bianchi, and Roman Garnett (eds.), Advances in Neural
+Information Processing Systems 31: Annual Conference on Neural Information Processing Systems
+2018, NeurIPS 2018, December 3-8,2018, Montreal, Canada,pp. 4954-4964, 2018a.
+Zhewei Yao, Amir Gholami, Qi Lei, Kurt Keutzer, and Michael W. Mahoney. Hessian-based analysis
+of large batch training and robustness to adversaries. In Samy Bengio, Hanna M. Wallach, Hugo
+Larochelle, Kristen Grauman, Nicolo Cesa-Bianchi, and Roman Garnett (eds.), Advances in Neural
+Information Processing Systems 31: Annual Conference on Neural Information Processing Systems
+2018, NeurIPS 2018, December 3-8,2018, Montreal, Canada,pp. 4954T964, 2018b.
+Nanyang Ye, Qianxiao Li, Xiao-Yun Zhou, and Zhanxing Zhu. Amata: An annealing mechanism for
+adversarial training acceleration. CoRR, abs/2012.08112, 2020.
+Yang You, Jing Li, Jonathan Hseu, Xiaodan Song, James Demmel, and Cho-Jui Hsieh. Reducing
+BERT pre-training time from 3 days to 76 minutes. CoRR, abs/1904.00962, 2019a.
+Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan
+Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization for deep
+learning: Training bert in 76 minutes. arXiv preprint arXiv:1904.00962, 2019b.
+Dongxu Zhang and Zhichao Yang. Word embedding perturbation for sentence classification. CoRR,
+abs/1804.08166, 2018.
+Minjia Zhang and Yuxiong He. Accelerating training of transformer-based language models with
+progressive layer dropping. In Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-
+Florina Balcan, and Hsuan-Tien Lin (eds.), Advances in Neural Information Processing Systems
+33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December
+6-12, 2020, virtual, 2020.
+Chen Zhu, Yu Cheng, Zhe Gan, Siqi Sun, Tom Goldstein, and Jingjing Liu. Freelb: Enhanced
+adversarial training for natural language understanding. In 8th International Conference on
+Learning Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020. OpenReview.net,
+2020.
+13
+Under review as a conference paper at ICLR 2022
+A Additional Results
+In the part, we present results that are not included in the main text due to the space limit.
+A.1 The Usefulness of Perturbation in the Initial Epochs
+85.00
+84.75
+84.50
+84.25
+84.00
+83.75
+#Epochs
+Figure 8: Accuracy results from delaying the injection of PGA-1 at different epochs.
+(a) MNLI-m
+(b) SST-2
+In Section 3.1, we mention that no adversaries are needed at the initial epochs of fine-tuning. To
+verify, we conduct experiments to measure the final accuracy corresponding to starting from regular
+training and switching to PGA-1 after ts epochs, where ts ∈ [T]. Figure 8 shows that enabling
+PGA-1 from the very beginning does not offer much improvement on accuracy. However, as we delay
+the adversarial perturbation, the model accuracy starts to increase. This is because, at initialization,
+the model’s parameters are relatively far from their final values and are less likely to get stuck at
+local minima. By delaying the injection of adversarial perturbations, we observe improved test
+accuracy on fine-tuning tasks. However, it also seems that such perturbation should not be injected
+too late, which may inadvertently affect the accuracy. It is possible that a more advanced method
+to adaptively choose the value of ts is desired. However, given that (1) the primary focus of this
+work is to demonstrate that it is possible and effective to leverage adversarial training for large-batch
+optimization of transformer networks and (2) the search space of is quite small for fine-tuning tasks,
+we leave this as an interesting research question for future exploration.
+B Hyperparameters
+For all configurations, we fine-tune against the GLUE datasets and set the maximum number of
+epochs to 6. We use a linear learning rate decay schedule with a warm-up ratio of 0.1. For ScaLA, we
+set λ = 1, perturbation clipping radius ω = 10-5, step size ρ = 10-4, and ts={3,5}. These values
+worked well enough that we did not feel the need to explore more. For fairness, we perform a grid
+search of learning rates in the range of {1e-5, 3e-5, 5e-5, 7e-5, 9e-5, 1e-4, 3e-4} for small batch sizes
+and {5.6e-5, 8e-5, 1e-4, 1.7e-4, 2.4e-4, 2.8e-4, 4e-4, 5.6e-4, 1e-3} for large batch sizes. We keep the
+remaining hyperparameteres unchanged.
+C Learning Rate S caling for Fine-tuning Tasks
+In this part, we investigate how large-batch optimization affects the generalizability in fine-tuning
+transformer networks. As there are various heuristics for setting the learning rates (Smith et al., 2018;
+Goyal et al., 2017; Smith, 2018; You et al., 2019a), and because few work studies the learning rate
+scaling effects on fine-tuning Transformer networks, we perform a grid search on learning rates
+{1e-4, 3e-4,5e-4, 7e-4, 9e-4, 1e-3, 3e-3} and batch sizes {1K, 2K, 4K, 8K} while keeping the other
+hyperparameters the same to investigate how ScaLA affects the hyperparameter tuning effort for large
+batch optimizations.
+Table 6 below shows the results of using the square root scaling rule to decide the learning rates for
+large batch sizes vs. accuracy results with tuned learning rate results, without and with ScaLA. The
+14
+Under review as a conference paper at ICLR 2022
+first row represents the best accuracy found through fine-tuning with a small batch size 32. The next
+two rows correspond to fine-tuning with batch size 1024 using tuned learning rates vs. using the
+scaling rule. The last two rows represent fine-tuning using ScaLA with batch size 1024, also using
+tuned learning rates vs. the scaling rule. Even with square-root scaling, the large-batch baseline still
+cannot reach the small-batch accuracy (88.7 vs. 89.4). Moreover, although tuning the learning rates
+lead to better results on some datasets such as MNLI-m (84.9 vs. 85.1) and SST-2 (92.9 vs. 93.5),
+the square-root scaling rule leads to better results on other tasks such as QNLI (90.8 vs. 90) and
+QQP (91.4/88.4 vs. 90.9/87.7). So the best learning rates on fine-tuning tasks are not exactly sqrt.
+However, given that ScaLA with square-root learning rate scaling achieves on average better results
+than the grid search of learning rates (89.4 vs. 89.7), we suggest to use sqrt scaling for learning rates
+to simplify the hyperparameter tuning effort for ScaLA.
+Table 6: Evaluation results on hyperparameter tuning vs. using square-root learning rate scaling.
+	MNLI-m	QNLI	QQP	SST-2	AVg
+Bsz=32 (tuned, baseline)	-84.8	90.6	91/88	93.1	89.4
+Bsz=1024 (tuned, baseline)	-843-	89.3	89.6/86.1	93	M5
+Bsz=1024 (scaling rule, baseline)	-83.9	89.2	90.6/87.4	92.5	M7
+Bsz=1024 (tuned, SCaLA)	-851-	^^90-	90.9/87.7	93.5	89.4
+Bsz=1024 (scaling rule, ScaLA)	84.9	~908~	91.4/88.4	92.9	^897
+D Convergence Analysis
+In this section, we provide the formal statements and detailed proofs for the convergence rate. The
+convergence analysis builds on techniques and results in (Davis & Drusvyatskiy, 2018; You et al.,
+2019b). We consider the general problem of a two-player sequential game represented as nonconvex-
+nonconcave minimax optimization that is stochastic with respect to the outer (first) player playing
+x ∈ X while sampling ξ from Q and deterministic with respect to the inner (second) player playing
+y∈Y,i.e.,
+min max Eξ〜Q [f (x, y, ξ)] := min Eξ〜Q [g(x, ξ)]	(2)
+xy	x
+Since finding the Stackelberg equilibrium, i.e., the global solution to the saddle point problem,
+is NP-hard, we consider the optimality notion of a local minimax point (Jin et al., 2020). Since
+maximizing over y may result in a non-smooth function even when f is smooth, the norm of the
+gradient is not particularly a suitable metric to track the convergence progress of an iterative minimax
+optimization procedure. Hence, we use the gradient of the Moreau envelope (Davis & Drusvyatskiy,
+2019) as the appropriate potential function. Let μ ∈ R*. The μ-Moreau envelope for a function
+g : X → R is defined as gμ(χ) := minz g(z) + Ph=I 露∣∣χi - Zik2. Another reason for the choice
+of this potential function is due to the special property (Rockafellar, 2015) of the Moreau envelope
+that if its gradient Vχ [gμ(χ)] almost vanishes at x, such X is close to a stationary point of the original
+function g.
+Assumptions: We assume that X = Fih=1 Xi is partitioned into h disjoint groups , i.e., in terms of
+training a neural network, we can think of the network having the parameters partitioned into
+h (hidden) layers. The measure Q characterizes the training data. Let Vb xf(x, y) denote the
+noisy estimate of the true gradient Vxf(x, y). We assume that the noisy gradients are unbiased,
+i.e., E[Vxf(x, y)] = Vxf(x, y). For each group i ∈ [h], we make the standard (groupwise)
+boundedness assumption (Ghadimi & Lan, 2013) on the variance of the stochastic gradients, i.e.,
+EkVbixf(x, y) -Vixf(x, y)k2 ≤ σi2, ∀i ∈ [h]. We assume that f(x, y) has Lipschitz continuous gradi-
+ents. Specifically, let f(x, y) be α-smooth in x where α := (α1, . . . , αh) denotes the h-dimensional
+vector of (groupwise) Lipschitz parameters, i.e., kVixf(xa, y) - Vixf(xb, y)k ≤ αikxia - xibk,
+∀i ∈ [h] and Xa, Xb ∈ X,y ∈ Y. Let Ka = mXHoi∙
+mni αi
+Super-scripts are used to index into a vector (i denotes the group index and j denotes an element in
+group i). For any c ∈ R, the function ν : R → [L, U] clips its values, i.e., ν(c) := max(L, min(c, U))
+where L < U. Let k∙∣∣, k∙∣∣ι and ∣∣.∣∞ denote the '2, '1, and '∞ norms. We assume that the true
+gradients are bounded, i.e., kVxf(X, y)k∞ ≤ G.
+First, we begin with relevant supporting lemmas. The following lemma characterizes the convexity
+of an additive modification of g.
+15
+Under review as a conference paper at ICLR 2022
+Lemma 1 ((Lin et al., 2020; Jin et al., 2020; Rafique et al., 2021)). Let g(x) := maxy f(x, y)
+with f being α-smooth in x where α ∈ Rh+ is the vector of groupwise Lipschitz parameters. Then,
+g(x) + Ph=ι α2i∣∣xik2 is convex in X.
+The following property of the Moreau envelope relates it to the original function.
+Lemma 2 ((Rockafellar, 2015)). Let g be defined as in Lemma 1. Let xb = arg minxe g(xe) +
+Ph=ι⅛ kei一Xik2. Then, ∣gμ(x)∣ ≤ E implies ∣∣b一Xk ≤ ∣∣μ∣∞e andminh ∣∣h∣ ≤ E with h ∈ ∂g
+where ∂g denotes the subdifferential of g.
+We now present the formal version of Theorem 1 in Theorem 2. Note that Lemma 2 facilitates giving
+the convergence guarantees in terms of the gradient of the Moreau envelope. Recall that t ∈ [T]
+denotes the epochs corresponding to the outer maximization. Without loss of generality, we set the
+delay parameter for injection of the adversarial perturbation in Algorithm 1 as ts = 0. Here, we
+assume that the PGA provides an E-approximate maximizer.
+Theorem 2 (Groupwise outer minimization with an E-approximate inner maximization oracle). Let
+US define relevant constants as D := (g1∕2α(x0) 一 E(minχ g(x))) being the optimality gap due
+to initialization, Ka := 黑；Xiαi being the COnditiOn number, ∣∣Vχf (x,y)k∞ ≤ G being gradient
+(xbi,j -xi,j )
+bound, Z := maxi,j,t，t j，σ% being the VarianCe term, L, U being clipping constants such that
+，，	(▽/ )
+L ≤ U. For the outer optimization, setting the learning rate as η = ^-√ψ and scaling batch size as
+b = 1TU2 z2, we have
+困口“1/2。(到2] ≤ 4E∣ɑ∣∞ + 2κ√DG	⑶
+T
+where x is the estimator obtainedfrom running T steps ofAlgorithm 1 and picking Xt uniformly at
+random for t ∈ [T ].
+Proof. In this proof, for brevity, we define the vector Vt := Vxf(X, y), i.e., the gradient of the
+objective with respect to X, evaluated at the outer step t. Since evaluating gradients using mini-batches
+produces noisy gradients, we use V to denote the noisy version of a true gradient V, i.e., V = V + ∆
+for a noise vector ∆. For any outer step t, we have f(Xt, yb) ≥ g(Xt) 一 E where ybis an E-approximate
+maximizer. For any Xe ∈ X, using the smoothness property (Lipschitz gradient) of f, we have
+g(Xe) ≥ f (Xe, yt)
+hh
+≥	f (xt, yt) + XhVt, ei - xi i-X αi ∣ei - χi∣2
+i=1	i=1
+hh
+≥	g(χt) - E + XhVt, ei - xti- χ αi ∣ei - χt∣2	(4)
+i=1	i=1
+Let φμ(x, z) := g(z) + Ph=ι 2μ ∣∣xi 一 zi∣2. Recall that the μ-Moreau envelope for g is defined as
+gμ(x) := minz φμ(x, Z) and its gradient is the groupwise proximal operator given by Vχ [gμ(x)]=
+[μ1 (x1 - argminzi φμ(x,z)) ,..., μh (Xh - argminzh φμ(x, z))].
+Now, let Xt = argminχ φ1∕2a(xt,x) = argminχ (g(x) + Ph=ι αi∣xt — xi∣∣2)∙ Then, plugging
+in the update rule for x at step t + 1 in terms of quantities at step t, using the shorthand νti := ν(∣xit ∣)
+16
+Under review as a conference paper at ICLR 2022
+and conditioning on the filtration up to time t, we have
+h
+gl∕2α(xt+1) ≤ g(xt) + Eaikxi+1 - Xtk2
+i=1
+h
+≤ g(xbt) +	αi
+i=1
+2
+-	-Vt ʌ-
+XtiWt 南 -xt
+h	h	bi	h
+≤ g(χt) + X ai ∣∣χt- bt∣∣ + X 2aiηt〈 Vi	^t ,bbt- xi) + Xaiη2(Vi)2
+i=1	i=1	kVt k	i=1
+h
+≤ g1∕2α (xt) +	2αiηt
+i=1
+(Vi kVtk ,xt - Xt: + X aiη2(Vi)2
+h	di
+≤ g1∕2α (Xt) + 2ηt	αiVti
+i=1	j=1
+vi，j
+Wl
+× (Xχit,j -Xit,j)
+h
+h	di
+≤ g1∕2α (Xt) + 2ηt Σ αiVti Σ
+i=1	j=1
+h	di	Vχ i,j	Vi,j	h
++2ηt X aiνi X (kV⅛-w)× (Xtj-Xtj)+X aiη2 (Vi)2
+hi
+≤ gl∕2ɑ(xt) +2ηt X 扁 Nt Xi-X)
+h	di
++ 2ηt XαiVti X
+i=1 j =1
+V Vitj + ∆tj
+UVi + ∆tk
+h
+× (Xχit,j - Xit,j) +Xαiηt2(Vti)2
+i=1
+17
+Under review as a conference paper at ICLR 2022
+h
+≤ gl∕2α(Xt) + 2ηtUE
+i=1
+αi
+Mk
+vit, xbit - xit
+h
+di
++ 2ηt	αi νti
+i=1	j=1
+h
++ X αiηt2(νti)2
+i=1
+Mkmj)(Vtj+∆t,j) -M+∆ik(vi,j)2
+kvi + ∆ikkvtk
+×
+it,j - Xit,j)
+(Vtj)
+E1
+≤ gi∕2ɑ(xt) +2ηtUmax
+αi
+kvtk
+g(xbt) - g(xt) + +
+h
++ 2ηt	αiνti max
+i=1	j
+(xbit,j -xit,j)	hvit, vit + ∆iti - kvti + ∆tikkvitk
+(Vtj)
+kvi + ∆tk
+h
++ X αiηt2 (νti)2
+i=1
+≤ gι∕2α(xt) + 2ηtUmax
+αi
+Mk
+g(xbt) - g(xt) + +
+h
+- 2ηt	αiνti max
+i=1	j
+h
++ X αiηt2(νti)2
+i=1
+(xbit,j-xit,j)	kvit + ∆itkkvtik - kvit + ∆itk2 + h∆it, vit + ∆iti
+(Vtj)
+kvi + ∆tk
+(5)
+αi
+kvit k
+g(xbt) - g(xt) + +
+h
+- 2ηt	αiνti max
+i=1	j
+(vit,j)
+kVtk-kVt + ∆tk- lh∆VV+ ∆∆iil ) + XX ɑ品(VY
+E2
+≤ gi∕2ɑ(xt) +2ηtUmax
+αi
+kvit k
+g(xbt) - g(xt) + +
+h
+- 2ηt	αiνti max
+i=1	j
+(vit,j)
+h
+(kvtk-kvt + ∆tk-k∆ik) + X ɑiηt (νi)2
+i=1
+E3
+≤ gi∕2ɑ(xt) +2ηtUmax
+αi
+kvit k
+g(xbt) - g(xt) + +
+h
+- 4ηt	αiνti max
+i=1	j
+(Vtj)
+h
+k∆itk +X αiηt2(νti)2
+i=1
+T-1
+E4	T-1
+gi∕2α (XT) ≤ gl∕2α(xθ)+2UX
+t=0
+αi
+ηt max W
+g(xbt) - g(xt) + +
+T-1	h
+- 4	ηt	αiνti max
+t=0	i=1	j
+(Vt，j)
+T-1 h
+k∆itk + X X αiηt2(νti)2
+t=0 i=1
+where We have used Holder,s inequality along with bound equation 4 in Ei, CaUchy-SchWarz
+inequality in E2, triangle inequality in E3, telescoping sum in E4. Rearranging and using ηt = η in
+18
+Under review as a conference paper at ICLR 2022
+E5 along with Holder,s inequality,
+2ηU (g1∕2α(XT) - g1∕2α(XO)) ≤ X max1芯 口 ^g(bt) - g(Xt) + E + X
+T-1 h	i,j i,j	T-1 h
+号 X X αν max(bj	+2U X X αi(Vi)2
+1	E5
+2ηU (g1∕2α(XT) - g1∕2α(XO)) ≤ max
+αi
+Mk
+T-1
+g(Xbt) - g(Xt) + E +
+t=O
+T -1 h i,j i,j	T -1 h
+-U XX a" max%jj k∆tk + 2U XX αi(νi)2
+t=O i=1	( t )	t=O i=1
+Dividing by T and rearranging,
+T X 卜Xt) - g(Xt) - X -2 kbi - Xtk2) ≤ E - 2ηUZT (g1∕2α(XT) - g1∕2α(XO))
+2 T-1 h	( i,j i,j)
+—-XX aiVi max(Xt - Xt) k∆ik
+uZT = = i t j	(vt,j)	k tk
+h	T-1
++ 2UζT X ai X(Vi)2
+i=1	t=O
+where We define Z := maxi,t ^^. Defining D := (g1∕2α(X0) — E(minχ g(∕))) and taking expec-
+tation with respect to ξ on both sides, we have
+TT X E 卜(Xt) — g	@t- X αi kbi -Xtk2) ≤E+2ηDZT 2L T-1 h	(Xbi,j — Xi,j)	ηUkαk1 —Wai max	Ek∆ik + η	l1 U ZT = =	j	(Vtj)	11 t"	2Z
+	E6	D ≤ E + 2ηU ZT 2L X X、mL(btj- Xtj) σi I nUkakι —a a ai max十 UZT t=0 i=1 i j	(Vtj)	√	2Z E7	D ≤ E + 2ηUZT 2Lkakι m…曲,-Xij)	l ηukakι 	m- maxσi 十 U Z √b i,j,t	(Vtj)	2Z E , D _ 2Lkαk1Z	ηUkakι =+2ηU ZT	U Z √b +	2Z	(6)
+where We have used the assumption on the variance of stochastic gradients in E6, Holder,s inequality
+(xbi,j -xi,j )
+in E7 and we define Z := maxi,^ "j / σi in Eg; b denotes batch size. Now, we lower bound
+19
+Under review as a conference paper at ICLR 2022
+the left hand side using the convexity of the additive modification of g .
+h
+g(Xt) - g(bt)- X	Ilbi - xtk2
+hh
+≥ g(xt) + 0 - g(bt) - X αikbi - xtk2 + X αikbi - xik2
+i=1	i=1 2
+≥	((g(Xt)	+ Xαikxi -χik2) -mχin	(g(Xt) + Xαikxi	-xtk2)) + Xα2ikbi	-xtk2
+E9	1
+≥ ----------∣Vgι∕2α(xt)k2	(7)
+4 maxi αi
+where we have used the expression for the gradient of the Moreau envelope in E9 . Combining the
+inequalities from Equation equation 7 and Equation equation 6, we have
+T X E (4mab^ kvg1∕2α(Xt)k2) ≤ e+2ηUζτ + (ηZ - z2Lzb) kαk1
+Setting the learning rate as η = -√~^ and batch size as b = 16TUL2Z2,
+T-1
+T X E [kVg1∕2α(xt)k2] ≤ 4emaxa + 2D售 Oa
+T t=0	ζ T
+Now, to simplify Z, using the inequality that maxk ® ∙ bk) ≥ minka aka ∙ min^ bkb for two finite
+sequences {a, b} with positive values, along with the bounded gradients assumption, we have
+T-1
+τ XE [kvgι∕2α(Xt)k2] ≤ 4e max αi + √T m： i： i=4ekαk∞ + RoaT
+where Ka := mmanHO7 .	□
+In analyzing inexact version, as in Theorem 2, we assumed the availability of an adversarial oracle.
+Next, we open up the adversarial oracle to characterize the oracle-free complexity. In order to do this,
+we will assume additional properties about the function f as well as our deterministic perturbation
+space, Yt ⊆ Y, ∀t ∈ [T]. Note that, for any given t, yτ ∈ Yt, ∀τ ∈ T. We recall the following
+guarantee for generalized non-convex projected gradient ascent.
+Lemma 3 ((Jain & Kar, 2017)). For every t, Let f (Xt, ∙) satisfy restricted Strong convexity with
+parameter C and restricted strong smoothness with parameter S over a non-convex constraint set with
+S/C < 2, ie, C ∣∣z — y∣2 ≤ f(Xt,y) - f (Xt,z) - hVzf (Xt,z),y - Z≤ S IIz — y∣∣2 for y,z ∈ Yt.
+For any given t, let the PGA-T algorithm y「一 Πe [yτ-ι + PVyf (Xt, y)] be executed with step size
+P = 1/S. Then after at most T = O ( 2：-S log ɪ ) steps, f (Xt, yτ) ≥ maxy f (x$, y) - e.
+Using Theorem 2 and Lemma 3 (together with the additional restricted strong convexity/smoothness
+assumptions), we have the following theorem on the full oracle-free rates for Algorithm 1.
+Theorem 3 (Groupwise outer minimization with inner maximization using projected gradient ascent).
+Setting the inner iteration count as T = O QC-S log 8kjk∞ ) and the outer iteration count as
+T = 16καD2G2, for a combined total of O(表 log ɪ) adaptive adversarial iterations, Algorithm 1
+achieves E [∣∣Vg1∕2a(X)∣∣2] ≤ 匕
+20

@@ -1,0 +1,779 @@
+﻿P-Adapters: Robustly Extracting Factual In-
+formation from Language Models with Di-
+verse Prompts
+Benjamin Newman*
+Stanford University
+Prafulla Kumar Choubey
+Salesforce Research
+Nazneen Rajani
+Salesforce Research
+Ab stract
+Recent work (e.g. LAMA (Petroni et al., 2019)) has found that the quality of the
+factual information extracted from Large Language Models (LLMs) depends on
+the prompts used to query them. This inconsistency is problematic because differ-
+ent users will query LLMs for the same information using different wording, but
+should receive the same, accurate responses regardless. In this work we aim to ad-
+dress this shortcoming by introducing P-Adapters: lightweight models that sit be-
+tween the embedding layer and first attention layer of LLMs. They take LLM em-
+beddings as input and output continuous prompts that are used to query the LLM.
+Additionally, we investigate Mixture of Experts (MoE) models that learn a set of
+continuous prompts (“experts”) and select one to query the LLM. They require
+a separate classifier trained on human-annotated data to map natural language
+prompts to the continuous ones. P-Adapters perform comparably to the more
+complex MoE models in extracting factual information from BERT and RoBERTa
+while eliminating the need for additional annotations. P-Adapters show between
+12-26% absolute improvement in precision and 36-50% absolute improvement in
+consistency over a baseline of only using natural language queries. Finally, we
+investigate what makes P-Adapters successful and conclude that a significant fac-
+tor is access to the LLM’s embeddings of the original natural language prompt,
+particularly the subject of the entity pair being queried.
+1	Introduction
+Recently, there has been an interest in meeting users’ factual information needs using large language
+models (LLMs) as knowledge bases in place of traditional, index-based IR methods (Petroni et al.,
+2019; Metzler et al., 2021). In this conception of LLM knowledge bases, LLMs accumulate factual
+knowledge during pretraining, have their parameters frozen to maintain this knowledge, and then
+are queried by users using handcrafted, natural language prompts. For example, if one user wants to
+know what the capital of Canada is, they might query a frozen model with the prompt, “The capital
+of Canada is [MASK].”, while another might use different wording: “Canada, which has the capital
+city [MASK].” In order for LLMs tobe effective knowledge bases, they have to be robust to different
+queries users could provide. Unfortunately, prior work has shown that LLMs are not robust: queries
+that are semantically equivalent may lead to inconsistent predictions (Jiang et al., 2020; Elazar et al.,
+2021). For example, taking the prompts above, the first prompt does extract the correct answer
+“Ottawa” from BERT Base, but the second extracts the incorrect “Winnipeg”. This observation has
+led many works to try to find the optimal prompt or set of prompts for a given relation: the one(s)
+that will allow models to extract factual information the best (e.g., for the relation Capital_of).
+These works have proposed ensembling sets of prompts (Jiang et al., 2020), optimizing which tokens
+are included in the prompt (Haviv et al., 2021; Shin et al., 2020), or forgoing the difficult discrete
+optimization problem entirely and instead optimizing the continuous embeddings that are input to
+the LLM (Li & Liang, 2021; Qin & Eisner, 2021; Zhong et al., 2021).
+In our work, rather than focus on finding a single optimal prompt, we aim to help LLMs overcome
+this variability by adapting natural language prompts into continuous representations that allow
+*blnewman@cs.stanford.edu. Work conducted during internship at Salesforce Research.
+1
+LLMs to accurately predict factual information. Because we are motivated by a user-focused setting,
+we want our adaptation method to require only a natural language prompt (e.g. “The capital of
+Canada is [MASK] ")at inference time. No additional annotation for the relation (Capital_of)
+between the subject (“Canada”) and object (“Ottawa”) of the entity pair in the prompt should be
+required. Nor should we need the identity of the subject separate from the prompt. At training
+time, our ideal method would only rely on (prompt, object) pairs (e.g. (“The capital of Canada is
+[MASK]”, “Ottawa”)), so collecting new data would not require additional annotation. Our research
+question is then as follows: in a setting where we are trying to prompt a frozen LLM using natural
+language alone, how can we encourage models to produce more consistent and accurate responses
+to potentially varied prompts.
+We introduce a class of models called P-
+Adapters (short for “prompt adapters”) to per-
+form this adaptation, which satisfy our infer-
+ence and training desiderata. P-Adapters sit
+between the embedding layer and the first at-
+tention layer of the frozen LLM, and modify
+the LLM’s embeddings so factual information
+can be more effectively predicted (Figure 1).
+They are optimized end-to-end, only requiring
+(prompt, object) pairs at training time, and im-
+plicitly encourage consistency by learning to
+map variable training prompts to the same ob-
+ject.
+We also investigate other models that could
+increase the consistency of natural language
+prompts: Mixture of Experts (MoE) models.
+Rather than adapt a natural language prompt,
+a MoE model maps it to an “expert” continu-
+ous prompt based on the relation between the
+prompt’s subject and object. The MoE model
+then queries the frozen LLM with that expert.
+This method reduces variability by mapping all
+Ottawa
+[ Pretrained LLM ,	)
+X □ □ 6 □ R 、
+[ P-AeiaPter )
+3 □ □ □ I___________
+[ LLM Embedding ]
+, 1 、
+[MASK] is CanaCIa's capital	Captial of Canada si [MASK]
+Capital OfCanada is [MASK]
+Figure 1: The P-Adapter Framework: P-Adapters
+sit between the embedding layer and the first at-
+tention layer of the LLM. They take as input the
+LLM embeddings and output continuous prompts
+that are fed into the LLM. The LLM is frozen
+(embeddings included), while the parameters of
+the P-Adapter are trained. The adapter helps miti-
+gate variability among different phrasings and ty-
+pographic errors in the prompts (as shown in the
+example inputs).
+natural language prompts concerned with the same relation to a single prompt optimized for that
+relation. These methods require additional annotations during training and inference (namely the
+relation between the entities and the identity of the entity subject), and therefore do not conform to
+our desiderata. However, we include them in our discussion because they are useful for comparing
+to previous work and for understanding why P-Adapters are successful. We find that P-Adapter
+and MoE methods both strongly outperform a baseline of using the natural language prompts alone
+by between 12-28% on precision and 36-86% on consistency. While MoE models usually perform
+better, the small increase comes at the cost of requiring relation annotations at training time and spec-
+ifying the subject of the entity at inference time. To simulate the variable kinds of natural language
+prompts we expect our methods to handle, we evaluate them in three out-of-distribution (OOD) set-
+tings: on a different set of natural language prompts, on a different distribution of entities (uniform
+rather than the distribution of Wikidata), and on natural language prompts with typographic errors.
+These OOD evaluations are especially important in light of recent work has found that models that
+appear to have knowledge of factual information often rely on surface-level feature associations. For
+example, models ignore negation, utilize stereotypical associations when making predictions (Kass-
+ner & Schutze, 2020; Poerner et al., 2020), and pick UP on the distribution of objects from their
+training corpus rather than learn how to access arbitrary facts (Zhong et al., 2021; Cao et al., 2021).
+We find that the OOD distribution of entities is the most challenging setting, and while typographic
+errors reduce model performance, they do so by less than might be expected.
+Finally, we investigate what makes P-Adapters effective, finding that it is important to keep some of
+the original natural language prompt embeddings available to the LLM. In particular, the availability
+of the subject of the prompt is the most important factor, in contrast with some other work suggesting
+the subject matters less (Cao et al., 2021).
+2
+Overall, we conclude that P-Adapters are helpful in reducing the impact of variable prompts, and
+are able to do so without requiring additional annotations. To encourage the use of P-Adapters to
+effectively extract factual information, we release the code used to train them. 1
+2	Related Work
+Prompting Language Models for Factual Knowledge. Prompting offers a low-parameter alter-
+native to finetuning LLMs. In prompting, the LLMs are usually frozen and their pretraining task is
+used to fill in the desired information, which is usually a single token (Trinh & Le, 2018; Davison
+et al., 2019; Petroni et al., 2019). Cao et al. (2021) outlines three main approaches for prompting
+LLMs for factual information. The one we focus on here involves querying them zero-shot with a
+prompt that contains the single entity of interest (like in Figure 1) (Petroni et al., 2019).
+Much previous work tries to lower-bound how much factual information LLMs store. Petroni et al.
+(2019) use one natural language prompt for each relation, while subsequent work argues that this
+approach underestimates LLM’s abilities given how sensitive they are to input prompts. To support
+his argument, Jiang et al. (2020) and Elazar et al. (2021) generate paraphrases of prompts in the
+LAMA dataset and ensemble them to get a score for each relation. Others argue for optimizing
+discrete (Shin et al., 2020; Haviv et al., 2021) or continuous (Qin & Eisner, 2021; Zhong et al.,
+2021; Liu et al., 2021b) prompt for each relation instead of working with language ones. Elazar
+et al. (2021) thoroughly investigate prompt sensitivity in this setting, finding models often predict
+different entities for semantically equivalent prompts. Further, they propose continuing to train
+LLMs with a consistency loss function to improve their robustness. In this work, however, we focus
+on a user-inspired and lightweight approach that does not require updating LLM parameters.
+Robustness and Extracting Facts. Training robust models—ones that are invariant to semantics-
+preserving input perturbations—is a challenge in many settings (Szegedy et al., 2013; Belinkov
+& Bisk, 2018) and has to led to theoretical and empirical innovations such as adversarial training
+(Sinha et al., 2017), provably robust models (Dvijotham et al., 2018), or more robust encoding
+schemes (Jones et al., 2020). Our works falls into this last category. In NLP, prior work investigates
+invariances to typos, word substitutions, irrelevant sentences, and syntactic perturbations (Jones
+et al., 2020; Alzantot et al., 2018; Jia & Liang, 2017; Iyyer et al., 2018).
+For robustly extracting factual information, Poemer et al. (2020) and Kassner & Schutze (2020)
+argue that LLMs exploit surface form regularities when making predictions. Zhong et al. (2021)
+and Dufter et al. (2021) make a related observation, concluding that simpler models like randomly
+initialized LLMs, static embeddings, and even a Naive Bayes model can achieve a precision better
+than a majority baseline. Cao et al. (2021) argue that prompts that were found to do well in previous
+work overfit the distribution of objects in the training data rather than enabling knowledge extraction.
+They show that prompting with different sets of entities leads to very similar predictions. Therefore,
+we adopt an OOD evaluation setting to address these concerns. Low parameter finetuning methods
+(Houlsby et al., 2019; Ben Zaken et al., 2021; Liu et al., 2021a) have also been shown to have better
+OOD performance for generation and classification tasks (Li & Liang, 2021; Lester et al., 2021),
+which we hope to leverage for factual extraction here.
+3	Terminology
+Taking inspiration from Liu et al. (2021a), we use the following terminology throughout this work.
+Each fact we want to extract consists of two parts: an entity pair—a subject (x) and an object (y)—
+and the relation (r) between them. We use the 41 relations in the LAMA dataset (Petroni et al.,
+2019). Each relation is expressed through a number of templates (e.g., one is “The capital of [X] is
+[Y].”). To query a language model for factual information, we substitute the subject in for the “[X]”
+in the template, and a [MASK] token into the object’s place (the “[Y]”) to form a prompt (p). We
+refer to this as a natural language prompt to emphasize that it consists of natural language tokens.
+Our prediction problem then consists of mapping p to y.
+1https://github.com/salesforce/factlm
+3
+LLMs perform this mapping by using their embedding layer, e, to embed p into a sequence of
+continuous vectors, and then inputting this sequence to their first attention layer. We refer to this
+sequence of continuous vectors that are input to the LLM as a continuous prompt (pcont). We make
+this distinction because P-Adapters sit between the embedding layer and the first attention layer of
+the LLM, so they take as input e(p) and output a continuous prompt pcont that differs from e(p).
+After passing Pcont through the attention layers of the LLM, We take the LLM's prediction (y) to be
+the token assigned the highest probability in the location of the [MASK] token in p, and compare
+it to y to assess the model knoWledge of the fact. Formally, a model is consistent if for any tWo
+prompts P1,P2 for the same (x, y, r) triple, its top-1 predictions yι and y2 are equal.
+4	Methods
+To test extracting factual knoWledge (rather than overfitting to training templates or entity pair dis-
+tributions), We evaluate our P-Adapters in four settings:
+1.	ID templates and objects for testing in-domain generalization.
+2.	OOD Prompts for testing generalization to novel natural language prompts.
+3.	OOD Objects for testing Whether our P-Adapter models learn to match the distribution of
+objects in the training set rather than predict arbitrary object entities.
+4.	OOD Keyboard Errors for testing robustness to typos in the natural language prompts.
+4.1	Data
+Entity Pairs. We use the entity pairs and relations from the T-Rex split of the LAMA Work (El-
+sahar et al., 2018; Petroni et al., 2019) in our experiments. This data includes 41 relations and ap-
+proximately 1000 entity pairs for each relation sampled from Wikidata, including citations to Where
+the relation manifests in Wikipedia. This data is used for evaluation. For training and validation,
+We use separate sets of entity pairs for each relation collected by Shin et al. (2020), Which they use
+to optimize their discrete prompts. The entities pairs in the training, validation, and evaluation sets
+are all disjoint, though the distribution of object entities is similar. For the OOD Objects setting,
+We use the entity pairs in the uniform-Wikidata dataset from Cao et al. (2021). This dataset Was
+constructed so that each object appears the same number of times for each relation, in contrast to the
+ID evaluation set Which contains a less uniform distribution of objects from Wikidata.
+Templates. The templates We use are pooled from prior Work: LAMA, LPAQA, and ParaRel
+datasets (Jiang et al., 2020; Elazar et al., 2021). LPAQA includes templates created automatically
+With a paraphrase model, mined from Wikipedia, and Written by annotators, and ParaRel contains
+high-quality human-Written templates. Additionally, We augment the ParaRel templates using the
+BERT lexical substitution system from Lee et al. (2021) by generating five paraphrases for each
+template, and then manually filtering out generations that do not preservens semantics. This gives
+us on average 81.4 prompt templates per relation (For more statistics, see Figure 6). We split the
+templates into tWo equal-sized groups: one for training and one for OOD Prompt evaluation. For
+the OOD Keyboard Errors setting, We use the training templates, except We introduce at least one
+typographic error in each template using the nlpaug package (Ma, 2019).
+4.2	Models
+First We introduce our P-Adapter models, and then We introduce our MoE models, and We finish With
+our oracle and baseline models. Recall that P-Adapters intercede betWeen the LLM’s embedding
+layer, e, and the first attention layer (Figure 1). We extract information from BERT Base Cased,
+BERT Large Cased, and RoBERTa Large (Devlin et al., 2018; Liu et al., 2019). Because these
+models’ pretraining corpera contain Wikipedia, they should have access to the facts We test.
+P-Adapter. P-Adapter models take as input the embeddings of the natural language prompt, e(p),
+and output a neW sequence of continuous embeddings, pcont, that are used as input to the LLM in
+place of e(p). Formally, a P-Adapter is a function fP-Adapter : e(p) → pcont trained to maximize
+4
+Figure 2: P-Adapters lie in between the LLM Embeddings and the rest of the model (1). We propose
+end-to-end P-Adapters (2a) as well as a Mixture of Experts model (2b). Figures 2b and 2a are sub-
+stituted into the “P-Adapter” block in 1. The subject embedding is in blue; the [MASK] embedding
+is red; embeddings generated by the P-Adapter are yellow; and other unmodified embeddings are
+gray. Dotted arrows represent inputs and outputs to model components and solid arrows represent
+copying from the input of the P-Adapter to its output.
+PLM (y | pcont). The LLM’s prediction is then:
+arg max PLM (v | fP-Adapter(e(p))) ,
+v∈V
+where V is the LLM vocabulary. There are many different possible parameterizations of fP-Adapter,
+and we describe three here. Two (Rewrite P-Adapter and Prefix P-Adapter) require no additional
+annotations, fitting the training and inference data criteria put forth in the introduction. The third
+(P-Tuning P-Adapter) does not fit our criteria, but we include it because it provides insight into what
+makes a P-Adapter effective (See Figure 2a for an illustration of each.)
+The simplest P-Adapter we investigate is the Rewrite P-Adapter. The Rewrite P-Adapter is pa-
+rameterized by a d/2-dimensional bidirectional LSTM followed by a single MLP applied to each
+hidden state independently (where d is the LLM’s hidden dimension). The output of the MLP, pcont,
+is input to the LLM. We use LSTMs to better compare our results with those of Liu et al. (2021b)
+who also use them, and because we want to use only a small number of parameters. Additionally,
+the prompts tend to be short and we do not do any pre-training, so LSTMs are effective.
+Next we look at the Prefix P-Adapter. The Prefix P-Adapter is parameterized similarly to the
+Rewrite P-Adapter; however, its output is a prefix of embeddings that are prepended to e(p). Like
+other works that learn prompt prefixes, the prefix has a fixed length (we use nine to compare with
+later models) (Li & Liang, 2021; Lester et al., 2021). Formally, using the Prefix P-Adapter, the input
+to the LLM is [g(e(p)); e(p)], where g is the application of a Bi-LSTM, a max pool, and an MLP to
+project the max pool’s output into the size of the prefix. Unlike the Rewrite P-Adapter, the Prefix
+P-Adapter keeps all of the embeddings e(p) accessible to the LLM’s first attention layer.
+Finally, we investigate the P-Tuning P-Adapter. This P-Adapter is based on work by Liu et al.
+(2021b) which presents a method called P-Tuning that learns a continuous prompt for each relation
+in the LAMA dataset. The method learns a function g : r → Rd×9 . The pcont consists of the output
+ofg, the LLM’s unmodified embedding of the subject, and the LLM’s unmodified embedding of the
+mask token. It has the following form:
+g(r)[0:3]; e(x); g(r)[3:6]; e([MASK]);g(r)[6:9] ,
+where bracket notation represents python-style list indexing.
+The P-Tuning P-Adapter is implemented in a similar fashion, except g takes as input e(p) rather than
+r, and is parameterized similarly to the Prefix P-Adapter. Like the Prefix P-Adapter, the method out-
+5
+puts a fixed number of embeddings; however, unlike the Prefix P-Adapter, only the embeddings for
+the subject and [MASK] token are kept unchanged, rather than all of e(p). Note that this P-Adapter
+additionally requires annotations for the identity of the subject during training and inference. This
+means that it does not fit the desiderata laid out in the introduction, but is included because it allows
+us to investigate what makes a P-Adapter successful.
+Mixture of Experts and Oracle. Enforcing consistency does not require modifying a natural lan-
+guage prompt like the P-Adapters do. One can also map each natural language prompt to a canonical
+continuous prompt, and use this prompt to query the frozen LLM. We explore this option next with
+our MoE and Oracle methods. In these, the canonical prompt is a continuous prompt optimized
+for the relation between the entities in the natural language prompt Liu et al. (2021b). These con-
+tinuous prompts are learned using P-Tuning, and have the same format as described previously in
+the P-Tuning P-Adapters section; they ignore e(p), depending only on the x, MASK, and r (Liu
+et al., 2021b). We train these continuous prompts with P-Tuning using the same method and hyper-
+paramters reported in Liu et al. (2021b), with one prompt for each of the 41 relations. In contrast
+to the P-Adapter methods, these require additional annotations with the relation of the prompt (See
+Figure 2b).
+The Mixture of Experts (MoE) model consists of two components. The first is a classifier that
+predicts the relation between the entities of a natural language prompt. This classifier is a BERT
+Base Cased model finetuned on a 41-way classification task. The second component is a look-up
+table to map the predicted relations to the canonical continuous prompts.
+Note that this is similar to a traditional mixture of experts model approach except that we do not use
+a weighted combination of prompts from different relations and instead just use the single prompt
+from the predicted relation.
+The Oracle method is similar to the MoE approach, except rather than using a classifier to predict
+the relation, the gold relation is used at inference time. This method is an oracle because it achieves
+perfect consistency—it makes the same prediction for all prompts with the same entity pair. The
+oracle also serves as a direct comparison to the prior work of P-Tuning because P-Tuning assumes
+access to the gold relation.
+Baseline. Finally, the baseline is a model that takes as input the natural language prompt without
+any prefixes or optimization. Any effective and useful P-Adapter network would have to perform
+better than just using the natural language prompt itself.
+4.3	Metrics
+We report two metrics: precision@1 (P@1) and consistency. P@1 is a stringent measure of whether
+a prompt can extract a fact. It is the fraction of prompts where the correct object is the LLM’s top
+prediction. Consistency measures whether a model’s predictions for a given entity pair match across
+the different prompts p’s that contain the entities. We calculated consistency using the method
+from Elazar et al. (2021): the consistency of knowledge of a fact is the proportion of pairs of
+prompts for the fact where the model makes the same prediction. Formally, given a set of un-
+ordered pairs of prompts with the same entity pair, P , where there are n unique prompts, and letting
+Top-1(p) = arg maxv∈V PLM (v | fprompt(e(p))) return the model’s top prediction given a natural
+language prompt x0, the consistency is defined as:
+.,∕τ∣m	Egg )∈P1[TOP-I(Pi) = TOP-I(Pj)]
+ConSiStency(Top-1,P)=   -------------1- --------------------.
+2 n(n — 1)
+Note: a model can be conSiStent and inaccurate by alwayS predicting the Same incorrect object.
+5 Results
+We preSent our main reSultS for BERT BaSe in Table 1. The reSultS for BERT Large and RoBERTa
+Large Show Similar trendS and are available in the Appendix (TableS 2, 3, FigureS 4 and 5; Qualitative
+ReSultS are in Appendix D). AcroSS all evaluation SettingS, we find optimized promptS lead to higher
+preciSion than natural language oneS, aS the low performance of the baSeline indicateS.
+6
+Metric	P-Adapter	ID	OOD Prompts	OOD Objects	OOD KE
+	Baseline	0.157	0.157	0.069	0.092
+	Rewrite	0.258 ± 0.00	0.247 ± 0.00	0.078 ± 0.00	0.167 ± 0.00
+P@1	Prefix	0.425 ± 0.01	0.415 ± 0.01	0.193 ± 0.00	0.326 ± 0.01
+	P-Tuning	0.442 ± 0.00	0.422 ± 0.00	0.203 ± 0.00	0.325 ± 0.00
+	MoE	0.488 ± 0.01	0.418 ± 0.00	0.237 ± 0.02	0.331 ± 0.00
+	Oracle	0.496 ± 0.01	0.496 ± 0.01	0.238 ± 0.02	0.496 ± 0.01
+	Baseline	0.126	0.133	0.097	0.068
+	Rewrite	0.476 ± 0.01	0.448 ± 0.02	0.456 ± 0.01	0.223 ± 0.01
+Consistency	Prefix	0.656 ± 0.02	0.613 ± 0.02	0.588 ± 0.03	0.452 ± 0.03
+	P-Tuning	0.730 ± 0.00	0.646 ± 0.01	0.656 ± 0.01	0.476 ± 0.01
+	MoE	0.947 ± 0.03	0.658 ± 0.03	0.916 ± 0.05	0.439 ± 0.01
+	Oracle	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00
+Table 1: P@1 and Consistency for BERT Base across all our settings. P-Adapters are separated
+based on whether they require additional training/inference data. Note that the consistency of the
+Oracle is 1.0 and that the Baseline does not have any standard deviation because there is no op-
+timization across runs. Results are microaveraged over all relations. (OOD KE: OOD Keyboard
+Errors).
+Precision. Comparing the different evaluation settings, we observe the following. First, the OOD
+Objects was the most challenging setting, on average 20.41% lower precision than the ID setting,
+even for the oracle. However, the models performed similarly on the OOD Prompts as they did on
+the ID ones. At first this might seem to conflict with previous work that finds that the prompt has a
+large impact on performance (Jiang et al., 2020), but these results make claims about average rather
+than individual prompt performance. That said, precision is still higher ID than OOD, particularly
+for the MoE model. Looking at the MoE’s relation classifier predictions, we can see it achieves an
+F1 of 99% for the ID and OOD Objects settings, but only 81% for OOD Prompts (See Appendix
+F). While this suggests some overfitting, our methods still outperform the baseline, so what they
+learn is still useful for the OOD natural language prompts. Finally, when evaluated on the OOD
+Keyboard Errors, we find that models still outperform the baseline. However, precision on the
+corrupted prompts is lower than the uncorrupted ones, and drops by a larger absolute percentage
+than the baseline does.
+Consistency. Additionally, across all variation types we can see that optimized prompts lead to
+more consistency among the models’ predictions. The consistencies dramatically increase from
+less than 0.2 for the baseline to over 0.4 (Table 1). Models were the least consistent on the OOD
+Keyboard Errors, and interestingly, were similarly consistent between the OOD Prompts and OOD
+Objects evaluations despite having a much higher precision for the OOD Prompts. The oracle has
+a perfect consistency of 1.0, because it uses the same continuous prompt for all facts with the same
+relation, so the predictions for that fact are all the same. The MoE model has a high consistency for a
+similar reason: as long as the classifier predicts two prompts for the same entity pair come from the
+same relation, the predictions will be the same, and therefore consistent. The P-Tuning P-Adapter
+often has a a high consistency as well, sometimes even higher than the MoE. This suggests that in
+P-Tuning P-Adapter, the main factor driving the model’s prediction is the subject of the entity pair,
+because the unmodified embedding of the subject is shared among all of the prompts for the same
+object.
+In the P-Adapters, this consistency is implicitly encouraged by the current training procedure by
+training P-Adapters to map from various natural language prompts to the same object. We investigate
+adding an additional loss term to explicitly encourage consistency and find that doing so increases
+consistency by 5% on average. This suggests that implicitly encouraging consistency can be helpful
+but is not necessary. The procedure and results are detailed in Appendix E.
+Unmodified Embeddings. We observe that giving the LLM access to its unmodified embeddings
+of the natural language prompt was helpful. The Prefix P-Adapter and the P-Tuning P-Adapter,
+which have access to some or all of these embeddings, achieve higher precisions than the Rewrite
+P-Adapter, which alters all of them. Because of this, we perform additional experiments to see what
+part of natural language prompt was important to keep.
+7
+苞d
+Unmodified EmbeddingS
+Precision VS a
+6WUOJ_—d
+①MSB
+OO∙IU d
+06∙0 U d
+g"∙0 U d
+Og∙0 U d
+0I∙0 U d
+00.0 U d
+Figure 3: The above results show which of the LLM’s embeddings are important to keep unmodified.
+On the left, the x-axis has the embeddings that are not modified by the P-Adapter (e.g. “None” is
+the Rewrite P-Adapter, where all embeddings are modified). These results are computed with BERT
+Base and the ID data. In the plot on the right, We compare different α's to the P-TUning P-AdaPter
+and the version of the “Rewrite” P-Adapter with the unmodified subject and [MASK] embeddings,
+finding the α = 0.5 performs as Well as the other adapters that reqUire additional annotation.
+One hypothesis is that the [MASK] token embedding shoUld remain Unmodified, and the ReWrite P-
+Adapter performs poorly becaUse it corrUpts this embedding. We investigate this in tWo Ways. First,
+We train a version of the ReWrite P-Adapter that replaces the P-Adapter’s oUtpUt in the [MASK] to-
+ken position With the LLM’s [MASK] token embedding. Second, We train a version of the P-TUning
+P-Adapter Whose oUtpUt only has the LLM’s [MASK] embedding, not the sUbject embedding. HoW-
+ever, We find these do not increase performance mUch compared to the ReWrite P-Adapter.
+Another hypothesis is that the sUbject embeddings mUst remain Unmodified, and that the ReWrite
+P-Adapter corrUpts the sUbject, leading to loWer precision. To address this, We train a version of the
+ReWrite P-Adapter model that replaces the embeddings for the sUbject in the P-Adapter oUtpUt With
+the LLM’s embeddings for the sUbject. We find this is mUch more effective, increasing precision
+by 13%. For comparison With the P-TUning P-Adapter, Which keeps the sUbject and [MASK] em-
+beddings the same, We also train a version of the ReWrite P-Adapter that replaces the embeddings
+at both the sUbject and [MASK] token positions With the LLM’s embeddings and find that this per-
+forms only 4% Worse than the P-TUning P-Adapter. The resUlts are visible in FigUre 3. From these
+experiments, We conclUde that the most important aspect of the prompt is the sUbject token. This
+also helps explain Why the Prefix P-Adapter does Well: it has access to the LLM’s embeddings for
+the entire natUral langUage prompt, Which inclUdes the sUbject.
+UnfortUnately, While these changes to the ReWrite P-Adapter models shoW promising resUlts, they
+reqUire knoWing the index of the sUbject tokens at training and inference time, Which contradicts
+oUr reqUirement to not Use extra annotations. FortUnately, there is another Way to incorporate the
+Unmodified LLM’s embeddings of the natUral langUage prompt into the oUtpUt of the P-Adapter: We
+can interpolate betWeen the P-Adapter oUtpUt and the Unmodified embeddings. To do this, We train
+a third type of ReWrite P-Adapter. If freWrite-adapter is the original ReWrite P-Adapter, the eqUation for
+the neW ReWrite P-Adapter is:
+fP-Adapter(p) = αe(p) + (1 - α)freWrite-adapter(e(p)).
+Where α is a hyperparameter. When α = 0, this P-Adapter is eqUivalent to the original ReWrite P-
+Adapter, and When α = 1 it is the baseline. We test α ∈ {0.1, 0.25, 0.5, 0.75, 0.9}, and find α = 0.5
+to perform the best. It oUtperforms the ReWrite P-Adapter When the sUbject and [MASK] tokens are
+sUbstitUted in, thoUgh barely Underperforms compared to the P-TUning P-Adapter (See FigUre 3).
+8
+6 Discussion
+Our goal was to create models to adapt arbitrary user queries so predictions from frozen LLMs
+were accurate and consistent. One desiderata was to train with only (prompt, object) pairs, so that
+a user’s experience would match current IR system experiences. Despite this requirement, some
+of the methods we introduce do use additional information—for comparison to other methods and
+understanding our own. For example, the P-Tuning P-Adapter and the MoE models both need the
+identity of the subject of the user’s prompt, and requiring a user to provide this feels cumbersome
+and redundant. One could obviate this need using an off-the shelf NER system as well, and we leave
+exploring this to future work.
+Additionally, the MoE models train their classifiers using annotations for the relation between the
+entities in the prompts. We use these annotations to compare to previous work: previous work as-
+sumes that relation is the most useful intermediate variable for factual extraction, but this does not
+have to be the case. For example, good prompts across different relations like “Ottawa is the capital
+of [MASK]” and “The second largest country by land area is [MASK]” might share components
+even though they do not share a relation. Our P-Adapters allow for greater flexibility by condition-
+ing on the natural language prompt itself rather than the relation. Importantly, while using extra
+information leads to better results in some cases, the Prefix P-Adapter usually achieves compara-
+ble precision. And while the Rewrite P-Adapter flounders, ensembling its outputs with the LLM
+embeddings leads to greater success.
+We speculate that there are two likely reasons for the P-Adapters’ success. First, not updating
+the LLM parameters likely maintains factual knowledge learned during pretraining—Elazar et al.
+(2021) show that continuing to finetune the models on extracting factual information can lead to
+lower accuracy. Second, the natural language prompts are likely close to being effective prompts, so
+small changes from P-Adapters are sufficient to elicit the correct objects.
+It is also worth noting that while the Prefix P-Adapter approaches the performance of the techniques
+with more information, this performance is still quite modest. The oracle was able to achieve only
+a precision of 50% in the cases with ID objects, missing half of the facts. For the OOD Objects
+evaluation set, it performed much worse, only correctly predicting about 25% of the facts. While
+the P@1 metric is quite strict, these numbers do not bode well for this approach. Cao et al. (2021)
+blame this poor performance on the optimized prompts overfitting to the training object distribution,
+and they observe that when the subjects are changed, the LLM’s distributions do not change all that
+much. They even observe that the LLM’s distributions when prompts have subjects are similar to
+those when the subjects are completely omitted. Our findings point to a more nuanced result. While
+it might be true that the LLM’s distributions in these cases are correlated, the subject does matter
+when considering the top prediction. We find that without the LLM’s embeddings of the subject
+accessible, the P-Adapters performs even more poorly.
+7 Conclusion
+LLMs implicitly learn factual information during pretraining, but accurately and consistently ex-
+tracting this information is challenging. Our work complements previous work on extracting factual
+information from LLMs by introducing a more user-oriented setting: we want our models to only
+take in varied natural language prompts, and return the objects that meet information needs. To do
+this, we propose P-Adapter models, which sit between the embedding layer and the first attention
+layer of LLMs. These are effective compared to other methods that require additional annotations
+(e.g., the relation between the entities in the prompt), and we perform ablations determining that
+their success is due to keeping the LLM’s embeddings of the subject available to the LLM. While
+we focus on the task of extracting factual information from LLMs, P-Adapters potentially provide
+a general framework for adapting to variable inputs, for example in reading comprehension or di-
+alogue. While there is still room for the further improvement in using LLMs as knowledge bases,
+and we see P-Adapters as an important part of the future of this endeavor.
+9
+8	Ethics Statement
+While our work is inspired by how users interact with current IR systems, we do not perform any
+experiments with human subjects. Additionally, our method improves the ability to extract factual
+information from pretraining corpora, so this means it may be possible to exploit our method to
+elicit the biased or harmful predictions from these corpora as well, though we do not study this.
+Finally, improving the ability to accurately and consistently extract information from text sources
+has privacy concerns if LLMs are pretrained on private or otherwise sensitive data. For the LLMs
+we study, this is not a concern as they were trained on Wikipedia and Books Corpus data rather than
+web data.
+9	Reproducibility Statement
+The descriptions of our models and training procedure in Section 4 and the code available at the link
+below is sufficient for reproducing our results. The data we use is available in the Github repositories
+of the work we cite that creates these resources. For running experiments, see the README.md file
+here: https://github.com/salesforce/FactLM.
+Acknowledgments
+The authors would like to thank Wenhao Liu, John Hewitt, and Alex Tamkin for their valuable
+discussions and feedback. We would also like to thank our reviewers for suggesting additional
+experiments and analyses to strengthen the claims made in the work.
+References
+Moustafa Alzantot, Yash Sharma, Ahmed Elgohary, Bo-Jhang Ho, Mani Srivastava, and Kai-
+Wei Chang. Generating natural language adversarial examples. In Proceedings of the 2018
+Conference on EmpiricaI Methods in NatUraI LangUage Processing, pp. 2890-2896, Brussels,
+Belgium, October-November 2018. Association for Computational Linguistics. doi: 10.18653/
+v1/D18-1316. URL https://aclanthology.org/D18-1316.
+Yonatan Belinkov and Yonatan Bisk. Synthetic and natural noise both break neural machine trans-
+lation. In International Conference on Learning RePreSentations, 2018.
+Elad Ben Zaken, Shauli Ravfogel, and Yoav Goldberg. Bitfit: Simple parameter-efficient fine-tuning
+for transformer-based masked language-models. arXiv e-prints, pp. arXiv-2106, 2021.
+Boxi Cao, Hongyu Lin, Xianpei Han, Le Sun, Lingyong Yan, Meng Liao, Tong Xue, and Jin
+Xu. Knowledgeable or educated guess? revisiting language models as knowledge bases. In
+ProceedingS of the 59th AnnUal Meeting of the ASSociation for ComPUtational LingUiSticS and the
+11th Intemational Joint Conference on NatUral LangUage ProceSSing (Volume 1: Long Papers),
+pp. 1860-1874, Online, August 2021. Association for Computational Linguistics. doi: 10.18653/
+v1/2021.acl-long.146. URL https://aclanthology.org/2021.acl-long.146.
+Joe Davison, Joshua Feldman, and Alexander M Rush. Commonsense knowledge mining from
+pretrained models. In PrOceedingS of the 2019 COnference on EmPirical MethOdS in NatUral
+Language Processing and the 9th International Joint Conference on Natural Language Processing
+(EMNLP-IJCNLP), pp. 1173-1178,2019.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+bidirectional transformers for language understanding. arXiv PrePrint arXiv:1810.04805, 2018.
+Philipp Dufter, Nora Kassner, and Hinrich SchUtze. Static embeddings as efficient knowledge
+bases? In PrOceedingS of the 2021 COnference of the North American ChaPter of the ASSOciatiOn
+for Computational LingUiStics: HUman LangUage Technologies, pp. 2353-2363, Online, June
+2021. Association for Computational Linguistics. doi: 10.18653∕v1∕2021.naacl-main.186. URL
+https://aclanthology.org/2021.naacl-main.186.
+10
+Krishnamurthy Dvijotham, Sven Gowal, Robert Stanforth, Relja Arandjelovic, Brendan
+O’Donoghue, Jonathan Uesato, and Pushmeet Kohli. Training verified learners with learned ver-
+ifiers. arXiv Preprint arXiv:1805.10265, 2018.
+Yanai Elazar, Nora Kassner, Shauli Ravfogel, Abhilasha Ravichander, Eduard Hovy, Hinrich
+Schutze, and Yoav Goldberg. Measuring and improving consistency in pretrained language mod-
+els. arXiv preprint arXiv:2102.01017, 2021.
+Hady Elsahar, Pavlos Vougiouklis, Arslen Remaci, Christophe Gravier, Jonathon Hare, Frederique
+Laforest, and Elena Simperl. T-REx: A large scale alignment of natural language with knowledge
+base triples. In ProceedingS of the EleVenth International Conference on LangUage Resources and
+EVaIUation (LREC 2018), Miyazaki, Japan, May 2018. European Language Resources Associa-
+tion (ELRA). URL https://aclanthology.org/L18-1544.
+Adi Haviv, Jonathan Berant, and Amir Globerson. BERTese: Learning to speak to BERT. In
+ProCeedingS of the 16th Conference of the EUropean Chapter of the ASSoCiation for CompUtational
+LingUiStics: Main Volume, pp. 3618-3623, Online, April 2021. Association for Computational
+Linguistics. URL https://aclanthology.org/2021.eacl-main.316.
+Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe,
+Andrea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning
+for NLP. In Kamalika Chaudhuri and Ruslan Salakhutdinov (eds.), Proceedings of the 36th
+International ConferenCe on MaChine Learning, volume 97 of Proceedings of MaChine Learning
+ReSearch, pp. 2790-2799. PMLR, 09-15 Jun 2019. URL https://proceedings.mlr.
+press/v97/houlsby19a.html.
+Mohit Iyyer, John Wieting, Kevin Gimpel, and Luke Zettlemoyer. Adversarial example genera-
+tion with syntactically controlled paraphrase networks. In ProCeedingS of the 2018 ConferenCe
+of the North AmeriCan Chapter of the ASSoCiation for CompUtational LingUiStics: HUman
+LangUage Technologies, VoIUme 1 (Long Papers), pp. 1875-1885, New Orleans, Louisiana,
+June 2018. Association for Computational Linguistics. doi: 10.18653∕v1∕N18-1170. URL
+https://aclanthology.org/N18-1170.
+Robin Jia and Percy Liang. Adversarial examples for evaluating reading comprehension systems.
+InEMNLP, 2017.
+Zhengbao Jiang, Frank F. Xu, Jun Araki, and Graham Neubig. How Can We Know What Language
+Models Know? TranSaCtionS of the ASSoCiation for Computational LingUiStics, 8:423T38, 07
+2020. ISSN2307-387X. doi: 10.1162/tacl_a_00324. URL https://doi.org/10.1162/
+tacl_a_00324.
+Erik Jones, Robin Jia, Aditi Raghunathan, and Percy Liang. Robust encodings: a framework for
+combating adversarial typos. TranSaCtionS of the ASSoCiation for Computational LingUiStics,
+2020.
+Nora Kassner and Hinrich SchUtze. Negated and misprimed probes for pretrained language models:
+Birds can talk, but cannot fly. In ProCeedingS of the 58th AnnUal Meeting of the ASSoCiation
+for CompUtational LingUiStics, pp. 7811-7818, Online, July 2020. Association for Computational
+Linguistics. doi: 10.18653∕v1∕2020.acl-main.698. URL https://aclanthology.org/
+2020.acl-main.698.
+Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In ICLR (Poster),
+2015. URL http://arxiv.org/abs/1412.698 0.
+Mina Lee, Chris Donahue, Robin Jia, Alexander Iyabor, and Percy Liang. Swords: A benchmark
+for lexical substitution with improved data coverage and quality. In Proceedings of the 2021
+ConferenCe of the North AmeriCan Chapter of the ASSoCiation for CompUtational LingUiStics:
+HUman LangUage Technologies, pp. 4362T379, Online, June 2021. Association for Computa-
+tional Linguistics. doi: 10.18653∕v1∕2021.naacl-main.345. URL https://aClanthology.
+org/2021.naacl-main.345.
+Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-efficient prompt
+tuning. ArXiv, abs/2104.08691, 2021.
+11
+Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation. In
+Proceedings of the 59th AnnUal Meeting of the Association for CompUtationaI LingUistics and the
+11th IntemationaI Joint Conference on NatUral LangUage Processing (VoIUme 1: Long Papers),
+pp. 4582-4597, Online, August 2021. Association for Computational Linguistics. doi: 10.18653/
+v1/2021.acl-long.353. URL https://aclanthology.org/2021.acl-long.353.
+Pengfei LiU, Weizhe YUan, Jinlan FU, Zhengbao Jiang, Hiroaki Hayashi, and Graham NeUbig. Pre-
+train, prompt, and predict: A systematic sUrvey of prompting methods in natUral langUage pro-
+cessing. arXiv PrePrint arXiv:2107.13586, 2021a.
+Xiao LiU, Yanan Zheng, Zhengxiao DU, Ming Ding, YUjie Qian, Zhilin Yang, and Jie Tang. GPT
+understands, too. arXiv PrePrint arXiv:2103.10385, 2021b.
+Yinhan LiU, Myle Ott, Naman Goyal, Jingfei DU, Mandar Joshi, Danqi Chen, Omer Levy, Mike
+Lewis, LUke Zettlemoyer, and Veselin Stoyanov. Roberta: A robUstly optimized bert pretraining
+approach. arXiv PrePrint arXiv:1907.11692, 2019.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International
+Conference on Learning RePresentations, 2018.
+Edward Ma. Nlp augmentation. https://github.com/makcedward/nlpaug, 2019.
+Donald Metzler, Yi Tay, Dara Bahri, and Marc Najork. Rethinking search: making domain experts
+out of dilettantes. In ACM SIGIR Forum, volume 55, pp. 1-27. ACM New York, NY, USA, 2021.
+Fabio Petroni, Tim Rocktaschel, Sebastian Riedel, Patrick Lewis, Anton Bakhtin, Yuxiang Wu,
+and Alexander Miller. Language models as knowledge bases? In Proceedings of the 2019
+Conference on EmPiricaI Methods in NatUral LangUage Processing and the 9th IntemationaI Joint
+Conference on NatUral LangUage Processing (EMNLP-IJCNLP), pp. 2463-2473, Hong Kong,
+China, November 2019. Association for Computational Linguistics. doi: 10.18653∕v1∕D19-1250.
+URL https://aclanthology.org/D19-1250.
+Nina Poerner, Ulli Waltinger, and Hinrich SchUtze. E-BERT: Efficient-yet-effective entity em-
+beddings for BERT. In Findings of the Association for Computational Linguistics: EMNLP
+2020, pp. 803-818, Online, November 2020. Association for Computational Linguistics.
+daiT 10.18653∕v1∕2020.findings-emnlp.71. URL https://aclanthology.org/2 02 0 .
+findings-emnlp.71.
+Guanghui Qin and Jason Eisner. Learning how to ask: Querying LMs with mixtures of soft prompts.
+In Proceedings of the 2021 Conference of the North American ChaPter of the Association
+for ComPUtationaI LingUistics: HUman LangUage Technologies, pp. 5203-5212, Online, June
+2021. Association for Computational Linguistics. doi: 10.18653∕v1∕2021.naacl-main.410. URL
+https://aclanthology.org/2021.naacl-main.410.
+Taylor Shin, Yasaman Razeghi, Robert L. Logan IV, Eric Wallace, and Sameer Singh. Auto-
+Prompt: Eliciting Knowledge from Language Models with Automatically Generated Prompts.
+In Proceedings of the 2020 Conference on EmPirical Methods in NatUral LangUage Processing
+(EMNLP), pp. 4222T235, Online, November 2020. Association for Computational Linguis-
+tics. doi: 10.18653∕v1∕2020.emnlp-main.346. URL https://aclanthology.org/2 02 0 .
+emnlp-main.346.
+Aman Sinha, Hongseok Namkoong, Riccardo Volpi, and John Duchi. Certifying some distributional
+robustness with principled adversarial training. arXiv PrePrint arXiv:1710.10571, 2017.
+Christian Szegedy, Wojciech Zaremba, Ilya Sutskever, Joan Bruna, Dumitru Erhan, Ian Goodfellow,
+and Rob Fergus. Intriguing properties of neural networks. arXiv PrePrint arXiv:1312.6199, 2013.
+Trieu H Trinh and Quoc V Le. A simple method for commonsense reasoning. arXiv PrePrint
+arXiv:1806.02847, 2018.
+12
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+Pierric Cistac, Tim Rault, Remi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick
+von Platen, Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain Gug-
+ger, Mariama Drame, Quentin Lhoest, and Alexander M. Rush. Transformers: State-of-the-art
+natural language processing. In ProCeedings of the 2020 Conference on EmpiriCal Methods in
+NatUraI Language Processing: System Demonstrations, pp. 38-45, Online, October 2020. As-
+sociation for Computational Linguistics. URL https://www.aclweb.org/anthology/
+2020.emnlp- demos.6.
+Zexuan Zhong, Dan Friedman, and Danqi Chen. Factual probing is [MASK]: Learning vs. learn-
+ing to recall. In Proceedings of the 2021 COnference of the NOrth AmeriCan ChaPter of the
+ASSOCiatiOn for Computational LingUiStics: HUman LangUage Technologies, pp. 5017-5033, On-
+line, June 2021. Association for Computational Linguistics. doi: 10.18653∕v1∕2021.naacl-main.
+398. URL https://aclanthology.org/2021.naacl-main.398.
+A All Results
+See Figures 4 and 5 as well as Tables 2 and 3.
+LLM	P-Adapter	ID	OOD Prompts	OOD Objects	OOD KE
+	Baseline	0.157	0.157	0.069	0.092
+	Rewrite	0.258 ± 0.00	0.247 ± 0.00	0.078 ± 0.00	0.167 ± 0.00
+BERT	Prefix	0.425 ± 0.01	0.415 ± 0.01	0.193 ± 0.00	0.326 ± 0.01
+Base	P-Tuning	0.442 ± 0.00	0.422 ± 0.00	0.203 ± 0.00	0.325 ± 0.00
+	MoE	0.488 ± 0.01	0.418 ± 0.00	0.237 ± 0.02	0.331 ± 0.00
+	Oracle	0.496 ± 0.01	0.496 ± 0.01	0.238 ± 0.02	0.496 ± 0.01
+	Baseline	0.163	0.160	0.077	0.099
+	Rewrite	0.117 ± 0.06	0.115 ± 0.06	0.042 ± 0.02	0.072 ± 0.03
+BERT	Prefix	0.431 ± 0.03	0.424 ± 0.02	0.207 ± 0.01	0.337 ± 0.02
+Large	P-Tuning	0.470 ± 0.00	0.443 ± 0.00	0.222 ± 0.00	0.346 ± 0.01
+	MoE	0.498 ± 0.01	0.431 ± 0.01	0.250 ± 0.02	0.339 ± 0.01
+	Oracle	0.510 ± 0.02	0.509 ± 0.02	0.258 ± 0.03	0.510 ± 0.02
+	Baseline	0.122	0.121	0.054	0.071
+	Rewrite	0.222 ± 0.04	0.214 ± 0.04	0.068 ± 0.01	0.148 ± 0.03
+RoBERTa	Prefix	0.385 ± 0.03	0.385 ± 0.03	0.179 ± 0.02	0.311 ± 0.02
+Large	P-Tuning	0.360 ± 0.07	0.359 ± 0.06	0.167 ± 0.03	0.306 ± 0.03
+	MoE	0.335 ± 0.11	0.290 ± 0.09	0.156 ± 0.05	0.231 ± 0.06
+	Oracle	0.340 ± 0.11	0.340 ± 0.11	0.157 ± 0.06	0.340 ± 0.11
+Table 2: Tabular format showing precision from Figure 4. The Baseline does not have any standard
+deviation because there is no randomness across runs. Results are microaveraged over all relations.
+(OOD KE: OOD Keyboard Errors)
+B Templates
+See Figure 6 and Table 4.
+13
+LLM	P-Adapter	ID	OOD Prompts	OOD Objects	OOD KE
+	Baseline	0.126	0.133	0.097	0.068
+	Rewrite	0.476 ± 0.01	0.448 ± 0.02	0.456 ± 0.01	0.223 ± 0.01
+BERT	Prefix	0.656 ± 0.02	0.613 ± 0.02	0.588 ± 0.03	0.452 ± 0.03
+Base	P-Tuning	0.730 ± 0.00	0.646 ± 0.01	0.656 ± 0.01	0.476 ± 0.01
+	MoE	0.947 ± 0.03	0.658 ± 0.03	0.916 ± 0.05	0.439 ± 0.01
+	Oracle	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00
+	Baseline	0.122	0.123	0.094	0.069
+	Rewrite	0.550 ± 0.22	0.538 ± 0.23	0.571 ± 0.22	0.399 ± 0.29
+BERT	Prefix	0.619 ± 0.07	0.583 ± 0.04	0.566 ± 0.06	0.446 ± 0.02
+Large	P-Tuning	0.759 ± 0.01	0.656 ± 0.01	0.694 ± 0.02	0.484 ± 0.02
+	MoE	0.955 ± 0.03	0.680 ± 0.04	0.933 ± 0.04	0.456 ± 0.03
+	Oracle	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00
+	Baseline	0.093	0.096	0.076	0.050
+	Rewrite	0.438 ± 0.03	0.403 ± 0.02	0.421 ± 0.02	0.217 ± 0.01
+RoBERTa	Prefix	0.540 ± 0.07	0.531 ± 0.06	0.491 ± 0.08	0.425 ± 0.04
+Large	P-Tuning	0.731 ± 0.13	0.707 ± 0.15	0.702 ± 0.18	0.600 ± 0.21
+	MoE	0.974 ± 0.01	0.661 ± 0.03	0.970 ± 0.02	0.436 ± 0.03
+	Oracle	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00	1.000 ± 0.00
+Table 3: Tabular format for the consistency from Figure 5. The Baseline does not have any standard
+deviation because there is no randomness across runs. Note that the Oracle models achieves a
+consistency of 1. Results are microaveraged over all relations. (OOD KE: OOD Keyboard Errors)
+Precision across all DataSetS
+BERT Large
+Figure 4: Results across our ID and OOD datasets across three LLMs. Each row is a different model,
+the x-axis is the dataset and error bars show standard deviation across either 3 runs. We can see that
+the oracle method outperformed all others, while the baseline and rewriter did the worst. The trends
+are similar across all models—the only difference come from some RoBERTa MoE models having
+higher variance than others which is explained by some runs not finding the best P-Tuning templates.
+14
+Consistency across all DataSetS
+BERT Large
+Figure 5: Consistency across all LLMs and evaluation sets.
+Number of Templates per Relation
+40	60	80	100	120
+Figure 6: Distribution of number of templates across the 41 relations we tested. Minimum is 32,
+maximum is 123 and mean is 81.44.
+subject	Canada
+object	Ottawa
+relation	IS .capital
+template	The capital of [X] is [Y].
+natural language prompt The capital of Canada is [MASK].
+prediction	Toronto
+Table 4: Here the terminology is applied to the example from the introduction. Note that the model
+is incorrect in this example.
+15
+C Training Details
+All of our P-Adapters were trained using the hyperparameters from Liu et al. (2021b): Adam opti-
+mizer with a learning rate of 1e - 5, weight decay of 5e - 4, a batch size of 128, and an exponential
+learning rate decay schedule with a decay rate of 0.98 (Kingma & Ba, 2015). Each result is the mean
+over five random seeds.
+Our MoE classifiers were trained using an AdamW optimizer with a learning rate of 0.001 and
+linear learning rate decay (Loshchilov & Hutter, 2018). We use HuggingFace Transformers to train
+the model for 3 epochs on the same training data used to train the P-Adapter models (Wolf et al.,
+2020). Each result is the mean over three random seeds rather than five because finetuning the
+classifier was more costly than training the the P-Adapters.
+D	Qualitative Analysis
+We also performed qualitative analysis to determine how P-Adapters’ predictions compare to the
+Baselines’ and MoE models’. We performed this analysis using the BERT base models, and focused
+on the Prefix P-Adapter.
+In general, we find that the Baseline tends to include more nonsensical or untopical vocabulary
+items. For example, for P36, the Capital_of relation, the baseline predicts the capital of “Iraq”
+to be ‘|’, ‘She’, and ‘It’ for some prompts. There are also situations where despite this variability,
+the baseline fails to predict the correct object for any of the prompts. For example, for the relation
+official_language_of, there are 60 natural language prompts. The correct object of the SUb-
+ject “Raahe” is “Finnish”, and it does not appear in the baseline’s 28 distinct predictions. However,
+half of the P-Adapter’s predictions are the correct “Finnish”.
+While the P-Adapter’s predictions are more consistent than the baseline’s, they are less consis-
+tent than the MoE’s. While this is undesirable from the perspective of consistency, it can lead to
+greater accuracy in some cases. For example, for the relation language_spoken, the MoE model
+predicted the object “French” for the subject “Guy Maddin” for 100% of the prompts, while the
+variability in P-Adapters allowed them to predict the only correct answer, “English” in 89.3% of the
+prompts (and “French” in 9.3% of them).
+There are downsides to this flexibility, however. We also observe examples where P-Adapters are
+tricked by the surface form of the prompt. For example, for the relation place_of_death, “Aki-
+hiko Saito” is predicted be Tokyo by 95% of phrases, even though the correct answer is “Iraq”. There
+are also examples where P-Adapters’ (particularly, the Prefix P-Adapters’) predictions appear to be
+copied from the input where the MoE models’ are not. For example, for prompts like “Windows
+Server 2003 was manufactured by [MASK].” P-Adapters correctly predict “Microsoft” for 87% of
+paraphrases, but they also predict “Windows” 13% of the time, which we do not observe the MoE
+models doing.
+E Explicitly Optimizing for Consistency
+Currently, P-Adapters encourage consistency in LLMs’ predictions implicitly, as the loss encour-
+ages LLMs to predict the same, correct object for variable natural language inputs. However, one
+could imagine that explicitly encouraging consistency could be helpful. One way to explicitly train
+for consistency is by encouraging not just the top-1 prediction to be the same, but the distribution
+over objects to the be the same for different natural language prompts for the same fact (Elazar et al.,
+2021). To do this, we train with pairs of natural language prompts for the same fact, and encourage
+the distributions over the predicted objects to be similar using the symmetric KL-Divergence. For-
+mally, given two prompts for the same entity pair and relation p1, p2, and an LM PLM we define our
+loss as:
+'consistency = DKL(PLM (PI) || PLM (Pz)) + DKL(PLM (P2 ) || PLM (PI))
+16
+We then add this to the loss, ` that we were previously calculating—the cross-entropy loss between
+the distribution over the object and the correct object, giving a total loss of:
+`total
+' + λ 'consist
+ency
+where we use λ = 0.5.
+This approach is inspired by the approach taken by Elazar et al. (2021), with the differences being
+that they finetune all of the parameters of the LLM, calculate this loss over all prompts with the
+same fact, and also find that in their setting they need to additionally continue with masked-language
+modeling training.
+We train new Prefix-P-Adapters on the BERT Base with this new loss, and find that the consistency
+increases slightly, and the P@1 stays the same or slightly decreases. This boost in consistency is
+beneficial, but the small increase (compared to the baseline) does not suggest that explicitly encour-
+aging consistency is necessary (See Table 5).
+	ID	OOD Prompts	OOD Objects	OOD KE
+P@1				
+Baseline	0.157	0.157	0.069	0.092
+Prefix P-Adapter	0.425 ± 0.011	0.415 ± 0.009	0.193 ± 0.004	0.326 ± 0.012
++ consistency	0.415 ± 0.002	0.408 ± 0.001	0.190 ± 0.002	0.326 ± 0.001
+MoE	0.488 ± 0.007	0.418 ± 0.002	0.237 ± 0.020	0.331 ± 0.003
+Consistency				
+Baseline	0.126	0.133	0.097	0.068
+Prefix P-Adapter	0.656 ± 0.023	0.613 ± 0.020	0.588 ± 0.026	0.452 ± 0.031
++ consistency	0.680 ± 0.008	0.645 ± 0.007	0.628 ± 0.005	0.507 ± 0.010
+MoE	0.947 ± 0.034	0.658 ± 0.032	0.916 ± 0.046	0.439 ± 0.013
+Table 5: P@1 and Consistency of Prefix P-Adapters on BERT Base. +consistency indicates training
+with the consistency loss (averaged over three runs). Consistency increases a small amount, while
+accuracy stays the same. The Baseline and MoE results are included for reference.
+F Relation Classifier
+We finetune BERT-base-cased to predict the relation from the natural language prompt for the MoE
+models. The F1 scores are microaveraged across three random seeds are visible in Table 6.
+ID	OOD Prompts	OOD Objects OODKE
+0.989 ± 0.004	0.812 ± 0.011 0.990 ± 0.003	0.607 ± 0.015
+Table 6: Microaveraged F1 score for the relation classifier component of the MOE models in each
+of the evaluation settings we investigate.
+17

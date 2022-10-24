@@ -1,0 +1,823 @@
+﻿Published as a conference paper at ICLR 2022
+Concurrent Adversarial Learning for Large-
+Batch Training
+Yong Liu1, Xiangning Chen2, Minhao Cheng3, Cho-Jui Hsieh2, Yang You1
+1 Department of Computer Science, National University of Singapore
+2Department of Computer Science, University of California, Los Angeles
+3 Department of Computer Science and Engineering, Hong Kong University of Science and Technology
+{liuyong, youy}@comp.nus.edu.sg, {xiangning, chohsieh}@cs.ucla.edu,
+minhaocheng@ust.hk
+Ab stract
+Large-batch training has become a widely used technique when training neural
+networks with a large number of GPU/TPU processors. As batch size increases,
+stochastic optimizers tend to converge to sharp local minima, leading to degraded
+test performance. Current methods usually use extensive data augmentation to in-
+crease the batch size as a remedy, but we found the performance brought by data
+augmentation decreases with the increase of batch size. In this paper, we propose
+to leverage adversarial learning to increase the batch size in large-batch training.
+Despite being a natural choice for smoothing the decision surface and biasing
+towards a flat region, adversarial learning has not been successfully applied in
+large-batch training since it requires at least two sequential gradient computations
+at each step. To overcome this issue, we propose a novel Concurrent Adversarial
+Learning (ConAdv) method that decouples the sequential gradient computations
+in adversarial learning by utilizing stale parameters. Experimental results demon-
+strate that ConAdv can successfully increase the batch size of ResNet-50 training
+on ImageNet while maintaining high accuracy. This is the first work that success-
+fully scales the ResNet-50 training batch size to 96K.
+1 Introduction
+As larger datasets and bigger models being proposed, training deep neural networks has become
+quite time-consuming. For instance, training BERT (Devlin et al., 2019) takes 3 days on 16 v3
+TPUs. GPT-2 (Radford et al., 2019) contains 1,542M parameters and requires 168 hours of training
+on 16 v3 TPUs. With the developments of high performance computing clusters, (e.g., Google and
+NVIDIA build high performance clusters with thousands of TPU or GPU chips), how to fully utilize
+those computing resources to accelerate the training process has become an important research topic.
+Data parallelism is a commonly used technique for distributed neural network training, where each
+processor computes the gradient of a local batch and the gradients across processors are aggregated
+at each iteration for a parameter update. Training with hundreds or thousands of processors with data
+parallelism is thus equivalent to running a stochastic gradient optimizer (e.g., SGD or Adam) with
+very large batch size, also known as large batch training. For example, Google and NVIDIA show
+that by increasing the batch size to 64k on ImageNet, they can finish 90-epochs ResNet training
+within one minute (Kumar et al., 2021; Mattson et al., 2019).
+But why can’t we infinitely increase the batch size as long as more computing resources are avail-
+able? Large batch training often faces two challenges. First, given a fixed number of training epochs,
+increasing the batch size implies reducing the number of training iterations. Even worse, it has been
+observed that large-batch training often converges to solutions with bad generalization performance
+(also known as sharp local minima) (Keskar et al., 2017), possibly due to the lack of inherent noise
+in each stochastic gradient update. Although this problem can be partially mitigated by using differ-
+ent optimizers such as LARS (You et al., 2017) and LAMB (You et al., 2019), the limit of batch size
+still exists. For instance, Google utilizes several techniques, such as distributed batch normaliza-
+1
+Published as a conference paper at ICLR 2022
+tion and mixed-precision training, to further scale the training of ResNet-50 on 4096 v3 TPU chips.
+However, it can just expand the batch size to 64k (Kumar et al., 2021; Ying et al., 2018).
+To mitigate the generalization gap brought by large-batch training, data augmentation has become
+an indispensable component. For instance, researchers at Facebook use augmentation to scale the
+training of ResNet-50 to 256 NVIDIA P100 GPUs with a batch size of 8k on ImageNet (Goyal et al.,
+2017). You et al. (2018) also use data augmentation to expand the batch size to 32k on 2048 KNL
+nodes. However, in this paper we observe that when batch size is large enough (i.e., larger than 32k),
+data augmentation will also increase the difficulty of training and even have a negative impact on
+test accuracy.
+This motivates us to study the application of adversarial training in large-batch training, which finds
+a perturbation within a bounded set around each sample to train the model. Previous works find
+that adversarial training can lead to a significant decrease in the curvature of the loss surface and
+make the network behave more “linearly” in small batch size cases, which could be used as a way
+to improve generalization (Xie et al., 2020; Moosavi-Dezfooli et al., 2019). However, adversarial
+training has not been used in large-batch training since it requires a series of sequential gradient
+computations within each update to find an adversarial example. Even when conducting only one
+gradient ascent to find the adversarial example, adversarial training requires two sequential gradient
+computations (one for adversarial example and one for weight update) that cannot be parallelized.
+Therefore, even with infinite computing resources, adversarial training is at least two times slower
+than standard training and increasing the batch size cannot compensate for that.
+To resolve this issue and make adversarial training applicable for large-batch training, we propose
+a novel Concurrent Adversarial Learning (ConAdv) algorithm. We show that by allowing the com-
+putation of adversarial examples using stale weights, the two sequential gradient computations in
+adversarial training can be decoupled, leading to fully parallelized computations at each step. As
+a result, extra processors can be fully utilized to achieve the same iteration throughput as original
+SGD or Adam optimizers. Comprehensive experimental results on large-batch training demonstrate
+that ConAdv is a better choice than existing augmentations.
+Our main contributions are listed below:
+•	This is the first work showing that adversarial learning can significantly increase the batch size
+limit of large-batch training without using data augmentation.
+•	The proposed algorithm, ConvAdv, can successfully decouple the two sequential gradient com-
+putations in adversarial training and make them parallelizable. This makes adversarial training
+achieve similar efficiency with standard stochastic optimizers when using sufficient computing
+resources. Furthermore, we empirically show that ConAdv achieves almost identical performance
+as the original adversarial training. We also provide theoretical analysis for ConAdv.
+•	Comprehensive experimental studies demonstrate that the proposed method can push the limit
+of large batch training on various tasks. For ResNet-50 training on ImageNet, ConAdv alone
+achieves 75.3% accuracy when using 96K batch size. Further, the accuracy will rise to 76.2%
+when combined with data augmentation. This is the first method scaling ResNet-50 batch size to
+96K with accuracy matching the MLPerf standard (75.9%), while previous methods fail to scale
+beyond 64K batch size.
+2	Background
+2.1	Large-Batch Training
+Using data parallelism with SGD naturally leads to large-batch training on distributed systems.
+However, it was shown that an extremely large batch is difficult to converge and has a general-
+ization gap (Keskar et al., 2017; Hoffer et al., 2017) . Therefore, related work starts to carefully
+fine-tune the hyper-parameters to bridge the gap, such as learning rate, momentum (You et al., 2018;
+Goyal et al., 2017; Li, 2017; Shallue et al., 2018; Xue et al., 2021; Lou et al., 2021). Goyal et al.
+(2017) try to narrow the generalization gap with the heuristics of learning rate scaling. However,
+there is still big room to increase the batch size. Several recent works try to use adaptive learning rate
+to reduce the fine-tuning of hyper-parameters and further scaling the batch size to larger value (You
+et al., 2018; Iandola et al., 2016; Codreanu et al., 2017; Akiba et al., 2017; Jia et al., 2018; Smith
+2
+Published as a conference paper at ICLR 2022
+et al., 2017; Martens & Grosse, 2015; Devarakonda et al., 2017; Osawa et al., 2018; You et al., 2019;
+Yamazaki et al., 2019; Liu et al., 2022). You et al. (2017) propose Layer-wise Adaptive Rate Scaling
+(LARS) for better optimization and scaling to the batch size of 32k without performance penalty on
+ImageNet. In addition, related work also tries to bridge the gap from the aspect of augmentation.
+Goyal et al. (2017) use data augmentation to further scale the training of ResNet-50 on ImageNet.
+Yao et al. (2018a) propose an adaptive batch size method based on Hessian information to gradually
+increase batch size during training and use vanilla adversarial training to regularize against the sharp
+minima. However, the process of adversarial training is time-consuming and they just use the batch
+size of 16k in the second half of the training process (the initial batch size is 256). How to further
+accelerate the training process based on adversarial training and reduce its computational burden is
+still an open problem.
+2.2	Adversarial Learning
+Adversarial training has shown great success on improving the model robustness through collecting
+adversarial examples and injecting them into training data (Goodfellow et al., 2015; Papernot et al.,
+2016; Wang et al., 2019). Madry et al. (2017) formulates it into a min-max optimization framework
+as follows:
+minE(χi,yi)〜DLmaX L(θt,x + δ,y)],	(1)
+θ '	'	l∣δ∣∣p∈e
+where D = {(xi, yi)}in=1 denotes training samples and xi ∈ Rd, yi ∈ {1, ..., Z}, δ is the adversarial
+Perturbation, ∣∣∙∣∣p denotes some Lp-norm distance metric, θt is the parameters of time t and Z is
+the number of classes. Goodfellow et al. (2015) proposes FGSM to collect adversarial data, which
+performs a one-step update along the gradient direction (the sign) of the loss function. Project
+Gradient Descent (PGD) algorithm (Madry et al., 2017) firstly carries out a random initial search in
+the allowable range (spherical noise region) near the original input, and then iterates FGSM several
+times to generate adversarial examples. Recently, several papers (Shafahi et al., 2019; Wong et al.,
+2020; Andriushchenko & Flammarion, 2020) aim to improve the computation overhead brought
+by adversarial training. Specifically, FreeAdv (Shafahi et al., 2019) tries to update both weight
+parameter θ and adversarial example x at the same time by exploiting the correlation between the
+gradient to the input and to the model weights. Similar to Free-adv, Zhang et al. (2019) further
+restrict most of the forward and backpropagation within the first layer to speedup computation.
+Wong et al. (2020) finds the overhead could be further reduced by using single-step FGSM with
+random initialization. While these works aim to improve the efficiency of adversarial training, they
+still require at least two sequential gradient computations for every step. Our concurrent framework
+could decouple the two sequential gradient computations to further boost efficiency, which is more
+suitable for large-batch training. Recently, several works (Xie et al., 2020; Cheng et al., 2021; Chen
+et al., 2021; Mei et al., 2022) show that the adversarial example can serve as an augmentation to
+benefit the clean accuracy in the small batch size setting. However, whether adversarial training can
+improve the performance of large-batch training is still an open problem.
+2.3	MLPerf
+MLPerf (Mattson et al., 2019) is an industry-standard performance benchmark for machine learning,
+which aims to fairly evaluate system performance. Currently, it includes several representative tasks
+from major ML areas, such as vision, language, recommendation. In this paper, we use ResNet-50
+(He et al., 2016) as our baseline model and the convergence baseline is 75.9% accuracy on ImageNet.
+3	Proposed Algorithm
+In this section, we introduce our enlightening findings and the proposed algorithm. We first study the
+limitation of data augmentation in large-batch training. Then we discuss the bottleneck of adversarial
+training in distributed systems and propose a novel Concurrent Adversarial Learning (ConAdv)
+method for large-batch training.
+3
+Published as a conference paper at ICLR 2022
+Worker 1
+CrIncal
+Data
+Adv
+Data
+CrIncal
+Data
+CIear
+Data
+CIear
+Data
+鬼仇）
+Adv
+Data
+The update process of step t
+Worker 2
+昌
+Local Data IUl	Local Data
+Training DataIJ
+(a)
+Figure 1: (a) Distributed Adversarial Learning (DisAdv), (b) Concurrent Adversarial Learning
+(ConAdv). To ease the understanding, WejUSt show the system including two workers.
+3.1	Does Data Augmentation Improve THE Performance of LARGE-BATCH
+Training?
+Data augmentation can usually improve the generalization of models and is a commonly used tech-
+nique to improve the batch size limit in large-batch training. To formally study the effect of data
+augmentation in large-batch training, we train ResNet-50 using ImageNet (Deng et al., 2009) by
+AutoAug (AA) (CUbUk et al., 2019). The results shown in Figure 2 reveal that although AA helps
+improve generalization under batch size ≤ 64K, the performance gain decreases as batch size in-
+creases. Further, it could lead a negative effect when the batch size is large enough (e.g., 128K or
+256K). For instance, the top-1 accuracy is increased from 76.9% to 77.5% when using AA on 1k
+batch size. However, it decreases from 73.2% to 72.9% under data augmentation when the batch
+size is 128k and drops from 64.7% to 62.5% when the batch size is 256k. The main reason is that
+the augmented data increases the diversity of training data, which leads to slower convergence when
+using fewer training iterations. Recent work tries to concat the original data and augmented data to
+jointly train the model and improve their accuracy (Berman et al., 2019). However, we find that con-
+cating them will hurt the accuracy when batch size is large. Therefore, we just use the augmented
+data to train the model. The above experimental results motivate us to explore a new method for
+large batch training.
+3.2	Adversarial Learning in the Distributed Setting
+Adversarial learning can be viewed as a way to automatically
+conduct data augmentation. Instead of defining fixed rules to
+augment data, adversarial learning conducts gradient-based
+adversarial attacks to find adversarial examples. As a re-
+sult, adversarial learning leads to smoother decision bound-
+ary (Karimi et al., 2019; Madry et al., 2017), which often
+comes with flatter local minima (Yao et al., 2018b). Instead
+of solving the original empirical risk minimization problem,
+adversarial learning aims to solve a min-max objective that
+minimizes the loss under the worst case perturbation of sam-
+ples within a small radius. In this paper, since our main goal
+is to improve clean accuracy instead of robustness, we con-
+sider the following training objective that includes loss on
+both natural samples and adversarial samples:
+80.0
+77.5
+/5.0
+∣72∙5
+< 70.0
+含 67.5
+65.0
+62.5
+1k 4k 8k 16k 32k 64k 96k 128k 256k
+Batch Size
+Figure 2: Augmentation Analysis
+min
+θ
+E(xi,yi)^D[L(θt; xi, yi) + maχ L(θt; Xi + δ, yi)],
+kδkp∈e
+(2)
+where L is the loss function and e represents the value of perturbation. Although many previous work
+in adversarial training focus on improving the trade-off between accuracy and robustness (Shafahi
+et al., 2019; Wong et al., 2020), recently Xie et al. (2020) show that using split BatchNorm for
+adversarial and clean data can improve the test performance on clean data. Therefore, we also adopt
+this split BatchNorm approach.
+4
+Published as a conference paper at ICLR 2022
+Sequence 1
+5ɑ(⅛)
+Second
+Gradient
+First
+Gradient
+"式仇—)	靖
+Concurrent Training
+(IndePendet)
+9t(0t)
+Update
+Sequence 2
+Xi ∈ ‰
+铸+τ W ^c,t+τ
+Concurrent 2
+9t(0t)
+Update
+Figure 3: Vanilla Training and Concurrent Train-
+ing
+Algorithm 1 ConAdv
+for t = 1,…，T do
+for Xi ∈ B% do
+Compute Loss:
+L(θt; Xi,yi) using main BN,
+La(θt; Xi(θt-τ), yi) using adv BN,
+Lb (θt) = EBk,tL(θt; Xi,yi)+
+EBk,t (XiR-T ),yi)
+Minimize the LB (θt) and obtain gk (θt)
+end for
+for Xi ∈ Bk,t+τ do
+Calculate adv gradient gk (θt)on Bc 右十「
+Obtain adv examples (Xi(θt), yi)
+end for
+end for
+Aggregate: gt(θt) = K PK=I gk(θt)
+Update weight θt+1 on parameter sever
+4(仇)
+For Distributed Adversarial Learning (DisAdv), training data D is partitioned into N local dataset
+Dk, and D = ∪c=KDk. For worker k, We firstly sample a mini-batch data (clean data) Bkc from the
+local dataset Dk at each step t. After that, each worker downloads the weights θt from parameter
+sever and then uses θt to obtain the adversarial gradients gk(θt) = VχL(θt; Xi, y%) on input example
+xi ∈ Bk,c. Noted that we just use the local loss E⑦9)〜DkL(θt; xi, yi) to calculate the adversar-
+ial gradient gk(θt) rather than the global loss E俳稔〃外〜口£(。公 xi, yi), since we aim to reduce the
+communication cost between workers. In addition, we use 1-step Project Gradient Descent (PGD)
+to calculate X*(θt) = xi + α ∙ VxL(θt; xi, yi) to approximate the optimal adversarial example x*.
+Therefore, we can collect the adversarial mini-batch Bk,t = {(X*(θt), yi)} and use both the clean
+example (xi, yi) ∈ Bk,t and adversarial example (X*(θt),yi) ∈ Bk,t to update the weights θt. More
+specially, we use main BatchNorm to calculate the statics of clean data and auxiliary BatchNorm to
+obtain the statics of adversarial data.
+We show the workflow of adversarial learning on distributed systems (DisAdv) as Figure 1, and
+more importantly, we notice that it requires two sequential gradient computations at each step which
+is time-consuming and, thus, not suitable for large-batch training. Specifically, we firstly need to
+compute the gradient gk(θt) to collect adversarial example X*. After that, we use these examples to
+update the weights θt, which computes the second gradient. In addition, the process of collecting
+adversarial example X* and use X* to update the model are tightly coupled, which means that each
+worker cannot calculate local loss 回旧加〜DkL(θt; xi, yi) and 庇.〃及〜DkL(θt; X*,yi) to update
+the weights θt, until the total adversarial examples X* are obtained.
+3.3	Concurrent Adversarial Learning for Large-Batch Training
+As mentioned in the previous section, the vanilla DisAdv requires two sequential gradient computa-
+tions at each step, where the first gradient computation is to obtain X* based on L(θt, xi, yi) and then
+compute the gradient of L(θt,X"yi) to update θt. Due to the sequential update nature, this overhead
+cannot be reduced even when increasing the number of processors — even with an infinite number
+of processors, the speed of two sequential computations will be twice of one parallel update. This
+makes adversarial learning unsuitable for large-batch training. In the following, we propose a simple
+but novel method to resolve this issue, and provide theoretical analysis on the proposed method.
+Concurrent Adversarial Learning (ConAdv) As shown in Figure 3, our main finding is that ifwe
+use stale weights (θt-τ) for generating adversarial examples, then two sequential computations can
+5
+Published as a conference paper at ICLR 2022
+be de-coupled and the parameter update step run concurrently with the future adversarial example
+generation step.
+Now we formally define the ConAdv procedure. Assume xi is sampled at iteration t, instead of the
+current weights θt, we use stale weights θt-τ (where τ is the delay) to calculate the gradient and
+further obtain an approximate adversarial example Xi(θt-τ):
+ga (θt-τ ) = V xL(θt-τ; xi, yi),	xi (θt-τ ) = Xi + α ∙ ga (θt-τ ) .	(3)
+In this way, We can obtain the adversarial sample Xi(θt-τ) through stale weights before updating the
+model at each step t. Therefore, the training efficiency can be improved. The structure of ConAdv
+is shown in Figure 1: At each step t, each worker k can directly concatenate the clean mini-batch
+data and adversarial mini-batch data to calculate the gradient gk(θt) and update the model. That is
+because the system has obtained the approximate adversarial example Xi based on the stale weights
+θt-τ before iteration t.
+In practice, we set τ = 1 so the adversarial examples Xi is computed at iteration t 一 1. Therefore,
+each iteration will compute the current weight update and the adversarial examples for the next
+batch:
+η
+θt+1 = θt + 2 Vθ(E(Xi,yi)~Bt,cL(4; xi, yi) + Exi,yi~Bt,aL(θt, xi(θt-1), yi)),	(4)
+Xi(θt) = Xi + α ∙ VxL(θt;xi,yi), where (Xi,yi) ∈ Bc,t+ι,	(5)
+where Bc,t = ∪kk==1K Bck,t denotes clean mini-batch of all workers and Ba,t = ∪kk==1K Bak,t represents
+adversarial mini-batch of all workers. These two computations can be parallelized so there is no
+longer two sequential computations at each step. In large-batch setting when the number of workers
+reaches the limit that each batch size can use, ConAdv is similarly fast as standard optimizers such
+as SGD or Adam. The pseudo code of proposed ConAdv is shown in Algorithm 1.
+3.4	Convergence Analysis
+In this section, we will show that despite using the stale gradients, ConAdv still enjoys nice con-
+vergence properties. For simplicity, we will use L(θ, Xi) as a shorthand for L(θ; Xi, yi) and ∣∣ ∙ ∣∣
+indicates the '2 norm. We define the optimal adversarial example as Xr = arg maxx*∈Xi L(θt,Xi).
+In order to present our main theorem, we will need the following assumptions.
+Assumption 1. The function L(θ, X) satisfies the Lipschitzian conditions:
+∣VxL(θι; X)-VxL@;X)∣ ≤ Lxθ∣∣θι- θ2k,∣∣VθL(θι;SL® x)∣ ≤ Lθθ||出 一 θ2∣
+∣VθL(θ; X1) 一 VθL(θ; X2)∣ ≤ Lθx∣X1 一 X2∣, ∣VxL(θ; X1) 一 VxL(θ; X2)∣ ≤ Lxx∣X1 一 X2∣.
+(6)
+Assumption 2. L(θ,X) is locally μ-StrongIy Concave in Xi = {x* : ||x* 一 x∕∣∞ ≤ e} for all
+i ∈ [n], i.e., for any X1, X2 ∈ Xi,
+L(θ,Xι) ≤ L(θ,X2) + hVxL(θ,X2),X1 — X2i - 2∣xi - X2∣.	(7)
+Assumption 2 can be verified based on the relationship between robust optimization and distribu-
+tional robust optimization in (Sinha et al., 2017; Lee & Raginsky, 2017).
+Assumption 3. The concurrent stochastic gradient ^(θt) = 2^ Pi=1(VθL(θt; Xi) + VθL(θt, Xi))
+is bounded by the constant M:
+kg(θt)k ≤ M.	⑻
+Assumption 4. Suppose	LD(θt)	=	2n	Pn=I(L(θt, X：)	+	L(θt,Xi)),	g(θt)	=
+2B Pi=1(VθL(Xi) + VθL(θt, X：)) and E[g(θt)] = VLD(θt), where ∖B∖ represents batch
+size . The variance of g(θt) is bounded by σ2:
+E[∣g(θt) - VLD(θt)∣2] ≤σ2.	(9)
+Based on the above assumptions, we can obtain the upper bound between original adversarial exam-
+ple x： (θt) and concurrent adversarial example x： (θt-τ), where T is the delay time.
+6
+Published as a conference paper at ICLR 2022
+Lemma 1. Under Assumptions 1 and 2, we have
+kx*(θt) - χ*(θt-τ)k ≤ Lkθt - θt-τk ≤ LxθητM.	(10)
+μ	μ
+Lemma 1 illustrates the relation between xi* (θt) and xi* (θt-τ), which is bounded by the delay τ.
+When the delay is small enough, xi*(θt-τ) can be regarded as an approximator of xi*(θt). We now
+establish the convergence rate as the following theorem.
+Theorem 1. Suppose Assumptions 1, 2, 3 and 4 hold. Let loss function LD (θt) =
+2n Pn=I(L(°t；x*,yi) + L(°t；xi,yi)) and Xi(θt-τ) be the λ-solution of x*(θt-τ):(/；必—)-
+Xi(θt-τ), VxL(θt-τ； Xi(θt-τ),yi)i ≤ λ. UnderAssumptions 1 and2,for the concurrent stochastic
+gradient g(θ). Ifthe step size ofouter minimization is set to ηt = η = min(1∕L,，△/Lσ2T). Then
+the output of Algorithm 1 satisfies:
+T XE[|VLDR)||2] ≤ 20"→ Lθx(TMLxθ + G)2,
+(11)
+where L = Lθθ + L2χμθ Lθx
+Our result provides a formal convergence rate of ConAdv and it can converge to a first-order sta-
+tionary point at a sublinear rate up to a
+practice we use the smallest delay τ =
+precision of Lθx (τMLμxθ
++
+which is related to τ . In
+1 as discussed in the previous subsection.
+4	Experimental Results
+4.1	Experimental Setup
+Architectures and Datasets. We select ResNet as our default architectures. More specially, we use
+the mid-weight version (ResNet-50) to evaluate the performance of our proposed algorithm. The
+dataset we used in this paper is ImageNet-1k, which consists of 1.28 million images for training and
+50k images for testing. The convergence baseline of ResNet-50 in MLPerf is 75.9% top-1 accuracy
+in 90 epochs (i.e. ResNet-50 version 1.5 (Goyal et al., 2017)).
+Implementation Details. We use TPU-v3 for all our experiments and the same setting as the base-
+line. We consider 90-epoch training for ResNet-50. For data augmentation, we mainly consider
+AutoAug (AA). In addition, we use LARS (You et al., 2017) to train all the models. Finally, for
+adversarial training, we always use 1-step PGD attack with random initialization.
+(a) ResNet-50
+Figure 4: (a): throughput on scaling up batch size for ResNet-50, (b): throughtput when the number
+of processors reach the limit that each batch size can use for ResNet-50 .
+4.2	ImageNet Training with ResNet
+We train ResNet-50 with ConAdv and compare it with vanilla training and DisAdv. The exper-
+imental results of scaling up batch size in Table 1 illustrates that ConAdv can obtain the similar
+7
+Published as a conference paper at ICLR 2022
+accuracy compared with DisAdv and meanwhile speed up the training process. More specially, we
+can find that the top-1 accuracy of all methods are stable when the batch size is increased from 4k
+to 32k. After that, the performance starts to drop, which illustrates the bottleneck of large-batch
+training. However, ConAdv can improve the top-1 accuracy and the improved performance is stable
+as DisAdv does when the batch size reaches the bottleneck (such as 32k, 64k, 96k), but AutoAug
+gradually reaches its limitations. For instance, the top-1 accuracy increases from 74.3 to 75.3 when
+using ConAdv with a batch size of 96k and improved accuracy is 0.7%, 0.9% and 1.0% for 32k,
+64k and 96k. However, AutoAug cannot further improve the top-1 accuracy when the batch size
+is 96k. The above results illustrate that adversarial learning can successfully maintain a good test
+performance in the large-batch training setting and can outperform data augmentation.
+Table 1: Top-1 accuracy for ResNet-50 on ImageNet
+Method	1k	4k	8k	16k	32k	64k	96k
+ResNet-50	76.9	76.9	76.6	76.6	76.6	75.3	74.3
+ResNet-50+AA	77.5	77.5	77.4	77.1	76.9	75.6	74.3
+ResNet-50+DisAdv	77.4	77.4	77.4	77.4	77.3	76.2	75.3
+ResNet-50+ConAdv	77.4	77.4	77.4	77.4	77.3	76.2	75.3
+In addition, Figure 4(a) presents the throughput (images/ms) on scaling up batch size. We can
+observe that ConAdv can further increase throughput and accelerate the training process. To obtain
+accurate statistics of BatchNorm, we need to make sure each worker has at least 64 examples to
+calculate them (Normal Setting). Thus, the number of cores is [Batch Size / 64]. For example,
+we use TPU v3-256 to train DisAdv when batch size is 32k, which has 512 cores (32k/64=512).
+As shown in Figure 4(a), the throughput of DisAdv increases from 10.3 on 4k to 81.7 on 32k and
+CondAdv achieve about 1.5x speedup compared with DisAdv, which verifies our proposed ConAdv
+can maintain the accuracy of large-batch training and meanwhile accelerate the training process.
+To simulate the speedup when the number of workers reach the limit that each Batch Size can use,
+we use a large enough distributed system to train the model with the batch size of 512, 1k and 2k
+on TPU v3-128, TPU v3-256 and TPU v3-512 , respectively. The result is shown in Figure 4(b), we
+can obtain that ConAdv can achieve about 2x speedup compared with DisAdv. Furthermore, in this
+scenario we can observe ConAdv can achieve the similar throughput as Baseline (vanilla ResNet-50
+training). For example, compared with DisAdv, the throughput increases from 36.1 to 71.3 when
+using ConAdv with a batch size of 2k. In addition, the throughput is 75.7, which illustrates that
+ConAdv can achieve a similar speed as baseline. However, ConAdv can expand to larger batch size
+than baseline. Therefore, ConAdv can further accelerate the training of deep neural network.
+4.3	ImageNet Training with Data Augmentation
+To explore the limit of our method and evaluate whether adversarial learning can be combined with
+data augmentation for large-batch training, we further apply data augmentation into the proposed
+adversarial learning algorithm and the results are shown in Table 2. We can find that ConAdv can
+further improve the performance of large-batch training on ImageNet when combined with Autoaug
+(AA). Under this setting, we can expand the batch size to more than 96k, which can improve the
+algorithm efficiency and meanwhile benefit the machine utilization. For instance, for ResNet, the
+top-1 accuracy increases from 74.3 to 76.2 under 96k when using ConAdv and AutoAug.
+Table 2: Top-1 accuracy with AutoAug on ImageNet
+Method	1k	4k	8k	16k	32k	64k	96k
+ResNet-50	76.9	76.9	76.6	76.6	76.6	75.3	74.3
+ResNet-50+AA	77.5	77.5	77.4	77.1	76.9	75.6	74.3
+ResNet-50+ConAdv+AA	78.5	78.5	78.5	78.5	78.3	77.3	76.2
+4.4	Training Time
+The wall clock training times for ResNet-50 are shown in Table 3. We can find that the training time
+gradually decreases with batch size increasing. For example, the training time of ConAdv decreases
+8
+Published as a conference paper at ICLR 2022
+from 1277s to 227s when scale the batch size
+from 16k to 64k. In addition, we can find that
+DisAdv need about 1.5x training time compared
+with vanilla ResNet-50 but ConAdv can effi-
+ciently reduce the training of DisAdv to a level
+similar to vanilla ResNet. For instance, the train-
+ing time of DisAdv is reduced from 1191s to
+677s when using ConAdv. Noted that we don’t
+Table 3: Training Time Analysis
+Method	16k	32k	64k
+ResNet-50	1194s	622s	/
+DisAdv	1657s	1191s	592s
+ConAdv	1277s	677s	227s
+report the clock time for vanilla ResNet-50 at 64k since the top-1 accuracy is below the MLPerf
+standard 75.9%. The number of machines required to measure the maximum speed at 96K exceeds
+our current resources. The comparison on 32k and 64k also can evaluate the runtime improvement.
+4.5	Generalization Gap
+To the best of our knowledge, theoretical analysis of generalization errors in large-batch setting is
+still an open problem. However, we empirically found that our method can successfully reduce
+the generalization gap in large-batch training. The experimental results in Table 4 indicate that
+ConAdv can narrow the generalization gap. For example, the generalization gap is 4.6 for vanilla
+ResNet-50 at 96k and ConAdv narrows the gap to 2.7. In addition, combining ConAdv with
+AutoAug, the training accuracy and test accuracy can further increase and meanwhile maintain the
+similar generalization gap.
+Table 4: Generalization Gap of Large-Batch Training on ImageNet-1k
+	16k	Vanilla ResNet-50		96k	ConAdv				ConAdv + AA			
+		32k	64k		16k	32k	64k	96k	16k	32k	64k	96k
+Training Accuracy	81.4	82.5	79.6	78.9	80.3	80.8	78.2	78.0	81.6	81.7	79.6	78.4
+Test Accuracy	76.6	76.6	75.3	74.3	77.4	77.3	76.2	75.3	78.5	78.3	77.3	76.2
+Generalization GaP	4.8	5.9	4.3	4.6	2.9	3.5	2.0	2.7	3.1	3.4	2.3	2.2
+4.6	Analysis of Adversarial perturbation
+Adversarial learning calculates an adversarial perturbation on input data to smooth the decision
+boundary and help the model converge to the flat minima. In this section, we analyze the effects of
+different perturbation values for the performance of large-batch training on ImageNet. The analysis
+results are illustrated in Table 5. It presents that we should increase the attack intensity as the batch
+size increasing. For example, the best attack perturbation value increases from 3 (32k) to 7 (96k)
+for ResNet-50 and from 8 (16k) to 12 (64k). In addition, we should increase the perturbation value
+when using data augmentation. For example, the perturbation value should be 3 for the original
+ResNet-50 but be 5 when data augmentation is applied.
+Table 5: Experiment Results (Top-1 Accuracy) when useing Different Adversarial Perturbation.
+Method	Batch Size	P=0	P=1	P=2	P=3	P=4	P=5	P=6	P=7	P=8	P=9	P=10	P=12
+ResNet-50 + ConAdv	32K	76.8	77.2	77.3	77.4	77.3	77.3	77.3	77.3	77.3	77.3	77.2	77.2
+ResNet-50 + ConAdv + AA	32K	77.8	78.0	78.1	78.1	78.0	78.3	78.2	78.2	78.2	78.2	78.2	78.1
+ResNet-50 + ConAdv	64K	75.7	76.2	76.3	76.3	76.4	76.7	76.4	76.4	76.4	76.4	76.4	76.3
+ResNet-50 + ConAdv + AA	64K	76.8	77.0	76.8	77.0	77.1	77.1	77.2	77.4	77.2	77.1	77.1	77.1
+ResNet-50 + ConAdv	96K	74.6	75.1	75.1	75.1	75.3	75.1	75.1	75.1	75.3	75.2	75.1	75.1
+ResNet-50 + ConAdv + AA	96K	75.8	75.9	75.8	76.0	76.0	76.0	76.0	76.1	76.2	76.2	76.0	76.0
+5	Conclusions
+We firstly analyze the effect of data augmentation for large-batch training and propose a novel dis-
+tributed adversarial learning algorithm to scale to a larger batch size. To reduce the overhead of
+adversarial learning, we further propose a novel concurrent adversarial learning to decouple the
+two sequential gradient computations in adversarial learning. We evaluate our proposed method
+on ResNet. The experimental results show that our proposed method is beneficial for large-batch
+training.
+9
+Published as a conference paper at ICLR 2022
+6	Acknowledgements
+We thank Google TFRC for supporting us to get access to the Cloud TPUs. We thank CSCS (Swiss
+National Supercomputing Centre) for supporting us to get access to the Piz Daint supercomputer. We
+thank TACC (Texas Advanced Computing Center) for supporting us to get access to the Longhorn
+supercomputer and the Frontera supercomputer. We thank LuxProvide (Luxembourg national super-
+computer HPC organization) for supporting us to get access to the MeluXina supercomputer. CJH
+and XC are partially supported by NSF under IIS-2008173, IIS-2048280 and by Army Research
+Laboratory under agreement number W911NF-20-2-0158.
+7	Ethics Statement
+We do not have any potential ethics issues in this paper. We hope to propose a novel distributed
+adversarial learning algorithm to accelerate large-batch training.
+8	Reproducibility Statement
+we list our main hyperparameters for large-batch training in Appendix A.4 (Table 6). For experimen-
+tal details, we introduce our experiment settings in section 4, such as the dataset, model architecture,
+data augmentation, optimizer and so on.
+References
+Takuya Akiba, Shuji Suzuki, and Keisuke Fukuda. Extremely large minibatch sgd: Training resnet-
+50 on imagenet in 15 minutes. arXiv preprint arXiv:1711.04325, 2017.
+Maksym Andriushchenko and Nicolas Flammarion. Understanding and improving fast adversarial
+training. In Advances in Neural Information Processing Systems, 2020.
+Maxim Berman, Herve Jegou, Andrea Vedaldi, Iasonas Kokkinos, and Matthijs Douze. Multigrain:
+a unified image embedding for classes and instances. arXiv preprint arXiv:1902.05509, 2019.
+Xiangning Chen, Cihang Xie, Mingxing Tan, Li Zhang, Cho-Jui Hsieh, and Boqing Gong. Robust
+and accurate object detection via adversarial learning. In Proceedings of the IEEE/CVF Confer-
+ence on Computer Vision and Pattern Recognition (CVPR), pp. 16622-16631, June 2021.
+Minhao Cheng, Zhe Gan, Yu Cheng, Shuohang Wang, Cho-Jui Hsieh, and Jingjing Liu. Adversarial
+masking: Towards understanding robustness trade-off for generalization, 2021. URL https:
+//openreview.net/forum?id=LNtTXJ9XXr.
+Valeriu Codreanu, Damian Podareanu, and Vikram Saletore. Scale out for large minibatch sgd:
+Residual network training on imagenet-1k with improved accuracy and reduced time to train.
+arXiv preprint arXiv:1711.04291, 2017.
+Ekin D. Cubuk, Barret Zoph, Dandelion Mane, Vijay Vasudevan, and Quoc V. Le. Autoaugment:
+Learning augmentation strategies from data. In IEEE Conference on Computer Vision and Pattern
+Recognition, 2019.
+J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and L. Fei-Fei. ImageNet: A Large-Scale Hierarchical
+Image Database. In IEEE Conference on Computer Vision and Pattern Recognition, 2009.
+Aditya Devarakonda, Maxim Naumov, and Michael Garland. Adabatch: Adaptive batch sizes for
+training deep neural networks. arXiv preprint arXiv:1712.02029, 2017.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: pre-training of
+deep bidirectional transformers for language understanding. In Jill Burstein, Christy Doran, and
+Thamar Solorio (eds.), Conference of the North American Chapter of the Association for Compu-
+tational Linguistics: Human Language Technologies, NAACL-HLT, 2019.
+10
+Published as a conference paper at ICLR 2022
+Ian Goodfellow, Jonathon Shlens, and Christian Szegedy. Explaining and harnessing adversarial
+examples. In International Conference on Learning Representations, 2015.
+Priya Goyal, Piotr Dollar, Ross Girshick, Pieter Noordhuis, LUkasz Wesolowski, AaPo Kyrola, An-
+drew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training imagenet
+in 1 hour. arXiv preprint arXiv:1706.02677, 2017.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. DeeP residual learning for image recog-
+nition. In IEEE Conference on Computer Vision and Pattern Recognition, 2016.
+Elad Hoffer, Itay Hubara, and Daniel Soudry. Train longer, generalize better: closing the general-
+ization gaP in large batch training of neural networks. arXiv preprint arXiv:1705.08741, 2017.
+Forrest N Iandola, Matthew W Moskewicz, Khalid Ashraf, and Kurt Keutzer. Firecaffe: near-
+linear acceleration of deeP neural network training on comPute clusters. In IEEE Conference on
+Computer Vision and Pattern Recognition, 2016.
+Xianyan Jia, Shutao Song, Wei He, Yangzihao Wang, Haidong Rong, Feihu Zhou, Liqiang Xie,
+Zhenyu Guo, Yuanzhou Yang, Liwei Yu, et al. Highly scalable deeP learning training system with
+mixed-Precision: Training imagenet in four minutes. arXiv preprint arXiv:1807.11205, 2018.
+Hamid Karimi, Tyler Derr, and Jiliang Tang. Characterizing the decision boundary of deeP neural
+networks. arXiv preprint arXiv:1912.11460, 2019.
+Nitish Shirish Keskar, Dheevatsa Mudigere, Jorge Nocedal, Mikhail Smelyanskiy, and Ping Tak Pe-
+ter Tang. On large-batch training for deeP learning: Generalization gaP and sharP minima. In
+International Conference on Learning Representations, 2017.
+Sameer Kumar, Yu Wang, Cliff Young, James Bradbury, Naveen Kumar, Dehao Chen, and Andy
+Swing. ExPloring the limits of concurrency in ml training on google tPus. Machine Learning and
+Systems, 2021.
+Jaeho Lee and Maxim Raginsky. Minimax statistical learning with wasserstein distances. arXiv
+preprint arXiv:1705.07815, 2017.
+Mu Li. Scaling distributed machine learning with system and algorithm co-design. PhD thesis, PhD
+thesis, Intel, 2017.
+Yong Liu, Siqi Mai, Xiangning Chen, Cho-Jui Hsieh, and Yang You. Towards efficient and scalable
+sharPness-aware minimization. arXiv preprint arXiv:2203.02714, 2022.
+Yuxuan Lou, Fuzhao Xue, Zangwei Zheng, and Yang You. SParse-mlP: A fully-mlP architecture
+with conditional comPutation. arXiv preprint arXiv:2109.02008, 2021.
+Aleksander Madry, Aleksandar Makelov, Ludwig Schmidt, Dimitris TsiPras, and Adrian Vladu.
+Towards deeP learning models resistant to adversarial attacks. arXiv preprint arXiv:1706.06083,
+2017.
+James Martens and Roger Grosse. OPtimizing neural networks with kronecker-factored aPProximate
+curvature. In International conference on machine learning. PMLR, 2015.
+Peter Mattson, Christine Cheng, Cody Coleman, Greg Diamos, Paulius Micikevicius, David Patter-
+son, Hanlin Tang, Gu-Yeon Wei, Peter Bailis, Victor Bittorf, et al. MlPerf training benchmark.
+arXiv preprint arXiv:1910.01500, 2019.
+Jieru Mei, Yucheng Han, Yutong Bai, Yixiao Zhang, Yingwei Li, Xianhang Li, Alan Yuille, and
+Cihang Xie. Fast advProP. In International Conference on Learning Representations, 2022. URL
+https://openreview.net/forum?id=hcoswsDHNAW.
+Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Jonathan Uesato, and Pascal Frossard. Robust-
+ness via curvature regularization, and vice versa. In IEEE Conference on Computer Vision and
+Pattern Recognition, 2019.
+11
+Published as a conference paper at ICLR 2022
+Kazuki Osawa, Yohei Tsuji, Yuichiro Ueno, Akira Naruse, Rio Yokota, and Satoshi Matsuoka.
+Second-order optimization method for large mini-batch: Training resnet-50 on imagenet in 35
+epochs. arXiv preprint arXiv:1811.12019, 2018.
+Nicolas Papernot, Patrick McDaniel, and Ian Goodfellow. Transferability in machine learning: from
+phenomena to black-box attacks using adversarial samples. arXiv preprint arXiv:1605.07277,
+2016.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+models are unsupervised multitask learners. OpenAI blog, 2019.
+Ali Shafahi, Mahyar Najibi, Amin Ghiasi, Zheng Xu, John Dickerson, Christoph Studer, Larry S
+Davis, Gavin Taylor, and Tom Goldstein. Adversarial training for free! arXiv preprint
+arXiv:1904.12843, 2019.
+Christopher J Shallue, Jaehoon Lee, Joseph Antognini, Jascha Sohl-Dickstein, Roy Frostig, and
+George E Dahl. Measuring the effects of data parallelism on neural network training. arXiv
+preprint arXiv:1811.03600, 2018.
+Aman Sinha, Hongseok Namkoong, and John Duchi. Certifiable distributional robustness with
+principled adversarial training. arXiv preprint arXiv:1710.10571, 2017.
+Samuel L Smith, Pieter-Jan Kindermans, Chris Ying, and Quoc V Le. Don’t decay the learning rate,
+increase the batch size. arXiv preprint arXiv:1711.00489, 2017.
+Yisen Wang, Xingjun Ma, James Bailey, Jinfeng Yi, Bowen Zhou, and Quanquan Gu. On the
+convergence and robustness of adversarial training. In ICML, volume 1, pp. 2, 2019.
+Eric Wong, Leslie Rice, and J Zico Kolter. Fast is better than free: Revisiting adversarial training.
+arXiv preprint arXiv:2001.03994, 2020.
+Cihang Xie, Mingxing Tan, Boqing Gong, Jiang Wang, Alan L Yuille, and Quoc V Le. Adversar-
+ial examples improve image recognition. In IEEE Conference on Computer Vision and Pattern
+Recognition, 2020.
+Fuzhao Xue, Ziji Shi, Futao Wei, Yuxuan Lou, Yong Liu, and Yang You. Go wider instead of deeper.
+arXiv preprint arXiv:2107.11817, 2021.
+Masafumi Yamazaki, Akihiko Kasagi, Akihiro Tabuchi, Takumi Honda, Masahiro Miwa, Naoto
+Fukumoto, Tsuguchika Tabaru, Atsushi Ike, and Kohta Nakashima. Yet another accelerated sgd:
+Resnet-50 training on imagenet in 74.7 seconds. arXiv preprint arXiv:1903.12650, 2019.
+Zhewei Yao, Amir Gholami, Daiyaan Arfeen, Richard Liaw, Joseph Gonzalez, Kurt Keutzer, and
+Michael Mahoney. Large batch size training of neural networks with adversarial training and
+second-order information. arXiv preprint arXiv:1810.01021, 2018a.
+Zhewei Yao, Amir Gholami, Qi Lei, Kurt Keutzer, and Michael W Mahoney. Hessian-based analysis
+of large batch training and robustness to adversaries. arXiv preprint arXiv:1802.08241, 2018b.
+Chris Ying, Sameer Kumar, Dehao Chen, Tao Wang, and Youlong Cheng. Image classification at
+supercomputer scale. arXiv preprint arXiv:1811.06992, 2018.
+Yang You, Igor Gitman, and Boris Ginsburg. Scaling sgd batch size to 32k for imagenet training.
+arXiv preprint arXiv:1708.03888, 2017.
+Yang You, Zhao Zhang, Cho-Jui Hsieh, James Demmel, and Kurt Keutzer. Imagenet training in
+minutes. In International Conference on Parallel Processing, 2018.
+Yang You, Jonathan Hseu, Chris Ying, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large-
+batch training for lstm and beyond. In Proceedings of the International Conference for High
+Performance Computing, Networking, Storage and Analysis, 2019.
+Dinghuai Zhang, Tianyuan Zhang, Yiping Lu, Zhanxing Zhu, and Bin Dong. You only propagate
+once: Accelerating adversarial training via maximal principle. arXiv preprint arXiv:1905.00877,
+2019.
+12
+Published as a conference paper at ICLR 2022
+A Appendix
+A.1 The proof of Lemma 1:
+This completes the proof. The proof is inspired by Sinha et al. (2017); Wang et al. (2019). Under
+Assumptions 1 and 2, we have
+kx↑(θt) - x↑(θt-τ )k
+≤ LXθ kθt - θt-τ k
+≤ xθη ητM
+μ μ
+(12)
+where χ↑(θt) and χ*(θt-τ) denote the adversarial example of Xi calculated by θt and stale weight
+θt-τ , respectively.
+Proof:
+According to Assumption 2, we have
+L(θt,x*(θt-τ)) ≤L(θt,χ*(θt)) + hVxL(θt,χ*(θt)),χ*(θt-τ) — x*(θt)i-
+μ kχ∙τ(θf)—χ*(θt)k2,	(13)
+≤L(θt,χ∏θt)) - 2 kχ*(θt-τ) — χ*(θt)k2
+In addition, we have
+L(θt,xi(θt)) ≤L(θt,x*(θt-τ)) + hVχL(θt,x1(θt-τ)),x*(θt) — xi(θt-τ)i —
+μ kχi(θt-τ κθt)k2	(14)
+Combining (13) and (14), we can obtain:
+μkx*(θt-τ) — x*(θt)k2 ≤ hVxL(θt,x*(θt)),x*(θt) — xi(θt-)i
+≤ hVχL(θt, x*(θt-τ)) — VχL(*, x*(θt-τ)), x*(θt) — x*(θt-τ)i
+≤ kVχL(θt,x*(θt-τ)) — VxL(θt-τ,x*(θt-τ))kkx*(θt) — xi(θt-τ)k
+≤ Lxθ kθt — θt-τ kkxi* (θt) — xi* (θt-τ)k
+(15)
+where the second inequality is due to hVxL(θt-τ, xi* (θt-τ)), xi* (θt) — xi* (θt-τ)i ≤ 0, the third
+inequality holds because CauchySchwarz inequality and the last inequality follows from Assumption
+1. Therefore,
+kx*(θt) - x*(θt-τ )k ≤ Lxθ kθt - θt-τ k
+μ
+≤ -xθk X ((θt-j+ι — Ot-j)k
+μ	j∈[1,τ ]
+≤ Lθk X ηgt-j(Xi))k
+μ	j∈[1,τ ]
+≤ ^xθ ητM
+_ μ
+(16)
+where the second inequality follows the calculation of delayed weight, the third inequality holds
+because the difference of weights is calculated with gradient gt-(j ∈ [1,τ]) and the last inequality
+holds follows Assumption 3.
+13
+Published as a conference paper at ICLR 2022
+Thus,
+E(θt)F*)k≤ LXθητM
+(17)
+This completes the proof.
+A.2
+Lemma 2. Under Assumptions 1 and 2, we have LD (θ) is L-Smooth where L = Lqq + LxθLeX,
+i.e., for any θ1 and θ2, we can say
+kVeLd(θt) - ReLD(θt-τ)k ≤ L∣∣θt - θ-∣∣	(18)
+LD (θt) = LD (θt-τ ) + hLD (θt-τ ), θt - θt-τ i +  -kθt - θt-τk	(19)
+t-τ
+Proof:
+Based on Lemma 1, we can obtain:
+kx*(θt) - x*(θt-τ)k ≤ Lxθkθt - θt-τk	(20)
+μ
+We can obtain for i ∈ [n]:
+kVeL(θt,χ*(θt)) -VeL(θt-τ,x*(θt-τ))k
+≤∣∣VeL(θt,χJ;(θt))-VeL(θt,χJ;(θt-τ ))k
++ kVeL(%"(θt-τ))- VeL(θ-"(θt-τ))k
+≤Leekθt - θt-τk + LeXllw(θt) - x↑(θt-τ)k
+≤Leekθt - θt-τk + Lex,—— kθt - θt-τk
+μ
+二(Lee + Lθx~X~)kθt - θt-τk
+μ
+(21)
+where the second inequality holds because Assumption 1, the third inequality holds follows Lemma
+1.
+Therefore,
+1n
+IlVLD(θt) -VLd(θt-τ)k2 ≤ k苏£(VeL(θt,xi)+ VeL(θt,χ*(θt)))
+n i=1
+1n
+-2n	(VeL(Ot-T, xi) + ReL(Ot-T, χ↑(θt-τ)))k
+1n
+≤ ʒ- V2 kVeL(θt,xi) - VeL(θt-τ, xi)k
+2n i=1
+(22)
+1n
++ 2n E kVeL(θt, x*(θt)) - VeL(θt-τ, W(θt-T))k
+n i=1
+≤ KLeekθt - θt-τk + 3(Lee + Lex~X~)kθt - θt-τk
+2	2	μ
+=(Lee + ^LLeX)kθt - θt-τk
+2μ
+This completes the proof.
+14
+Published as a conference paper at ICLR 2022
+A.3
+Lemma 3. Let xi(θt) be the λ-solution of x↑(θt)： hχ↑(θt) 一 Xi(θt), VxL(θt, Xi(θt))i ≤ λ. Under
+Assumptions 1 and 2, for the concurrent stochastic gradient ^(θ), we have
+W 一 g(θt-τ )k≤ ? Vλ
+(23)
+Proof:
+l∣g(θt) - g(θt-τ)∣∣ = Il2B X (vθL(θt,xi)+ vθc(θt,x*i (θt))
+1	1 i∈∣B∣
+-(VθL(θt,Xi)+ VθL(θt,Xi(θt-τ )))k
+=k焉 X (VθL(θt,x*(θt)) -VθL(θt,Xi(θt-τ)))k
+1	1 i∈∣B∣
+≤ 2B X ∣VθL(θt,xi(θt)) -VθL(θt,Xi(θt-τ))k
+1	1 i∈∣B∣
+≤ 焉 X LθχIlW(θt) - Xi(θt-τ)k
+1	1 i∈∣B∣
+= 2⅛τ X LθχIIw(θt) - xi(θt-τ) + W(θt-τ) - Xi(θt-τ)k
+1	1 i∈∣B∣
+≤ 焉 X (Lθxkχi(θt) - xi(θt-τ)k + Lθχ∣xi(θt-τ) - Xi(θt-τ)k)
+1	1 i∈∣B∣
+=焉 X (Lθχ3(θt) -χi(θt-τ)1 + Lθx3(θt-τ) - Xi(θt-τ)k)
+1	1 i∈∣B∣
+≤ xrjj∖ X (LθxητM-^θ + Lθx∣∣χi(θt-τ) - Xi(Bt-T)∣∣)
+21B1 不	μ
+(24)
+Let Xi(θt-τ) be the λ-approximate of Xi (θt-τ), We can obtain:
+hχi(θt-τ) - Xi(θt-τ), VθL(θt-τ； Xi(θt-τ))〉≤ δ	(25)
+In addition, We can obtain:
+hXi(θt-τ) - Xi(θt-τ), VχL(θt-τ,x：(θt-τ)) ≤ 0	(26)
+Combining 25 and 26, we have:
+hχi(θt-τ) - Xi(θt-τ), VθL(θt-τ； Xi(θt-τ)) -VχL(θt-τ,X：(θt-τ))〉≤ λ (27)
+Based on Assumption 2, we have
+“∣xi(θt-τ) -Xi(θt-τ)k2 ≤ hVχL(θt-τ,xi(θt-τ)) -VχL(θt-τ,Xi(θt-τ),Xi -Xi(θt-τ)))(28)
+Combining 28 with 27, we can obtain:
+μ∣Xi(θt-τ) - X(θt-τ)k2 ≤ λ	(29)
+15
+Published as a conference paper at ICLR 2022
+Therefore, we have
+kx*(θt-τ) - X(θt-τ)k
+≤ μi-
+(30)
+Thus, we can obtain
+kg(θt) - g(θt-τ)k≤ Lθx5TMiLx + Vλ)
+(31)
+This completes the proof.
+A.3 The proof of Theorem 1:
+Suppose Assumptions 1, 2, 3 and 4 hold. Let ∆ = LD(θo) - min& LD(θ), NLD(θt) 二
+2n Pn=1(VL(θt, Xi, yi) + VL(θt, Xlyi)). If the step size of outer minimization is set to η 二
+η = min(1∕L,，△/Lσ2T), where L = Lθθ + LχθLθχ. Then the output of Algorithm 1 satisfies:
+T Tl E[kvLD (θt )k2] ≤ 20 冷+Lθχ (τMLχθ+μι )2	2
+where L = (MLθχLχθ/eμ + Lθθ).
+Proof:
+LD (θt+l) ≤ LD (θt) + hvLD (θt), θt+1 - θti + 2 kθt+1 - θtk2
+Lη2
+=LD (θt) - ηkvLD (θt)∣∣ +--2 llg(θt)k2 + InhVLD (θt), vLD (θt) - g(θt)i
+=LD(θt) - n(1 - ʒn)kvLD(θt)∣∣2 + n(1 - Ln)(VLD(θt), VLD(θt) - g(θt)i
++ -ɪ llg(θt) - VLD (θt)k2
+=Ld(θt) - n(1 - Ln)∣VLd(θt)k2 + n(1 - LQBLd(θt), g(θt) - g(θt)i
+Ln2
++ n(1 - Ln)(VLD(θt), vld(θt) - g(θt)i +—2-kg(θt) - g(θt) + g(θt) - vld(θt)k
+≤ Ld(θt) - 2∣VLd(θt)k2 + 2(1 - Ln)kg(θt) - g(θt)k2
++ n(1 - Ln)(VLD(θt), VLd(θt) - g(θt)i + Ln2(∣g(θt) - g(θ)k2 + kg(θt) - VLd(θt)∣2)
+=Ld(θt) - 2||VLd(θt)k2 + 2(1 + Ln)kg(θt) - g(θt)k2
++ n(1 - Ln)(VLD(θt), VLD(θt) - g(θt)i + Ln2lg(θt) -VLD(θt)l22)
+(33)
+Taking expectation on both sides of the above inequality conditioned on θt, we can obtain:
+16
+Published as a conference paper at ICLR 2022
+E[LD(θt+ι) - LD(θt)lθt] ≤ -η||VLDR)Il2 + η(I + Ln)(2θx(ητMxθs+ + ∖ -))2 + Lη2σ2
+2	2	2	μ μ μ
+=-n kVLD (θt)k2 + n (1 + Ln)(Lθx(nτMLxθ + ʌλ) ))2 + Ln2σ2
+2	8	μ μ μ
+=-nkvLD (θt)k2 + n ?x (1 + Ln)(nτ M —xθ + ʌ/ɪ)2 + Ln2σ2
+2	8	μ V μ
+(34)
+where we used the fact that E[g(θt)] = VLD(θt), Assumption 2, Lemma 2 and Lemma 3. Taking
+the sum of (34) over t = 0, ..., T - 1, we obtain that:
+T-1	T-1 L2	LH T-1
+X ⅛[kvLD(θt)k2] ≤ E[LD(θo)-LD(θτ)]+X r^θx(1+Ln)(nτM~^x+ι∕-)2+L Xn2σ2
+t=0 2	t=0 8	μ V μ	t=0
+(35)
+Choose n = min(1∕L, JtM ) where ∆ = LD(θ0) — LD(θτ) and L = Lqq + L2χθLθx, We can
+show that:
+1
+T
+XIE[kVLD(θt)k2] ≤ 2σ芹+ ?(τMLμxθ
+(36)
+A.4 Hyperparameters
+Hyperparameters:
+More specially, our main hyperparameters are shown in Table 6.
+Table 6: Hyperparameters of ResNet-50 on ImageNet
+	32k	64k	96k
+Peak LR	35.0	41.0	43.0
+Epoch	90	90	90
+Weight Decay	5E-4	5E-4	5E-4
+Warmup	40	41	41
+LR decay	POLY	POLY	POLY
+Optimizer	LARS	LARS	LARS
+Momentum	0.9	0.9	0.9
+Label Smoothing	0.1	0.1	0.1
+17
