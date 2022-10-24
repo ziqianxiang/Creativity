@@ -1,0 +1,1984 @@
+﻿Published as a conference paper at ICLR 2022
+Pixelated Butterfly: Simple and Efficient Sparse
+Training for Neural Network Models
+Tri Dao** 1, Beidi Chen*1, Kaizhao Liang 2, Jiaming Yang 3, Zhao Song 4, Atri Rudra 5, Christopher Re 1
+1	Department of Computer Science, Stanford University
+2	SambaNova Systems, Inc
+3	Department of Probability and Statistics, Peking University
+4	Adobe Research
+5	Department of Computer Science and Engineering, University at Buffalo, The State University of New York
+{trid,beidic}@stanford.edu, kaizhao.liang@sambanovasystems.com,
+edwinyjmpku@gmail.com, zsong@adobe.com,
+atri@buffalo.edu, chrismre@cs.stanford.edu
+Abstract
+Overparameterized neural networks generalize well but are expensive to train. Ideally, one
+would like to reduce their computational cost while retaining their generalization benefits.
+Sparse model training is a simple and promising approach to achieve this, but there
+remain challenges as existing methods struggle with accuracy loss, slow training runtime,
+or difficulty in sparsifying all model components. The core problem is that searching
+for a sparsity mask over a discrete set of sparse matrices is difficult and expensive. To
+address this, our main insight is to optimize over a continuous superset of sparse matrices
+with a fixed structure known as products of butterfly matrices. As butterfly matrices are
+not hardware efficient, we propose simple variants of butterfly (block and flat) to take
+advantage of modern hardware. Our method (Pixelated Butterfly) uses a simple fixed
+sparsity pattern based on flat block butterfly and low-rank matrices to sparsify most
+network layers (e.g., attention, MLP). We empirically validate that Pixelated Butterfly
+is 3× faster than butterfly and speeds UP training to achieve favorable accuracy-efficiency
+tradeoffs. On the ImageNet classification and WikiText-103 language modeling tasks,
+our sparse models train up to 2.5× faster than the dense MLP-Mixer, Vision Transformer,
+and GPT-2 medium with no drop in accuracy.
+1	Introduction
+Recent results suggest that overparameterized neural networks generalize well (Belkin et al., 2019), but
+they are expensive to train (Kaplan et al., 2020). An ideal model should use less compute and memory
+while retaining the generalization benefits of large models. The simplest and most popular direction is to
+sparsify these models. This idea has a long history in machine learning (LeCun et al., 1990) and has driven
+fundamental progress in other fields such as statistics (Tibshirani, 1996), neuroscience (Foldiak, 2003), and
+signal processing (Candes et al., 2006). However, despite significant efforts, speeding up sparse training
+in wall-clock time without degrading accuracy remains an unresolved problem.
+While sparse training is an active research area, it has not seen wide adoption. First, it is difficult and expensive
+to find the sparsity pattern (the possible locations of the nonzeros) that could maintain the same level of
+accuracy of dense models. Many methods (pruning (Lee et al., 2018), lottery tickets (Frankle and Carbin, 2018),
+hashing (Kitaev et al., 2020)) maintain dynamic sparsity masks. However, the large overhead of evolving the
+sparsity mask can significantly slow down training and complicate the implementation. Indeed, these methods
+either require long cycles of pruning and retraining (Frankle and Carbin, 2018)1 or maintain expensive hash
+tables (Chen et al., 2019). Second, most existing methods adopt unstructured sparsity, which may be efficient
+in theory, but do not take into account the efficiency of training hardware such as GPUs (optimized for dense
+computation)2. Finally, most methods target a single type of operation such as attention (Child et al., 2019;
+Zaheer et al., 2020), whereas neural network (NN) models often compose different modules (attention, MLP),
+and in many applications the MLP layers are the main training bottleneck (Wu et al., 2020).
+* Equal contribution. Order determined by coin flip.
+1State-of-the-art sparse training methods require up to 5× more training epochs compared to dense models (Evci et al.,
+2020)
+2An unstructured sparse model with 1% nonzero weights can be as slow as a dense model (Hooker, 2020)
+1
+Published as a conference paper at ICLR 2022
+Model Schema J j Pixelated Butterfly	Sparse Masks
+Figure 1: Pixelfly targets GEMM-based networks (networks whose computation is dominated by matrix multiply), which
+it views as a series of matrix multiplication. For each matrix multiply from Model Schema, it (1) allocates compute
+budget based on dimension and layer type, (2) the budget decides a mapping (hyper-parameter) to our proposed flat block
+butterfly sparsity patterns, (3) outputs a hardware-aware sparse mask. Note since the hardware is a block device, one
+memory access to an element in a block leads to the access to the full block.
+A better sparse training method should (i) be simple yet accurate, ideally with a static sparsity pattern, (ii) be fast
+by aligning sparsity pattern with available hardware, and (iii) have wide coverage of operators that applies to
+most NN layers. There are three technical challenges. First, we show that given a budget (e.g., total non-zeros
+in a matrix), it is NP-hard to find the optimal static sparsity pattern for a NN module to minimize the approx-
+imation error to the dense model. Second, for each sparsity pattern, we need to take into account hardware
+block-oriented efficiency (accessing each element in memory takes the same time as accessing the block of ad-
+jacent elements (Cook, 2012), illustrated in Fig. 2). Common theoretical measures of efficiency (e.g., number
+of non-zeros, FLOPs) do not map well to modern hardware designed for block computation. Last, every dif-
+ferent NN module might require different sparsity patterns, which makes the problem even more complicated.
+In our early exploration, we empirically study many sparsity patterns proposed in the literature to find
+those patterns that can closely approximate the dense model (Details in Appendix K). We found that one
+sparsity pattern, namely butterfly + low-rank, consistently outperforms the others. This sparsity pattern closely
+connects to two lines of work in matrix structures: (i) sparse + low-rank matrices, which can capture global
+and local information (Candes et al., 2011; Udell and Townsend, 2019; Chen et al., 2021), and (ii) butterfly
+matrices (Parker, 1995; Dao et al., 2019) whose products can tightly represent any sparse matrix (De Sa
+et al., 2018; Dao et al., 2020). Using the fixed sparsity pattern from butterfly matrices, with the addition
+of a low-rank term, would address two of the three challenges above and yield a simple way to sparsify most
+NN layers (that are based on matrix multiply).
+However, butterfly matrices are inefficient on modern hardware: (i) they are difficult to parallelize as they
+contain sequential products of many factors, and (ii) they are not hardware-friendly because the sparsity
+patterns are not block-aligned. We propose two simple changes to make Butterfly efficient while retaining
+their favorable properties. Our proposal, Pixelated Butterfly (Pixelfly), combines flat block butterfly and
+low-rank matrices to yield a simple and efficient sparse training method.
+•	We design an extremely simple sparsity pattern inspired by butterfly + low-rank matrices, which takes
+into account the hardware’s block-oriented efficiency. We propose block butterfly matrices that are
+efficient as their sparsity patterns align with hardware blocks. We then introduce flat butterfly, a first-order
+approximation of butterfly with residual connection, that turns the original product of factors into a sum.
+Flat butterfly matrix multiplications are easy to parallelize. Pixelfly, uses the fixed sparsity pattern from
+flat & block butterfly, along with a low-rank term, to produce a sparse network.
+•	We prove that block butterfly retains the expressiveness of butterfly matrices and can thus tightly capture
+sparse matrices. We show that flat butterfly matrices can closely approximate large classes of matrices
+that butterfly matrices capture. Moreover, we demonstrate that flat block butterfly + low-rank matrices are
+strictly more expressive than sparse or low-rank matrices alone. Finally, leveraging the recent advance in
+the neural tangent kernel (NTK), we adapt existing techniques to prove the global convergence of gradient
+descent on training sparse and wide ReLU networks.
+•	Our proposed Pixelfly can be applied to all network modules that rely on matrix multiplication (e.g., linear
+layer, attention, MLP). To sparsify a full network, we simply need to allocate compute budget for each
+layer based on matrix and hardware block size.
+We empirically validate that Pixelfly can speed up the training of models (Transformers, ViT, MLP-Mixer)
+without quality drop compared to baselines on a wide range of domains and tasks. On CIFAR10/100 &
+ImageNet classification, Pixelfly achieve 2.3× training time speedup compared to dense ViT, MLP-Mixer
+models, and other sparse training baselines, while preserving the same accuracy. On the WikiText-103
+language modeling task, we speed up GPT-2 Medium training by 2.5× and achieve the same perplexity. On
+the Long Range Arena benchmark, we maintain the same accuracy as Transformer with 5.2× faster training
+than a dense model, 2× faster than Sparse transformer, and 6× faster than non-block-aligned sparse methods
+2
+Published as a conference paper at ICLR 2022
+(Reformer). Our ablation studies highlight the importance of each of our components: our butterfly sparsity
+improves on existing hand-crafted patterns by up to 2% of accuracy on ImageNet, our hardware-aware
+block-sparsity yields up to 5 × speedup, and the balanced compute budget allocation brings 2× speedup
+compared to baselines that only sparsify attention.3
+2	Problem Setting
+We first define the problem as sparse matrix approximation with a simple hardware cost model. Then we
+briefly introduce butterfly and sparse + low-rank matrices.
+Problem Formulation: We focus on the training of GEMM-based models,
+which can be viewed as a series of matrix multiplies (Given A, B ∈ Rn×d,
+compute C=ABT). Speeding up training while maintaining model quality can
+be mapped to finding an approximation procedure f which reduces the time
+T of computing C while minimizing error E[kf (A,B) -ABT k2F]. Since the
+hardware is a block device, accessing any individual element within a block of
+memory is the same as accessing the full block (Cook, 2012) (Fig. 2). A simple
+cost model of T on hardware with block size b would depend on the number of
+b-blocks being accessed and compute time (formal definition in Appendix A).
+Our experiment (Appendix L.5) reveals that when the non-zeros are grouped
+Memory Access
+Figure 2: Visualization of
+memory access for a hardware
+with block size 4: accessing
+the one (red) location means
+accessing the full 4 × 4 block
+(blue).
+into blocks, picking the smallest block size supported by hardware can speed up operations by 10× compared
+to sparsity patterns that are not block-aligned.
+Butterfly, Sparse + Low-rank Matrices: Butterfly matrices have been used in numerical linear alge-
+bra (Parker, 1995; Li et al., 2015) and machine learning (Mathieu and LeCun, 2014; Jing et al., 2017;
+Munkhoeva et al., 2018; Dao et al., 2019; Choromanski et al., 2019). They encode the recursive divide-and-
+conquer structure of the fast Fourier transform (FFT) algorithm (Cooley and Tukey, 1965) and provably
+capture any sparse matrix with near-optimal space and time complexity. Sparse and Low-rank structures
+have been studied in Robust PCA (Candes et al., 2011), graph clustering (Jalali et al., 2011), and co-variance
+estimation (Luo, 2011). Recently it has been adopted in attention approximation for Transformers (Chen et al.,
+2021).
+3	Butterfly matrices and Pixelated Butterfly
+Butterfly matrices (Parker, 1995; Dao et al., 2019) are expressive and theoretically efficient. As they contain
+the set of sparse matrices, we choose to search for the sparsity pattern in this larger class due to their fixed
+sparsity structure. However, there are three technical challenges. We highlight them here along with our
+approaches to address them:
+1.	Slow speed: butterfly matrices are not friendly to modern hardware as their sparsity patterns are not
+block-aligned, thus are slow. We introduce a variant of butterfly matrices, block butterfly, which operate at
+the block level, yielding a block-aligned sparsity pattern.
+2.	Difficulty of parallelization: the sequential nature of butterfly matrices as products of many factors makes
+it hard to parallelize the multiplication. We propose another class of matrices, flat butterfly matrices, that
+are the first-order approximation of butterfly with residual connections. Flat butterfly turns the product of
+factors into a sum, facilitating parallelization.
+3.	Reduced expressiveness of flat butterfly: even though flat butterfly matrices can approximate butterfly
+matrices with residual connections, they are necessarily high-rank and cannot represent low-rank matri-
+ces (Udell and Townsend, 2019). We propose to add a low-rank matrix (that is also block-aligned) to flat
+butterfly to increase their expressiveness.
+Combining these three approaches (flat & block butterfly + low-rank), our proposal (Pixelated Butterfly) is a
+very simple method to train sparse networks.
+3.1	Block Butterfly Matrices
+We propose a block version of butterfly matrices, which is more hardware-friendly than the regular butterfly.
+The regular butterfly matrices Dao et al. (2019; 2020) will be a special case of block butterfly with block size
+b= 1. We omit b in the notation if b= 1.
+3Pixelfly code is available at https://github.com/HazyResearch/pixelfly
+3
+Published as a conference paper at ICLR 2022
+Λ
+Butterfly
+Block Butterfly
+√
+Figure 3: Visualization of Flat, Block, and Flat Block butterfly.
+Λ
+
+Definition 3.1. A block butterfly factor (denoted as Bk,b) of size kb (where k≥2) and block size b is a matrix
+oftheform Bk,b = DI D2 where each Di is a 2 × 2 block diagonal matrix ofblock size b oftheform
+diag Di,1,...,Di,k/2 where Di,j ∈ Rb×b. We restrict k to be a power of2.
+Definition 3.2. A block butterfly factor matrix (denoted as B(kn,b)) of size nb with stride k and block size b is
+a block diagonal matrix of n (possibly different) butterfly factors ofsize kb and block size b:
+Bk%b)=diag([Bk,b]1,[Bk,b]2,…,[Bk,b] n)
+Definition 3.3. A block butterfly matrix of size nb with block size b (denoted as B(n,b)) is a matrix that can
+be expressed as a product ofbutterflyfactor matrices: B(n,b) = B(n,"B(n,"…B2n'b). Define Bb as the set of
+all matrices that can be expressed in the form B(n,b) (for some n).
+3.2	Flat butterfly matrices
+In most applications of butterfly matrices to neural networks, one multiplies the O(logn) butterfly factors.
+However, this operation is hard to be efficiently implemented on parallel hardware (e.g., GPUs) due to the
+sequential nature of the operation4. We instead propose to use a sum of butterfly factors that can approximate
+the products of the factors. This sum of factors results in one sparse matrix with a fixed sparsity pattern, which
+yields up to 3× faster multiplication on GPUs (Appendix J).
+Residual connections have been proposed to connect the butterfly factors (Vahid et al., 2020). We show that
+residual products of butterfly matrices have a first-order approximation as a sparse matrix with a fixed sparsity.
+Let M be a matrix in the set of butterfly matrices B. In residual form, for some λ ∈ R:
+M = (I +λB^)(I+λBn∕2)...(I+λB2n)).	(1)
+Note that this form can represent the same matrices in the class of butterfly matrices B, since any B(kn)
+contains the identity matrix I.
+Assuming that λis small, we can expand the residual and collect the terms5:
+M=I+λ(B2n)+B4n)+…+Bnn))+o (λ2).
+Definition 3.4. Flat butterfly matrices of maximum stride k (for k a power of 2) are those of the form
+I+λ(B2n)+B4n)+…+Bkn)).
+Flat butterfly matrices of maximum stride n are the first-order approximation of butterfly matrices in residual
+form (Eq. (1)). Notice that flat butterfly of maximum stride k are sparse matrices with O(nlogk) nonzeros
+with a fixed sparsity pattern, as illustrated in Fig. 3. We call this sparsity pattern the flat butterfly pattern.
+Flat block butterfly matrices are block versions of flat butterfly in Section 3.2 (shown in Fig. 3). We
+empirically validate that flat block butterfly matrices are up to 3× faster than block butterfly or regular
+butterfly (Appendix J).
+Since flat butterfly matrices approximate the residual form of butterfly matrices, they have high rank if λis
+small (Section 4). This is one of the motivations for the addition of the low-rank term in our method.
+4Even with a very specialized CUDA kernel, butterfly matrix multiply (O(nlogn) complexity) is only faster than
+dense matrix multiply (O(n2) complexity) for large values ofn (around 1024) (Dao et al., 2019).
+5We make the approximation rigorous in Section 4.
+4
+Published as a conference paper at ICLR 2022
+3.3	Pixelated Butterfly: Flat Block Butterfly + Low-rank for Efficient Sparse
+Training
+We present Pixelated Butterfly, an efficient sparse model with a simple and fixed sparsity pattern based on
+butterfly and low-rank matrices. Our method targets GEMM-based neural networks, which are networks
+whose computation is dominated by general matrix multiplies (GEMM), such as Transformer and MLP-Mixer.
+As a result, we can view the network as a series of matrix multiplies.
+Given a model schema (layer type, number of layers, matrix dimension) and a compute budget, Pixelated
+Butterfly has three steps: compute budget allocation per layer, sparsity mask selection from the flat butterfly
+pattern, and model sparsification. We describe these steps in more details:
+1.	Compute budget allocation: based on our cost model (Appendix A), given the layer type, number of
+layers, and matrix dimension, we can find the density (fraction of nonzero weights) of each layer type
+to minimize the projected compute cost. Continuing our goal for a simple method, we propose to use a
+simple rule of thumb: allocate sparsity compute budget proportional to the compute fraction of the layer.
+For example, if the MLP layer and attention layers are projected to takes 60% and 40% the compute time
+respectively, then allocate 60% of the sparsity compute budget to MLP and 40% to attention. We verify in
+Appendix I that this simple rule of thumb produces similar results to solving for the density from the cost
+model.
+2.	Sparsity mask selection: given a layer and a sparsity compute budget for that layer, we use one-quarter to
+one-third of the budget for the low-rank part as a simple rule of thumb. We pick the rank as a multiple of the
+smallest supported block size of the device (e.g., 32) so that the low-rank matrices are also block-aligned.
+The remaining compute budget is used to select the sparsity mask from the flat block butterfly sparsity
+pattern: we choose the butterfly block size as the smallest supported block size of the device (e.g., 32), and
+pick the maximum stride of the flat block butterfly (Definition 3.4) to fill up the budget.
+3.	Model sparsification: The resulting sparse model is simply a model whose weights or attention follow
+the fixed sparsity mask chosen in step 2, with the additional low-rank terms (rank also chosen in step 2).
+In particular, we parameterize each weight matrix6 as: W =γB+(1-γ)UV>, where B is a flat block
+butterfly matrix (which is sparse), UV> is the low-rank component, and γ is a learnable parameter. We
+train the model from scratch as usual.
+Our method is very simple, but competitive with more complicated procedures that search for the sparsity
+pattern (Appendix K). We expect more sophisticated techniques (dynamic sparsity, a better approximation of
+butterfly) to improve the accuracy of the method.
+4	Theoretical analysis
+We characterize the expressiveness of the matrices used in our method. In particular, we prove that block
+butterfly retains the expressiveness of butterfly, and that flat butterfly can accurately approximate the residual
+form of butterfly. Moreover, flat block butterfly + low-rank (an instance of sparse + low-rank) is more expres-
+sive than sparse or low-rank matrices alone. Finally, we analyze the training convergence and generalization
+of networks with sparse weights. All proofs are in the Appendix.
+4.1	Expressiveness of Block Butterfly
+We first prove the expressiveness of block butterfly matrices.
+Theorem 4.1. The set B2b of n×n block butterfly matrices with block size 2b contains the set Bb of n×n
+block butterfly matrices of block size b.
+By a recursive argument, the set of block butterfly matrices whose block size is a power of 2 contains the set
+of regular butterfly matrices.
+Dao et al. (2020) show that butterfly matrices can tightly represent all structured matrices, such as sparse
+matrices and many fast transforms. As a result, block butterfly matrices can also represent those structured
+matrices. In particular,
+Corollary 4.2. For any constant block size b that is a power of 2, any nb×nb spare matrix with s nonzeros
+can be written as products of block butterfly matrices with block size b and their transposes, with O(slogn)
+parameters.
+6We describe how to add sparse and low-rank for attention in Appendix I
+5
+Published as a conference paper at ICLR 2022
+4.2	Expressiveness of Flat Butterfly
+We now characterize how the flat butterfly matrices approximate butterfly matrices. In particular, assuming
+that each butterfly factor has bounded norm, we show that flat-butterfly matrices can accurately approximate
+the residual form of butterfly with error scaling as O(λ2).
+Theorem 4.3.	Let M be a matrix of the form in Definition 3.4 where k=n, with Bmax := maxiBi(n)
+and | λ ∣≤ IognB- for some constant 0 <c ≤ 2 and some e> 0. Then
+∣∣M -(i+λ(B2n)+B4n) + …+Bnn)))L ≤ e∙
+We show that flat butterfly matrices must have high-rank if λ is small. This is the motivation for the addition
+of the low-rank term in Pixelfly (Section 3).
+Theorem 4.4.	Let M be as in Eq. (1), with Bmax =maxi∣∣B(n) ∣∣ and ∣λ∣≤ on√— for some constant
+0 <c ≤ 1 and some e> 0. Let Bm∞ax = maxi IIBil ∣ ∞. Assuming Bm∞x ≤ Bmax. Then
+rank(I+λ(B2n) + …+Bnn))) = Ω
+2
+Bmax	logn
+Bma
+B∞a
+4.3	Expressiveness of Flat Block Butterfly + Low-rank
+Chen et al. (2021) prove that there is a natural class of input sequences (generated by a clustering process)
+whose attention matrix can only be approximated well by sparse + low-rank matrices, and not sparse or
+low-rank matrices alone. We adapt their technique to show a similar result for the class of matrices we use in
+Pixelfly.
+We require an extra assumption on the clustering process compared to Chen et al. (2021): the elements in the
+input sequence form clusters with the same size. Then their attention matrix will have a large block diagonal
+component well-approximated by flat butterfly, while the rest of the attention matrix is of medium size and is
+well-approximated by low-rank.
+Theorem 4.5 (Informal). There exists a class of input sequences whose attention matrices are well-
+approximated by flat block butterfly + low-rank (a special case of sparse + low-rank) but not by sparse or
+low-rank alone.
+The formal theorem statement and proof are in Appendix B.3.
+4.4	Convergence and Generalization of Sparse Networks
+There are natural questions about the training and generalization of sparse models: do they train similarly to
+dense models, is their generalization close to that of dense models, and can one successfully train them with
+gradient descent? Our analysis theoretically shows that the answers are yes.
+Our analysis relies on the neural tangent kernel (NTK) (Jacot et al., 2018) of the network. The NTK of
+two data points x and y measures the similarity between the gradient of the network when evaluated at x
+compared to the gradient when evaluated at y. This kernel governs the dynamics of the neural network output
+function f (∙,θ) throughout the training and its generalization. We build on the great literature of NTK (Li and
+Liang, 2018; Du et al., 2019; Allen-Zhu et al., 2019b). The standard result (Song and Yang, 2019) implies
+the following, if the NTK of the sparse model is close to the NTK of the dense model, then (i) their training
+convergence speed is similar, (ii) their generalization bounds are similar. For completeness, we state the formal
+result in Appendix F.
+Though this result does not capture the possible regularization effect of sparsity, it shows that sparse models
+with small NTK difference from dense NTK preserve the generalization ability of dense models, a subject
+that has been studied more extensively, both from empirical and from theoretical perspectives. We also show
+that training wide and sparse networks with gradient descent converges globally, similar to the result for wide
+dense networks (Du et al., 2019; Allen-Zhu et al., 2019b) in Appendix H.
+5 Experiments
+In this section, our goal is to demonstrate that an extremely simple fixed sparsity pattern can actually speed
+up sparse model training in wall-clock time without degrading model quality. Specifically, we empirically
+6
+Published as a conference paper at ICLR 2022
+validate three claims that suggest Pixelfly can improve training speed of different model architectures while
+retaining model quality on a wide range of domains and tasks.
+Figure 4: NTK Comparison with
+Dense Model.
+1.	Section 5.1: for image classification tasks, we first show the empirical NTK of flat block butterfly +
+low-rank sparsity pattern is closer to dense NKT than other baselines. Then We demonstrate our superior
+end-to-end performance. Specifically, we achieve training speed UP on both MLP-Mixer and ViT models
+by UP to 2.3× wall-clock time with no drop in accuracy compared to the dense model and up to 4×
+compared to RigL, BigBird and other sparse baselines.
+2.	Section 5.2: for language modeling and text classification tasks, we can speed up GPT-2 small dense model
+training by 2.1×, achieving a perplexity of 22.5 on wikitext-103. In addition, on Long Range Arena (LRA)
+benchmark, we maintain the same accuracy but have 5.2× speed-up in training.
+3.	Section 5.3: we show the necessity of block flat butterfly and low-rank structures, hardware-alignment and
+wide coverage of most network layers with ablation studies on these three components of Pixelfly.
+5.1	Image Classification
+We evaluate the quality and efficiency of Pixelfly through three metrics:
+(1) distance to training dynamic of the dense model: compare the distance
+between empirical NTK kernel7 of the models with candidate patterns,
+including BigBird (Zaheer et al., 2020), Butterfly (Dao et al., 2020), and
+that of the dense model, (2) upstream accuracy: compare the accuracy and
+training time of the Pixelfly, the dense counterpart, and other baselines
+on same image classification tasks, (3) downstream accuracy: compare
+the accuracy of our pretrained Pixelfly and dense model fine-tuned on
+downstream tasks (Appendix L.4). The empirical NTK of the model with
+flat block butterfly + low-rank, picked by Pixelfly, is closer to the NTK of
+the dense model. Pixelfly MLP-mixer and ViT models also retain the same top-1 accuracy of the original
+dense models while achieving up to 2.3 X speed up.
+Setup: We use three popular vision benchmarks, CIFAR-10/100 (Krizhevsky et al., 2009) and ImageNet (Deng
+et al., 2009). We choose recent popular Vision Transformer (Dosovitskiy et al., 2020), T2T-ViT (Yuan et al.,
+2021) and MLP-Mixer (Tolstikhin et al., 2021) as representative base models. Their major computation
+bottlenecks are in different components, e.g. MLP only, attention, or both so we can evaluate the end-to-end
+applicability of Pixelfly more clearly.
+Empirical NTK: To character-
+ize the training dynamic of the
+sparse networks, we compute the
+empirical NTK kernels for dense
+Vision Transformer on CIFAR-
+100. Then, we show the rela-
+tive differences between kernels
+of models with different sparsity
+patterns and that of the dense one
+in Fig. 4. Specifically, we pick
+a popular sparsity pattern com-
+bination - Bigbird pattern (Za-
+heer et al., 2020) for attention
+layer and random (magnitude-
+Figure 5: The performance of Pixelfly and ViT or MLP-Mixer on CIFAR10,
+CIFAR100 and ImageNet benchmarks. We measure the accuracy and the training
+time speedup (on ImageNet) compared to the dense model.
+Model	CIFAR10	CIFAR100	ImageNet	Speedup
+Mixer-S/16	86.4	58.7	72.4	-
+Pixelfly-Mixer-S/16	89.8	62.9	72.6	1.7×
+Mixer-B/16	87.6	59.5	75.6	-
+Pixelfly-Mixer-B/16	90.6	65.4	76.3	2.3×
+ViT-S/16	89.5	65.1	77.7	-
+Pixelfly-ViT-S/16	91.3	66.8	77.5	1.9×
+ViT-B/16	89.9	61.9	78.5	-
+Pixelfly-ViT-B/16	92.2	65.1	78.6	2.0×
+based sparsity at initialization equals to random) for MLP layer, as a representative baseline. The plot
+indicates that our designed pattern, flat block butterfly + low-rank is the closest one to that of the dense one
+among all the patterns. Hence, we expect them to enjoy the most benefits of their dense overparameterized
+counterparts in real tasks. More details on measuring empirical NTK are covered in the Appendix L.3.
+Training from scratch: We validate that Pixelfly trains up
+to 2.3× and 2.0× faster than dense MLP-Mixer and ViT
+models from scratch, with the same accuracy under the same
+setting (batch size, epochs). Specifically, we sparsify the
+models with Pixelfly and train them on three commonly used
+vision benchmarking datasets, CIFAR-10/100 and ImageNet.
+We measure their Top-1 accuracy wall-clock training time.
+Figure 6: Comparison with a representative sparse
+training baseline RigL (Evci et al., 2020).
+Model	ImageNet (Acc)	Speedup
+MiXer-S/32	58.56	-
+RigL (EVCi et al., 2020)	56^	08×
+Pixelfly (ours)	59.61	-21×
+7 There is an emerging consensus that the NTK is an informative measure of how training and convergence behaviors
+of two models are similar.
+7
+Published as a conference paper at ICLR 2022
+To summarize the general trend, Fig. 5 highlights that our sparse vision models consistently retain the accuracy
+of their dense counterparts in terms of accuracy and achieve training-time speed-up.
+Furthermore, we have discussed in Section 1 that current sparse training algorithms aim to dynamic search
+what could be good sparsity for efficient inference but do not speed up training in wall-clock time. But we still
+present the comparison results in Fig. 6 for completeness. For a fair comparison, we conduct the experiment
+on Mixer-S/32 model for 100 epochs because RigL aims for sparsity on weights, while we aim for both
+weights & attention. As expected, RigL does not speed up training (the pioneering work has unstructured
+sparsity and does not achieve speed up on GPU) but surprisingly Pixelfly outperforms both dense and RigL in
+terms of accuracy while achieving 2.1× speedup.
+Finally, we compare Pixelfly with BigBird and
+Sparse Transformer pattern. For a fair compari-
+son, we choose T2T-ViT as the base model be-
+cause its major bottleneck is on the T2T attention
+module (our baselines are efficient attention vari-
+ants). We can see from Fig. 7 that Pixelfly is the
+only one that can maintain the accuracy and have
+actual speed up. Further more, Pixelfly speeds
+up T2T module (large attention) by 1.4× compare to dense.
+5.2	Language Modeling and Text Classification
+Figure 7: Comparison with representative sparse attention base-
+lines.
+Model	ImageNet (Acc)	Speedup
+T2T-ViT	8T7	-
+BigBird	815	-0.9×
+Sparse Transformer	81.4	-13×
+Pixelfly	8T7	-14×
+In this section, we aim to evaluate the effectiveness of Pixelfly in the text domain, on a language modeling
+task and Long Range Arena (LRA (Tay et al., 2020)) benchmarks. On WikiText-103 (Merity et al., 2016),
+Pixelfly achieves 22.5 perplexity, which is around the same perplexity as GPT-2 small (Radford et al., 2019)
+but trains 2.1× faster. On LRA, Pixelfly obtains almost the same accuracy as the full model but gains up to
+5.2× speed-up.
+Setup: We use WikiText-103 for language modeling and LRA for classification tasks. We use GPT-2 small
+and vanilla Transformer as the base dense models. The computational bottleneck of GPT-2 small for moderate
+sequence length, e.g. 512, would be on both attention and MLP layers, while the bottleneck of transformer on
+LRA task is on attention since the benchmark is designed to evaluate models under long-context scenarios.
+GPT-2-Small, Medium on WikiText-103: We
+show training GPT-2-Small, Medium and its Pixelfly
+model from scratch on a commonly used NLP bench-
+marking dataset, wikiText-103. We measure their
+perplexity on that dataset, and our training speed
+up. All setup and finetuning hyperparameters follow
+the ones in the original paper (Radford et al., 2019).
+We present the results in Fig. 8. It is not hard to
+see that Pixelfly models have great advantages in
+accuracy-efficiency tradeoffs since it maintains the
+same perplexity as the dense model but achieve up
+to 2.5× speed-up in training.
+Figure 8: The performance of Pixelfly, BigBird and GPT-2-
+Small, Medium on WikiText-103. We measure the perplexity
+and the training speed up.
+Model	WikiText-103(ppl)	Speedup
+-GPT-2-Small-	222	-
+BigBird	233	-0.96×-
+Pixelfly	225	-21×
+GPT-2-Medium	20.9	-
+BigBird	215	-∏×
+Pixelfly	21.0	-25×
+Vanilla Transformer on
+LRA: We compare vanilla
+transformer and its Pixelfly
+models trained from scratch
+on LRA benchmark. We mea-
+sure the accuracy, throughput,
+and training time of both
+Figure 9: The performance of Pixelfly, Reformer and vanilla transformer on Long-
+Range-Arena benchmarks. We measure the accuracy and training speed.
+Model	ListOps	Text	Retrieval	Image	Pathfinder	Avg	Speedup
+Transformer	36.54	63.12	80.33	41.56	73.49	59.01	-
+Reformer	36.85	58.12	78.36	28.30	-6795-	53.90	0.8×~
+Pixelfly	37.65	66.78	80.55	42.35	72.01	59.86	5.2×
+models. Each task has a different sequence length varying between 1024 and 4096. We follow the
+implementation and experimental setting in (Xiong et al., 2021). We compare the performance of Pixelfly
+against the dense transformer and report the results in Fig. 9. We also include the numbers of other baselines
+from the same repository in the appendix. We can see Pixelfly cause almost no drop in accuracy while
+achieving 5.2× speed-up in time.
+5.3	Ablation Study
+We conduct ablation studies on each component of Pixelfly (Details in Appendix L.5). Specifically, we present
+(i) how flat block butterfly and low-rank affect the model quality, (ii) how different block size would affect the
+training speed, (iii) how budget allocation affects the end-to-end speed up.
+8
+Published as a conference paper at ICLR 2022
+Necessity of Flat Block Butterfly and Low-rank: (i) We apply different parameter allocation of flat block
+butterfly and Low-rank component in Pixelfly Mixer-S model on CIFAR-10 under the different density
+varying in [0.05, 0.1, 0.2]. We found that similar to What was reported in (Chen et al., 2021), using around 4
+budget on Low-rank and 4 on flat block butterfly achieves the best accuracy. (ii) We also compare Pixelfly
+with baseline sparsity patterns and show itis 2.7× faster than dense, 3× faster than Butterfly, 3.2× faster than
+BigBird under 10% density.
+Block Size: We study the accuracy-efficiency trade-off for flat block butterfly and random sparsity pattern
+with different block sizes from 1-32 ( Table 7). We found that first, under the same density, the same sparsity
+patterns covered with different block sizes could have a big difference in efficiency. Under the same block, the
+pattern with more locality can be more efficient. Last, the density can seem very small, but actually memory
+access could be up to 100% of the matrix. Therefore, we always want to make full utilization of the smallest
+block size that the hardware (or compiler) supported.
+Budget Allocation: We sparsify different components of ViT-small separately, including attention and MLP.
+We show that their compute ratio is approximately 1 : 2 , so if only sparsify one of them, the other one will
+be the bottleneck preventing end-to-end speed up. Therefore, it is necessary to have an algorithm that can
+sparsify all layers.
+6	Related Work
+Lottery Ticket Hypothesis. Models proposed in our work can be roughly seen as a class of manually
+constructed lottery tickets. Lottery tickets (Frankle and Carbin, 2018) are a set of small sub-networks derived
+from a larger dense network, which outperforms their parent networks. Many insightful studies (Morcos et al.,
+2019; Orseau et al., 2020; Frankle et al., 2019; 2020; Malach et al., 2020; Pensia et al., 2020) are carried out to
+analyze these tickets, but it remains difficult to generalize to large models due to training cost. In an attempt,
+follow-up works (Wang et al., 2020; Tanaka et al., 2020) show that one can find tickets without training labels.
+We draw inspiration from one of them, Liu and Zenke (2020), which uses the NTK to avoid using labels in
+sparsifying networks. Other recent works use specialized hardware to accelerate sparse training (Goli and
+Aamodt, 2020; Raihan and Aamodt, 2020).
+Neural Pruning. Our work is loosely related to neural network pruning. By iteratively eliminating neurons
+and connections, pruning has seen great success in compressing complex models. Pioneering work (Han et al.,
+2015a;b) shows that pruning can produce significantly smaller and faster models for inference. Subsequent
+methods (Li et al., 2016; Lin et al., 2017; Dong et al., 2017; Sanh et al., 2020; Lagunas et al., 2021; Zhu and
+Gupta, 2017) improve on the quality of the pruned models. While both our and the pruning methods aim to
+produce sparse models, we target training efficiency, whereas pruning mostly focuses on inference efficiency
+at the cost of sacrificing training speed.
+Overparameterized Models and NTK. Our analysis for sparse model convergence relies heavily on
+recent advance in neural tangent kernel (NTK) (Jacot et al., 2018). NTK is a tool which has been widely
+used in analyzing overparameterized models’ convergence (Li and Liang, 2018; Du et al., 2019; Allen-
+Zhu et al., 2019b;c; Song and Yang, 2019), generalization (Allen-Zhu et al., 2019a), connection to data
+separability (Oymak and Soltanolkotabi, 2020), and cost per iteration (Brand et al., 2021)). Deep Double
+Descent (Nakkiran et al., 2019; d’Ascoli et al., 2020) conjectures that the generalization error improves as the
+parameter count grows. It is not surprising that the community is racing to break the record of the largest
+parameter counts (Radford et al., 2019; Brown et al., 2020; Dosovitskiy et al., 2020; Tolstikhin et al., 2021;
+Zhang et al., 2021; Naumov et al., 2019; Jumper et al., 2021).
+We provide extended related work in Appendix M.
+7	Conclusion
+In our early exploration of many sparsity patterns with complex training procedures, we found that a simple
+pattern (butterfly + low-rank) consistently (though not always) performed among the best. This motivated
+us to propose Pixelated Butterfly, a simple and efficient sparse training method. In our quest for simplicity
+and efficiency, we have chosen to use fixed sparsity that aligns with modern hardware, which was sufficient
+to yield wall-clock training time speedup without sacrificing accuracy. We are excited about several future
+directions. Inspired by the remarkable success of model pruning for inference, it is possible that dynamic block
+sparse mask could be made efficient yet still accurate. Our flat butterfly is a simple first order approximation
+of the rich class of butterfly matrices, and there could be more sophisticated approximations that retain more
+expressiveness. Our method is a first step towards the goal of making sparse models train faster than dense
+models and make them more accessible to the general machine learning community.
+9
+Published as a conference paper at ICLR 2022
+Ethics Statement. As the amount of data and model size grows, our work seeks to understand how to
+train those large models more efficiently by exploiting sparsity. This potentially connects to energy savings
+during large-model training. In addition, this allows the general community that has limited access to the
+computational resources to train and understand those foundation models. Our method is applicable to
+popular models such as MLP-based and Transformer-based architectures, which may improve a wide range of
+applications, each with their own potential benefits and harms. For example, making language modeling more
+efficient might simplify the process of spreading misinformation. Similarly, better image classification models
+might make automatic surveillance easier. To alleviate the above risks, we need to address application-specific
+issues like privacy, bias and discrimination, going beyond the accuracy metric we currently considered.
+Specifically, for image classification task, while our work partially addresses the issue of environmental cost,
+it does not address other issues such as fairness and bias in model and datasets.
+Reproducibility Statement. To facilitate the reproducibility of our algorithms and results, (i) we include a
+link to downloadable source code in supplementary materials, (ii) for our theoretical statements and results,
+we include clear explanations of any assumptions and a complete proof of the claims from Appendix A
+to Appendix H; for any datasets used in the experiments, a complete description of the data processing steps is
+in Appendix L.
+Acknowledgments
+We thank Laurel Orr, Xun Huang, Sarah Hooper, Sen Wu, Megan Leszczynski, and Karan Goel for their
+helpful discussions and feedback on early drafts of the paper.
+We gratefully acknowledge the support of NIH under No. U54EB020405 (Mobilize), NSF under Nos.
+CCF1763315 (Beyond Sparsity), CCF1563078 (Volume to Velocity), and 1937301 (RTML); ONR under
+No. N000141712266 (Unifying Weak Supervision); ONR N00014-20-1-2480: Understanding and Applying
+Non-Euclidean Geometry in Machine Learning; N000142012275 (NEPTUNE); the Moore Foundation,
+NXP, Xilinx, LETI-CEA, Intel, IBM, Microsoft, NEC, Toshiba, TSMC, ARM, Hitachi, BASF, Accenture,
+Ericsson, Qualcomm, Analog Devices, the Okawa Foundation, American Family Insurance, Google Cloud,
+Salesforce, Total, the HAI-AWS Cloud Credits for Research program, the Stanford Data Science Initiative
+(SDSI), and members of the Stanford DAWN project: Facebook, Google, and VMWare. The Mobilize Center
+is a Biomedical Technology Resource Center, funded by the NIH National Institute of Biomedical Imaging
+and Bioengineering through Grant P41EB027060. The U.S. Government is authorized to reproduce and
+distribute reprints for Governmental purposes notwithstanding any copyright notation thereon. Any opinions,
+findings, and conclusions or recommendations expressed in this material are those of the authors and do not
+necessarily reflect the views, policies, or endorsements, either expressed or implied, of NIH, ONR, or the U.S.
+Government. Atri Rudra’s research is supported by NSF grant CCF-1763481.
+References
+Zeyuan Allen-Zhu, Yuanzhi Li, and Yingyu Liang. Learning and generalization in overparameterized
+neural networks, going beyond two layers. In Advances in neural information processing systems, pages
+6155-6166,2019a.
+Zeyuan Allen-Zhu, Yuanzhi Li, and Zhao Song. A convergence theory for deep learning via over-
+parameterization. In International Conference on Machine Learning, pages 242-252. PMLR, 2019b.
+Zeyuan Allen-Zhu, Yuanzhi Li, and Zhao Song. On the convergence rate of training recurrent neural networks.
+In NeurIPS, 2019c.
+Noga Alon. Perturbed identity matrices have high rank: Proof and applications. Combinatorics, Probability
+and Computing, 18(1-2):3-15, 2009.
+Sanjeev Arora, Nadav Cohen, and Elad Hazan. On the optimization of deep networks: Implicit acceleration
+by overparameterization. In International Conference on Machine Learning, pages 244-253. PMLR, 2018.
+Sanjeev Arora, Simon Du, Wei Hu, Zhiyuan Li, and Ruosong Wang. Fine-grained analysis of optimization and
+generalization for overparameterized two-layer neural networks. In International Conference on Machine
+Learning, pages 322-332. PMLR, 2019a.
+Sanjeev Arora, Simon S Du, Wei Hu, Zhiyuan Li, Ruslan Salakhutdinov, and Ruosong Wang. On exact
+computation with an infinitely wide neural net. arXiv preprint arXiv:1904.11955, 2019b.
+10
+Published as a conference paper at ICLR 2022
+Mikhail Belkin, Daniel Hsu, Siyuan Ma, and Soumik Mandal. Reconciling modern machine-learning practice
+and the classical bias-variance trade-off. Proceedings of the National Academy of Sciences, 116(32):
+15849-15854, 2019.
+Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von Arx, Michael S
+Bernstein, Jeannette Bohg, Antoine Bosselut, Emma Brunskill, et al. On the opportunities and risks of
+foundation models. arXiv preprint arXiv:2108.07258, 2021.
+Jan van den Brand, Binghui Peng, Zhao Song, and Omri Weinstein. Training (overparametrized) neural
+networks in near-linear time. In ITCS, 2021.
+Tom B Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners.
+arXiv preprint arXiv:2005.14165, 2020.
+Emmanuel J Candes, Justin K Romberg, and Terence Tao. Stable signal recovery from incomplete and
+inaccurate measurements. Communications on Pure and Applied Mathematics: A Journal Issued by the
+Courant Institute of Mathematical Sciences, 59(8):1207-1223, 2006.
+Emmanuel J Candes, Xiaodong Li, Yi Ma, and John Wright. Robust principal component analysis? Journal
+of the ACM (JACM), 58(3):1-37, 2011.
+Yuan Cao and Quanquan Gu. Generalization error bounds of gradient descent for learning over-parameterized
+deep relu networks. In Proceedings of the AAAI Conference on Artificial Intelligence, volume 34, pages
+3349-3356, 2020.
+Beidi Chen, Tharun Medini, James Farwell, Sameh Gobriel, Charlie Tai, and Anshumali Shrivastava. Slide:
+In defense of smart algorithms over hardware acceleration for large-scale deep learning systems. arXiv
+preprint arXiv:1903.03129, 2019.
+Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, and Christopher R6. Scatterbrain: Unifying sparse
+and low-rank attention. In NeurIPS, 2021.
+Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse
+transformers. arXiv preprint arXiv:1904.10509, 2019.
+Krzysztof Choromanski, Mark Rowland, Wenyu Chen, and Adrian Weller. Unifying orthogonal Monte Carlo
+methods. In International Conference on Machine Learning, pages 1203-1212, 2019.
+DC Collins and ES Angel. The diagonal decomposition technique applied to the dynamic programming
+solution of elliptic partial differential equations. Journal of Mathematical Analysis and Applications, 33(3):
+467-481, 1971.
+Shane Cook. CUDA Programming: A Developer’s Guide to Parallel Computing with GPUs. Morgan
+Kaufmann Publishers Inc., San Francisco, CA, USA, 1st edition, 2012. ISBN 9780124159334.
+James W Cooley and John W Tukey. An algorithm for the machine calculation of complex fourier series.
+Mathematics of computation, 19(90):297-301, 1965.
+Tri Dao, Albert Gu, Matthew Eichhorn, Atri Rudra, and Christopher R6. Learning fast algorithms for
+linear transforms using butterfly factorizations. In International conference on machine learning, pages
+1517-1527. PMLR, 2019.
+Tri Dao, Nimit S Sohoni, Albert Gu, Matthew Eichhorn, Amit Blonder, Megan Leszczynski, Atri Rudra, and
+Christopher R6. Kaleidoscope: An efficient, learnable representation for all structured linear maps. In
+International conference on representation learning, 2020.
+Stephane d,Ascoli, Levent Sagun, and Giulio Biroli. Triple descent and the two kinds of overfitting: Where &
+why do they appear? arXiv preprint arXiv:2006.03509, 2020.
+Christopher De Sa, Albert Gu, Rohan Puttagunta, Christopher Re, and Atri Rudra. A two-pronged progress
+in structured dense matrix vector multiplication. In Proceedings of the Twenty-Ninth Annual ACM-SIAM
+Symposium on Discrete Algorithms, pages 1060-1079. SIAM, 2018.
+11
+Published as a conference paper at ICLR 2022
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hierarchical
+image database. In 2009 IEEE conference on computer vision and pattern recognition, pages 248-255.
+Ieee, 2009.
+Xin Dong, Shangyu Chen, and Sinno Jialin Pan. Learning to prune deep neural networks via layer-wise
+optimal brain surgeon. arXiv preprint arXiv:1705.07565, 2017.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Un-
+terthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, et al. An image is worth
+16x16 words: Transformers for image recognition at scale. arXiv preprint arXiv:2010.11929, 2020.
+Simon S Du, Xiyu Zhai, Barnabas Poczos, and Aarti Singh. Gradient descent provably optimizes over-
+parameterized neural networks. In ICLR. https://arxiv.org/pdf/1810.02054, 2019.
+Utku Evci, Trevor Gale, Jacob Menick, Pablo Samuel Castro, and Erich Elsen. Rigging the lottery: Making
+all tickets winners. In International Conference on Machine Learning, pages 2943-2952. PMLR, 2020.
+Peter Foldiak. Sparse coding in the primate cortex. The handbook of brain theory and neural networks, 2003.
+Dean Foster, Howard Karloff, and Justin Thaler. Variable selection is hard. In Conference on Learning Theory,
+pages 696-709. PMLR, 2015.
+Jonathan Frankle and Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable neural networks.
+arXiv preprint arXiv:1803.03635, 2018.
+Jonathan Frankle, Gintare Karolina Dziugaite, Daniel M Roy, and Michael Carbin. Stabilizing the lottery
+ticket hypothesis. arXiv preprint arXiv:1903.01611, 2019.
+Jonathan Frankle, Gintare Karolina Dziugaite, Daniel Roy, and Michael Carbin. Linear mode connectivity
+and the lottery ticket hypothesis. In International Conference on Machine Learning, pages 3259-3269.
+PMLR, 2020.
+Negar Goli and Tor M. Aamodt. Resprop: Reuse sparsified backpropagation. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), June 2020.
+Scott Gray, Alec Radford, and Diederik P Kingma. Gpu kernels for block-sparse weights. arXiv preprint
+arXiv:1711.09224, 3, 2017.
+Song Han, Huizi Mao, and William J Dally. Deep compression: Compressing deep neural networks with
+pruning, trained quantization and huffman coding. arXiv preprint arXiv:1510.00149, 2015a.
+Song Han, Jeff Pool, John Tran, and William J Dally. Learning both weights and connections for efficient
+neural networks. arXiv preprint arXiv:1506.02626, 2015b.
+Soufiane Hayou, Arnaud Doucet, and Judith Rousseau. Training dynamics of deep networks using stochastic
+gradient descent via neural tangent kernel. arXiv preprint arXiv:1905.13654, 2019.
+Sara Hooker. The hardware lottery. arXiv preprint arXiv:2009.06489, 2020.
+Arthur Jacot, Franck Gabriel, and Clement Hongler. Neural tangent kernel: Convergence and generalization
+in neural networks. arXiv preprint arXiv:1806.07572, 2018.
+Ali Jalali, Yudong Chen, Sujay Sanghavi, and Huan Xu. Clustering partially observed graphs via convex
+optimization. In ICML, 2011.
+Li Jing, Yichen Shen, Tena Dubcek, John Peurifoy, Scott Skirlo, Yann LeCun, Max Tegmark, and Marin
+Soljacic. Tunable efficient unitary neural networks (EUNN) and their application to RNNs. In Proceedings
+of the 34th International Conference on Machine Learning-Volume 70, pages 1733-1741. JMLR. org,
+2017.
+John Jumper, Richard Evans, Alexander Pritzel, Tim Green, Michael Figurnov, Olaf Ronneberger, Kathryn
+Tunyasuvunakool, Russ Bates, Augustin 右dek, Anna Potapenko, et al. Highly accurate protein structure
+prediction with alphafold. Nature, 596(7873):583-589, 2021.
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child, Scott Gray,
+Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language models. arXiv preprint
+arXiv:2001.08361, 2020.
+12
+Published as a conference paper at ICLR 2022
+Nikita Kitaev,匕Ukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In The International
+Conference on Machine Learning (ICML), 2020.
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+FrangOiS Lagunas, Ella Charlaix, Victor Sanh, and Alexander M Rush. Block pruning for faster transformers.
+arXiv preprint arXiv:2109.04838, 2021.
+Yann LeCun, John S Denker, and Sara A Solla. Optimal brain damage. In Advances in neural information
+processing systems, pages 598-605,1990.
+Jaehoon Lee, Lechao Xiao, Samuel Schoenholz, Yasaman Bahri, Roman Novak, Jascha Sohl-Dickstein, and
+Jeffrey Pennington. Wide neural networks of any depth evolve as linear models under gradient descent.
+Advances in neural information processing systems, 32:8572-8583, 2019.
+Namhoon Lee, Thalaiyasingam Ajanthan, and Philip HS Torr. Snip: Single-shot network pruning based on
+connection sensitivity. arXiv preprint arXiv:1810.02340, 2018.
+Hao Li, Asim Kadav, Igor Durdanovic, Hanan Samet, and Hans Peter Graf. Pruning filters for efficient
+convnets. arXiv preprint arXiv:1608.08710, 2016.
+Yingzhou Li, Haizhao Yang, Eileen R. Martin, Kenneth L. Ho, and Lexing Ying. Butterfly factorization.
+Multiscale Modeling & Simulation, 13(2):714-732, 2015.
+Yuanzhi Li and Yingyu Liang. Learning overparameterized neural networks via stochastic gradient descent on
+structured data. In NeurIPS, 2018.
+Ji Lin, Yongming Rao, Jiwen Lu, and Jie Zhou. Runtime neural pruning. In I. Guyon, U. V. Luxburg, S. Bengio,
+H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, Advances in Neural Information Processing
+Systems, volume 30. Curran Associates, Inc., 2017. URL https://proceedings.neurips.cc/
+paper/2017/file/a51fb975227d6640e4fe47854476d133-Paper.pdf.
+Tianlin Liu and Friedemann Zenke. Finding trainable sparse networks through neural tangent transfer. In
+International Conference on Machine Learning, pages 6336-6347. PMLR, 2020.
+Xi Luo. High dimensional low rank and sparse covariance matrix estimation via convex minimization. arXiv
+preprint arXiv:1111.1133, 199, 2011.
+Eran Malach, Gilad Yehudai, Shai Shalev-Schwartz, and Ohad Shamir. Proving the lottery ticket hypothesis:
+Pruning is all you need. In International Conference on Machine Learning, pages 6682-6691. PMLR,
+2020.
+Michael Mathieu and Yann LeCun. Fast approximation of rotations and Hessians matrices. arXiv preprint
+arXiv:1404.7195, 2014.
+Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models.
+arXiv preprint arXiv:1609.07843, 2016.
+Ari S Morcos, Haonan Yu, Michela Paganini, and Yuandong Tian. One ticket to win them all: generalizing
+lottery ticket initializations across datasets and optimizers. arXiv preprint arXiv:1906.02773, 2019.
+Marina Munkhoeva, Yermek Kapushev, Evgeny Burnaev, and Ivan Oseledets. Quadrature-based features
+for kernel approximation. In S. Bengio, H. Wallach, H. Larochelle, K. Grauman, N. Cesa-Bianchi, and
+R. Garnett, editors, Advances in Neural Information Processing Systems 31, pages 9165-9174. Curran
+Associates, Inc., 2018.
+Preetum Nakkiran, Gal Kaplun, Yamini Bansal, Tristan Yang, Boaz Barak, and Ilya Sutskever. Deep double
+descent: Where bigger models and more data hurt. arXiv preprint arXiv:1912.02292, 2019.
+Maxim Naumov, Dheevatsa Mudigere, Hao-Jun Michael Shi, Jianyu Huang, Narayanan Sundaraman, Jongsoo
+Park, Xiaodong Wang, Udit Gupta, Carole-Jean Wu, Alisson G Azzolini, et al. Deep learning recom-
+mendation model for personalization and recommendation systems. arXiv preprint arXiv:1906.00091,
+2019.
+Laurent Orseau, Marcus Hutter, and Omar Rivasplata. Logarithmic pruning is all you need. Advances in
+Neural Information Processing Systems, 33, 2020.
+13
+Published as a conference paper at ICLR 2022
+Samet Oymak and Mahdi Soltanolkotabi. Toward moderate overparameterization: Global convergence
+guarantees for training shallow neural networks. IEEE Journal on Selected Areas in Information Theory, 1
+(1):84-105, 2020.
+D Stott Parker. Random butterfly transformations with applications in computational linear algebra. 1995.
+Ankit Pensia, Shashank Rajput, Alliot Nagle, Harit Vishwakarma, and Dimitris Papailiopoulos. Optimal lottery
+tickets via subsetsum: Logarithmic over-parameterization is sufficient. arXiv preprint arXiv:2006.07990,
+2020.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language models
+are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+Md Aamir Raihan and Tor M Aamodt. Sparse weight activation training. arXiv preprint arXiv:2001.01969,
+2020.
+Ilya Razenshteyn, Zhao Song, and David P Woodruff. Weighted low rank approximations with provable
+guarantees. In Proceedings of the forty-eighth annual ACM symposium on Theory of Computing, pages
+250-263, 2016.
+Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng Huang, Andrej
+Karpathy, Aditya Khosla, Michael Bernstein, et al. Imagenet large scale visual recognition challenge.
+International journal of computer vision, 115(3):211-252, 2015.
+Victor Sanh, Thomas Wolf, and Alexander M Rush. Movement pruning: Adaptive sparsity by fine-tuning.
+arXiv preprint arXiv:2005.07683, 2020.
+Zhao Song and Xin Yang. Quadratic suffices for over-parametrization via matrix chernoff bound. arXiv
+preprint arXiv:1906.03593, 2019.
+Hidenori Tanaka, Daniel Kunin, Daniel LK Yamins, and Surya Ganguli. Pruning neural networks without any
+data by iteratively conserving synaptic flow. arXiv preprint arXiv:2006.05467, 2020.
+Yi Tay, Mostafa Dehghani, Samira Abnar, Yikang Shen, Dara Bahri, Philip Pham, Jinfeng Rao, Liu Yang,
+Sebastian Ruder, and Donald Metzler. Long range arena: A benchmark for efficient transformers. arXiv
+preprint arXiv:2011.04006, 2020.
+Ann Taylor, Mitchell Marcus, and Beatrice Santorini. The penn treebank: an overview. Treebanks, pages
+5-22, 2003.
+Robert Tibshirani. Regression shrinkage and selection via the lasso. Journal of the Royal Statistical Society:
+Series B (Methodological), 58(1):267-288, 1996.
+Ilya Tolstikhin, Neil Houlsby, Alexander Kolesnikov, Lucas Beyer, Xiaohua Zhai, Thomas Unterthiner, Jessica
+Yung, Daniel Keysers, Jakob Uszkoreit, Mario Lucic, et al. Mlp-mixer: An all-mlp architecture for vision.
+arXiv preprint arXiv:2105.01601, 2021.
+Madeleine Udell and Alex Townsend. Why are big data matrices approximately low rank? SIAM Journal on
+Mathematics of Data Science, 1(1):144-160, 2019.
+Keivan Alizadeh Vahid, Anish Prabhu, Ali Farhadi, and Mohammad Rastegari. Butterfly transform: An
+efficient fft based neural architecture design. In 2020 IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR), pages 12021-12030. IEEE, 2020.
+Chaoqi Wang, Guodong Zhang, and Roger Grosse. Picking winning tickets before training by preserving
+gradient flow. arXiv preprint arXiv:2002.07376, 2020.
+Zhanghao Wu, Zhijian Liu, Ji Lin, Yujun Lin, and Song Han. Lite transformer with long-short range attention.
+arXiv preprint arXiv:2004.11886, 2020.
+Yunyang Xiong, Zhanpeng Zeng, Rudrasis Chakraborty, Mingxing Tan, Glenn Fung, Yin Li, and Vikas
+Singh. Nystromformer: A Nystrom-based algorithm for approximating self-attention. arXiv preprint
+arXiv:2102.03902, 2021.
+Li Yuan, Yunpeng Chen, Tao Wang, Weihao Yu, Yujun Shi, Francis EH Tay, Jiashi Feng, and Shuicheng
+Yan. Tokens-to-token vit: Training vision transformers from scratch on imagenet. arXiv preprint
+arXiv:2101.11986, 2021.
+14
+Published as a conference paper at ICLR 2022
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon,
+Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences.
+Advances in Neural Information Processing Systems, 33, 2020.
+Xiaohua Zhai, Alexander Kolesnikov, Neil Houlsby, and Lucas Beyer. Scaling vision transformers. arXiv
+preprint arXiv:2106.04560, 2021.
+Zhengyan Zhang, Xu Han, Hao Zhou, Pei Ke, Yuxian Gu, Deming Ye, Yujia Qin, Yusheng Su, Haozhe Ji,
+Jian Guan, et al. Cpm: A large-scale generative Chinese pre-trained language model. AI Open, 2:93-99,
+2021.
+Michael Zhu and Suyog Gupta. To prune, or not to prune: exploring the efficacy of pruning for model
+compression. arXiv preprint arXiv:1710.01878, 2017.
+15
+Published as a conference paper at ICLR 2022
+A	Problem Formulation
+We formulate the problem of sparse model training as sparse matrix approximation with a simple hardware
+cost model (Section 2).
+We first describe our simple cost model for sparse matrix multiplication to reflect the fact that parallel hardware
+such as GPUs are block-oriented (Cook, 2012; Gray et al., 2017): accessing one single element from memory
+costs the same as accessing one whole block of elements. We then formulate the sparse matrix approximation
+in the forward pass and the backward pass. The cost model necessitates narrowing the sparsity pattern
+candidates to those that are block-aligned.
+Cost model We model the time cost of an operation based on the number of floating point operations
+and memory access. The main feature is that our cost model takes into account memory coalescing, where
+accessing a memory location costs the same as accessing the whole block of b elements around it (typically
+b= 16 or 32 depending on the hardware).
+Let Costmem be the memory access cost (either read or write) for a block of b contiguous elements. Accessing
+any individual element within that block also costs Costmem time. Let Costflop be the compute cost of a
+floating point operation. Let Nblockmem be the number of block memory access, and Nflop be the number of
+floating point operations. Then the total cost of the operation is
+Totalcost = Costmem ∙ Nblockmem + Costflop ∙ Nflop.
+This cost model is a first order approximation of the runtime on modern hardware (GPUs), ignoring the effect
+of caching.
+Block-aligned sparsity pattern, Block cover, and Memory access cost As the memory access cost
+depends on the number of block of memory being accessed, we describe how the number of nonzero elements
+in a sparse matrix relates to the number of blocks being accessed. We first define a block cover ofa sparse
+mask.
+Definition A.1. A sparse mask M ∈ {0,1}m×n is (b1,b2)-block-aligned if for any index i,j where Mij = 1,
+we also have Mi0j0 = 1 where:
+i0 = b1bi/b1c+r1,j0 = b2bj/b2c +r2 for all r1 = 0,1,...,b1 -1 and r2 = 0,1,...,b2 - 1.
+The (b1,b2)-block cover ofa sparse mask M ∈ {0,1}m×n is the (b1,b2)-block-aligned mask M0 ∈ {0,1}m×n
+with the least number of nonzeros such that Mij ≤ Mi0j for all i,j.
+We omit the block size (b1,b2) ifit is clear from context.
+A sparse mask M being (b1,b2) block-aligned means that ifwe divide M into blocks of size b1 × b2, then
+each block is either all zeros or all ones. To get the (b1,b2)-block cover ofa sparse mask M, we simply divide
+M into blocks of size b1 ×b2 and set each block to all ones if any location in that block is one.
+For a sparse matrix with sparse mask M on a device with block size b, the number of block memory access
+Nblockmem is the number of nonzero blocks in its (1,b)-block cover M0 (assuming row-major storage). This
+corresponds to the fact that to access a memory location on modern hardware (GPUs), the device needs to
+load a whole block of b elements around that location.
+Fast sparse matrices means block-aligned sparsity pattern For sparsity patterns that are not block-aligned,
+such as the random sparse pattern where each location is independently zero or nonzero, its (1,b)-block cover
+might increase the density by a factor of close to b times (we show this more rigorously in the Appendix). As
+memory access often dominates the computation time, this means that non block-aligned sparsity will often
+result is b times slower execution than block-aligned ones. In other words, exploiting hardware locality is
+crucial to obtain speed up.
+Therefore, this cost model indicates that instead of searching over sparsity patterns whose total cost is less
+than some budget C, we can instead search over block-aligned patterns whose number of nonzeros is less
+than some limit k. For our theoretical analysis, we consider sparsity patterns that are (1,b)-block-aligned. In
+practice, since we need to access both the matrix and its transpose (in the forward and backward pass), we
+require the sparsity pattern to be both (1,b)-block-aligned and (b,1)-block-aligned. This is equivalent to the
+condition that the sparsity pattern is (b,b)-block-aligned.
+Sparse matrix approximation in the forward pass We now formulate the sparse matrix approximation
+in the forward pass. That is, we have weight matrix A with input B and we would like to sparsify A while
+minimizing the difference in the output. For easier exposition, we focus on the case where number of nonzeros
+in each row is the same.
+16
+Published as a conference paper at ICLR 2022
+Definition A.2 (Forward regression). Given four positive integers m≥n≥d≥ k ≥ 1, matrices A∈Rm×d
+and B ∈ Rd×n. The goal is to find a (1,b)-block-aligned binary mask matrix M ∈ {0,1}m×d that satisfies
+∣∣A∙B-(A。M )∙B∣∣ι
+min
+M∈{0,1}m×d
+s.t. kMik0 = k,∀i ∈ [d]
+where Mi is the i-th row of M.
+Sparse matrix approximation in the backward pass In the backward pass to compute the gradient wrt to
+the weight matrix A, we would like to sparsify the gradient CB> while preserving as much of the gradient
+magnitude as possible.
+Definition A.3 (Backward regression). Given four positive integers m≥n≥d≥k≥ 1, matrices B ∈ Rd×n
+and C ∈ Rm×n. The goal is to find a (1,b)-block-aligned binary mask matrix M∈ {0,1}m×d such that
+min	∣∣C ∙Bτ-(C∙B>)o M k1
+M∈{0,1}m×d
+s.t. ∣Mi∣0=k,∀i∈ [d]
+where Mi is the i-th row of M.
+Without making any assumptions, such problems are in general computationally hard Foster et al. (2015);
+Razenshteyn et al. (2016).
+17
+Published as a conference paper at ICLR 2022
+B	Analysis of Butterfly Variants
+We present formal versions of theorems in Section 4 regarding variants of butterfly matrices. We provide full
+proofs of the results here.
+B.1	Block Butterfly Analysis
+Proof of Theorem 4.1. Let M be an n×n block butterfly matrix with block size b. We want to show that M
+also has a representation as an n×n block butterfly matrix with block size 2b.
+By Definition 3.3, M has the form:
+M = Bnb ,b)B(rb ,b)...B4b ,b)B2b ,b).
+Notice that We can combine that last two terms to form a matrix of the form B(2b ,2b) (See Fig. 3). Moreover,
+other terms in the product of the form B(b,b) can also be written as B( 2bn,2b) (see Fig. 3). Thus M also has
+2ib	2i-12b
+the form:
+M = B⅛b ,2b)B⅛b，2b)...B22b 叫.
+2b	4b	2
+In other words, M is also an n× n block butterfly matrix with block size 2b.
+□
+Proof of Corollary 4.2. Dao et al. (2020, Theorem 3) states that any n× n sparse matrix with s nonzeros can
+be represented as products of butterfly matrices and their transposes, with O(slogn) parameters.
+For a constant block size b that is a power of 2, the set of n × n block butterfly matrices of block size b
+contains the set of regular butterfly matrices by Theorem 4.1. Therefore any such n ×n sparse matrix also has
+a representation has products of block butterfly matrices of block size b and their transposes, with O(slogn)
+parameters.	□
+B.2	Flat Butterfly Analysis
+We prove Theorem 4.3, which relates the first-order approximation in the form of a flat butterfly matrix with
+the original butterfly matrix.
+Proof of Theorem 4.3. Let n=2m and let B1,...,Bm ∈ Rn×n be the m butterfly factor matrices (we rename
+them here for simplicity of notation).
+Let
+mm
+E=Y(I+λBi)- I+XλBi .
+i=1	i=1
+Our goal is to show that kE kF ≤ .
+We first recall some properties of Frobenius norm. For any matrices A and C, we have kACkF ≤ kAkF kCkF
+and kA+CkF ≤ kAkF +kCkF.
+Expanding the terms of the product in E, we have
+m
+E=Xλi	X	YBj.
+i=2 s∈[m],∣s∣=ij∈s
+18
+Published as a conference paper at ICLR 2022
+Using the above properties of Frobenius norm, we can bound E :
+m
+kEkF ≤Xλi	X	YkBjkF
+m
+≤Xλi	X	YBmax
+i=2 s∈[m],∣s∣=ij∈s
+m
+=Xλ2mi(Bin aχ)
+i=2
+m
+=X(λmBmax)i
+i=2
+m
+≤ X(3
+i=
+∞
+≤ c2eX(c√e)i
+i=0
+V c2e
+≤ 1-c√
+≤ ,
+where in the last step We use the assumption that C ≤ 1.
+□
+We now bound the rank of the first-order approximation.
+ProofofTheorem 4.4. Let M* = I+Pm=ιλBi. Note that any entry in Pm=QBi has absolute value at most
+^xr∞ JwB制XJ 一
+mλBmax ≤ —B---------------------------------------------≤ 4,
+where we use the assumption that B∞ax ≤ BmaX and C ≤ 1.
+Thus any diagonal entry in M * has absolute value at least 1 -1 = 3 and the off-diagonal entries are at most
+c√≡B∞ax
+bm .
+Alon (2009, Theorem 1.1) states that: there exists some C>0 such that for any real M∈Rn×n, if the diagonal
+elements have absolute values at least 2 and the Off-diagonal elements have absolute values at most E where
+7√r ≤ E ≤ 1, then rank(M) ≥ jogn.
+2 n	4 ,	2log1/ .
+Applying this theorem to our setting, we have that
+ra" ≥ ω(( Bmax )2 二)∙
+B∞	1
+WejUSt need to show that Bmx ≥ 2√n to satisfy the condition of the theorem.
+Indeed, we have that 1 ≤ B∞x ≤ √2n as each k Bi k ° ≤ 2n. Combining the two conditions on B∞x, we have
+max	max
+shown that 1 ≤ B∞ax ≤ 2c√En. This concludes the proof.	口
+max
+B.3 Flat Block Butterfly + Low-rank Analysis
+We show that flat butterfly + low-rank (an instance) of sparse + low-rank, is more expressive than either
+sparse or low-rank alone. We adapt the argument from Chen et al. (2021) to show a generative process where
+the attention matrix can be well approximated by a flat butterfly + low-rank matrix, but not by a sparse or
+low-rank alone.
+We describe here a generative model of an input sequence to attention, parameterized by the inverse temperature
+β∈R and the intra-cluster distance ∆∈R.
+Process 1. Let Q ∈Rn×d, where d≥ Ω(log3∕2(n)), with every row of Q generated randomly asfollows:
+19
+Published as a conference paper at ICLR 2022
+1.	For C=Ω(n), sample C number ofcluster centers ci,…,cc ∈ Rd independentlyfrom N (0,Id∕√d).
+2.	For each cluster around ci, sample ni = b number of elements around ci, of the form zij = ci + rij
+for j = 1,…,n where rj 〜N (0,Id△/√d). Assume that the total number of elements is n = Cb and
+∆ ≤ O(1/log1/4n).
+Let Q be the matrix whose rows are the vectors zij where i= 1,...,C andj= 1,...,ni. Let A=QQ> and let
+the attention matrix be Me = exp(β ∙ A).
+Theorem B.1. Let Mβ, be the attention matrix in Process 1. Fix ∈ (0,1). Let R ∈ Rn×n be a matrix.
+Consider low-rank, sparse, and sparse + low-rank approximations to Mβ. Assume (1 - △2) logn ≤ β ≤
+O(logn).
+1.	Flat butterfly + low-rank: There exists a flat butterfly + low-rank R with n1+o(1) parameters with
+kMβ -RkF ≤ n.
+2.	Low-rank: If R is such that n—rank(R)=Ω(n), then ∣∣Mβ-RkF ≥Ω(n).
+3.	Sparse: If R has sparsity o(n2), then ∣∣Mβ-RkF ≥ Ω(n).
+Proof sketch. As the argument is very similar to that of Chen et al. (2021, Theorem 1), we describe here the
+modifications needed to adapt their proof.
+The main difference between our generative process and that of Chen et al. (2021) is that each cluster has the
+same number of elements, which is the same as the block size. The resulting attention matrix will have a large
+block diagonal component, similar to that Chen et al. (2021). However, all the blocks in the block diagonal
+component has the same block size, which is b. Moreover, a flat block butterfly of block size b contains a
+block diagonal component of block size b. Therefore, this flat block butterfly matrix plays the same role as
+the sparse matrix in the proof of Chen et al. (2021). The rest of the argument follows that of theirs. □
+20
+Published as a conference paper at ICLR 2022
+Roadmap The analysis of sparse networks is organized as follows. In Section C we list some basic notations
+that will be used. In Section D we consider the problem of adding sparsity on W, and we achieve polynomial
+solving time. In Section E we prove that the gradient descent can be done fast under the sparsity assumption.
+In Section G we consider the problem of adding sparsity on a, and we show that minimizing the dropout loss
+is equivalent with a kernel ridge regression problem. In Section H we analyze the dynamics of gradient flow
+and prove the convergence result.
+C	Notations
+For a vector x, we use kxkp to denote its `p norm, and we mainly consider p = 1,2 in this paper. For a matrix
+A, we use kAk0,kAk1,kAkF to denote the `0 norm, entry-wise `1 norm and Frobenius norm of A respectively.
+For two matrices A,B ∈ Rd×m, We use A◦ B to denote their Hadamard product. We use Tmat(n,d,m) to
+denote the time of multiplying n × d matrix with another d × m matrix. For a symmetric matrix A, we use
+λmin(A) to denote its minimum eigenvalue. We also let vec(A) be the vectorization ofa matrix A in column
+first order. We use《,•〉to denote standard Euclidean inner product between two vectors.
+Moreover, we use N(μ,Σ) to denote the Gaussian distribution with mean μ and covariance Σ. We denote the
+ReLU function by φ(z) = max{z,0}. For an event E, we use 1{E} or 1E to denote its indicator function.
+D	Sparsity on hidden layer weights
+D.1 Applying masks before multiplication
+Given matrix A ∈ Rn×d, B ∈ Rd×n, naively computing AB takes Tmat(n,d,n). Note that, we can also
+consider the case where A and B have different size. For simplicity, let us consider the case where matrix A
+and matrix B> have the same size.
+Our goal is to find “optimal" binary mask matrix W ∈ {0,1}d×n such that,
+min kf(A∙B)-f(A∙(WoB))kι
+s.t. kWB,ik0 = k,∀i ∈ [n]
+Remark D.1. In the practical applications we care about, the function f is the activation function of neural
+network, e.g., ReLU(z) = max{z,0}.
+We define a sparse targeted regression problem:
+Definition D.2 (Sparse mark regression, `1 version). Given a matrix B ∈ Rd×n, and a vector a ∈Rd, the
+goal is to find a k-sparse binary vector w ∈ {0,1}d to minimize the following problem:
+minka> ∙B — (a> ow>)∙B∣∣ι∙
+w
+Naively, the above problem can be solved in n∙dO(k) via guess all the $ choices.
+Lemma D.3. The targeted sparse mask regression problem can be solved in n∙dO(k).
+Proof. We need to guess kd times, which becomes dO(k). Each time it takes nd operations, thus the total
+time is
+nd")= n-dO(k).
+□
+Definition D.4 (`1 version). Given three positive integers m ≥ n ≥ d ≥ k ≥ 1, matrices A ∈ Rm×d and
+B∈Rd×n. We define our problem as finding the binary matrix W∈ {0,1}m×d that satisfies
+min ∣∣A∙B-(AoW)∙B∣∣ι
+s.t. ∣∣Wi*ko = k,∀i∈ [m].
+where W^ is the i-th row of W.
+Theorem D.5. The problem being defined as Definition D.4 can be solved in mndO(k) time.
+Proof. Our problem can be decomposed into m sub-problems as follows:
+21
+Published as a conference paper at ICLR 2022
+m
+kA∙B-(A。W )∙Bkι = X∣∣(A∙B)i*-((Ao W )∙B)i*∣∣1
+i=1
+m
+=XIlAi* ∙B -(AoW)i* ∙B∣∣1
+i=1
+m
+=^X∣∣Ai* ∙B -(Ai* OWi*>B∣∣ι
+i=1
+where A/ means the i-th row of matrix A. By applying Lemma D.3, each SUb-Problem
+min∣∣Ai* ∙B — (Ai* oWi*)∙B∣∣ι
+Wi*
+can be solved in n∙dO(k) time. Then the problem defined in Definition D.4 can be solved in
+m∙ndO(k') = mndO(k')
+time in total. ThUs we finish the proof.
+□
+In the above Theorem, we show that solving the sparse mask regression problem is NP-hard. However, if we
+add some mild assUmptions and consider minimizing `1 norm, then we can solve the regression problem in
+polynomial time, as the following parts show.
+Definition D.6 (`1 version). Given a matrix B ∈ Rd≥×0n, anda vector a ∈ Rd≥0, the goal is to find a k-sparse
+binary vectorw∈ {0,1}d to solve
+mink a> ∙ B — (a>。w>) ∙ B k ι
+w
+Lemma D.7. The targeted `1 version sparse mask regression problem can be solved in
+O(nd+nlogn)
+which is polynomial time.
+Proof. We first consider the sitUation when a∈ {0,1}d. In this case, we have
+∣∣a>.B — (a>ow>)∙Bkι + k(a>ow>)∙Bkι = ∣∣a>∙B∣∣ι
+where ∣∣a> ∙B∣∣ 1 is fixed. So we only need to consider the following problem:
+maxk(a> ow>)∙B∣ι.
+w
+For simplicity we assUme ai =1,∀i∈ [d], and we only need to solve
+max∣w> ∙B∣ι
+w
+where w has k elements eqUal to 1 and d-k elements eqUal to 0. For i ∈ [d], we compUte Si = Pjn=1Bij
+which is the summation of i-th row of B, and sort them as S(i)≥ S(2)≥ …≥ S(n). Then we only need to
+let w(i) = 1 for i ∈ [k] and other elements eqUal to 0. CompUting all Si takes O(nd) time, sorting Si takes
+O(nlogn) time, thus the total time consumption is O(nd+nlogn) in this case.
+Next, we consider the general case when a ∈ Rd≥0. We let
+Bi*=aiBi* and ai={o, ai>o, ∀i∈[d]
+where Bi* is the i-th row of B. Then our optimization problem is equivalent to
+min∣a>∙B — (a> ow>)∙B∣ι
+w
+where B ∈ R≥×0n and a ∈ {0,1}d. Thus we turn this case into the first case. Constructing B and a takes O (nd)
+time, thus the total time consumption is also O(nd+nlogn) in this case.	□
+Definition D.8 (`1 version). Given three positive integers m ≥ n ≥ d ≥ k ≥ 1, matrices A ∈ R≥m0×d and
+B∈Rd≥×0n. We define our problem as finding the binary matrix W∈ {0,1}m×d that satisfies
+min ∣∣A∙B-(AoW)∙B∣ι
+s.t. ∣Wi*∣0=k,∀i∈ [m].
+where Wi* is the i-th row of W.
+Theorem D.9. The problem being defined as Definition D.8 can be solved in
+O(mnd+mnlogn)
+time.
+22
+Published as a conference paper at ICLR 2022
+Proof. Our problem can be decomposed into m sub-problems as follows:
+m
+kA∙B-(A。W )∙Bkι = X∣∣(A∙B)i*-((Ao W )∙B)i*∣∣1
+i=1
+m
+=^XllAi* ∙B -(AOW)i* ∙B∣∣1
+i=1
+m
+=〉］∣Ai* ∙B — (Ai* °Wi*) ∙B∣∣ 1
+i=1
+where Ai* means the i-th row of matrix A. By applying Lemma D.7, each sub-problem
+min∣∣Ai* ∙B -(Ai* oWi*)∙B∣∣ι
+Wi*
+can be solved in O(nd+nlogn) time. Then the problem defined in Definition D.8 can be solved in
+m∙O(nd+nlogn) = O (mnd + mnlogn)
+time in total. Thus We finish the proof.	□
+D.2 Applying Masks After Multiplication
+Definition D.10. Given matrix B ∈ Rd×n, C∈Rm×n. The goal is to find a maskW∈ {0,1}m×d where each
+column of W is k-sparse
+min	kC∙B> — (C∙B>)oW k
+W ∈{0,1}m×d
+1
+Remark D.11. The B defined in Definition D.4 is the same as the B defined in Definition D.10. B is
+corresponding to the X in the neural network setting.
+E Gradient computation
+In this section We consider a neural netWork With one hidden layer and m neurons in this hidden layer.
+Suppose X ∈Rd is the input, W = (wι,…,wm) ∈Rd×m is the weight matrix of the first layer, a ∈Rm is the
+output Weight, and M ∈ {0,1}d×m is the mask matrix With each column having at most k non-zero entries.
+The neural network f : Rd → R is defined as
+f (X) = a>φ((M oW )> ∙x).
+For simplicity, we only optimize W and fix a. Consider the mean square loss
+1n
+L(W )=2∑(f (χi)-yi)2
+i=1
+1n
+2∑S(a>φ((M oW )> ∙xi)-yi)2∙
+i=1
+In the forward computation, for a batch of data points xi,…,Xn ∈ Rd, let X ∈ Rd×n denote the input data
+points matrix. For convenience, we define
+∆W(t)=W(t+)-W(t)=-η
+∂L(W (t))
+∂W (t)
+where η is the step size. We define function gt : Rd → Rm as
+gt(x) = (f (x)-y)∙diag{φ0((M oW(t))> ∙x)}∙a
+and also denote gt(X) = (gt(χι),…,gt(χn)) ∈Rm×n.
+Lemma E.1. We can express ∆W (t) as
+∆W(t) = —η(x ∙g>(X))oM,
+and each column of ∆W(t) has at most k non-zero entries.
+23
+Published as a conference paper at ICLR 2022
+Proof. From the definition, we know
+∆W(t)=-η
+∂L(W (t))
+∂W (t)
+n
+i=1
+d×m
+--V-
+m×m
+m×1 1×d
+n
+=-η(Xgt(χi)∙χ>)τ ◦m
+i=1
+=-ηCg>χ)o ①.
+d×n n×m	d×m
+Since each column of M has at most k non-zero entries, we easily know each column of ∆W (t) also has at
+most k non-zero entries.	□
+Lemma E.2. Suppose that matrices M ∈ Rd×m, W(t) ∈ Rd×m and ∆W (t) ∈ Rd×m are given and
+pre-computed, then we can compute ft+1 (X ) in
+O(mnk)
+time. (Here ft+1(X ) is the evaluation of f at W (t+1).)
+Proof. The goal is to compute
+ft+ι(X) = aτ∙φ(( M ◦W(t+1))τ∙X).
+I{z} 'l_'{z_}'
+d×m	d×m
+By using Lemma E.1, we have
+(M ◦W (t+1))τ ∙X = (M ◦(W (t)+∆W (t)))τ ∙X
+=(M ◦W (t))τ ∙X+(M o∆W (t))τ ∙X
+=(M ◦W (t))τ ∙X-η(M ◦(X ∙gτ(X)”M )τ ∙X
+=(M ◦W (t))τ ∙X-η((X ∙gJ(X)”M )τ ∙X
+=(M ◦W (t))τ ∙X+(∆W (t))τ ∙X.
+Notice thatwe have already computed (M◦W(t))τ ∙X ∈Rm×d from previous iteration, so We only need
+to compute (∆W(t))τ ∙ X where ∆W(t) ∈ Rd×m and X ∈ Rd×n. By using Lemma E.1, each row of
+(∆W(t))τ has at most k non-zero entries, thus we can compute (∆W(t))τ ∙X in O(mnk) time.	□
+Lemma E.3. Suppose that matrices M∈Rd×m,W(t) ∈ Rd×m and ft(X) are given and pre-computed, then
+we can compute d∂WW(t?) in O(mnk) time.
+Proof. By using Lemma E.1, we have
+⅞Wi …。M
+wheregt(x) = (f (x)-y)∙diag{φ0((M◦W(t))τ∙x)}∙a∈Rm andgt(X) = (gt(xι),…,gt(xn)) ∈Rm×n. We
+first compute M◦ W(t) in O(mk) time, then we can construct gt(X) ∈ Rm×n in n∙O(mk) time. Given
+gt(X), since we only need to compute km entries of X ∙gj (X), where each entry can be computed in O(n)
+time, thus we can compute dLWW(t?) in O(mnk) time.
+□
+24
+Published as a conference paper at ICLR 2022
+Algorithm 1 The sparse training algorithm
+1	procedure SPARSE TRAINING({xi,yi}i∈[n])	
+2	Initialization a『,w『(0)〜N(0,Id) for r ∈ [m].	
+3	for t=1→T do	
+4	/*forward computation*/	
+5	Compute M ◦W (t)	. Takes O(mk) time.
+6	for i= 1→n do	
+7	ft(xi) . a>φ((M ◦W (t))>∙Xi)	. Takes O(mk) time.
+8	gt(xi) 一 (f (xi)-yi)∙diagφ0((M ◦W (t))τ ∙Xi)∙a	. Takes O(mk) time.
+9	end for	
+10	/*backward computation*/	
+11	gt(X) J (gt(XI),∙∙∙,gt(Xny).	
+12	dLW))=(χ ∙g>(χ ))◦ M	. Takes O(mnk) time.
+13	W (t+1) = W (t)+∆W (t)	.δw (t) = -η dL号.
+14	end for	
+15	end procedure	
+F	Neural Tangent Kernel, Convergence, and Generalization
+Our analysis relies on the neural tangent kernel (NTK) (Jacot et al., 2018) of the network.
+Definition F.1. Let f (∙,θ): Rd →R be thefunCtion specified by a neural network with parameters θ ∈ Rp
+and input dimension d. The parameter θ is initialized randomly from a distribution P. Then its neural tangent
+kernel (NTK) (Jacot et al., 2018) is a kernel K : Rd ×Rd→R defined by:
+κ(χ,y)=θEp [(fθ 号)]-
+We can relate the training and generalization behavior of dense and sparse models through their NTK. The
+standard result (Song and Yang, 2019) implies the following.
+Proposition F.2. Let fdense denote a ReLU neural network with L layers with dense weight matrices
+θdense with NTK Kdense, and let fsparse be the ReLU neural network with the same architecture and with
+weight matrices θsparse whose rows are k-sparse, and with NTK Ksparse. Let x1, ... ,xN be the inputs
+sampled from some distribution PX. Suppose that the empirical NTK matrices Kd = Kdense (xi,xj) and
+Ks = Ksparse(xi,xj) for (i,j)∈ [N]×[N] satisfy kKd -Ksk ≤δ.
+Training. We knew the the number of iterations of dense network is λmin(Kd)-2n2log(1/) to reach the
+training loss. For sparse network we need (λmin(Kd)-δ)-2n2log(1/).
+Generalization. We knew the the number of iterations of dense network is λmin (Kd)-2n2log(1/) to reach
+the generalization error training loss. For sparse network we need (λmin(Kd)-δ)-2n2log(1/).
+These results relate the generalization bound of sparse models to that of dense models.
+25
+Published as a conference paper at ICLR 2022
+G Dropout Neural Network and KRR
+We consider a two layer neural network with ReLU activation function, and write
+f(W,x):
+1m
+√mfarφ(w>x) =
+r=1
+(2)
+where wr(0)〜N(0,Id) ∈ Rd, a『〜unif({-1,+1}) and all randomnesses are independent. Wewill fix a『
+during the training process and use √m normalization factor, both of which are in the literature of Du et al.
+(2019); Song and Yang (2019); Brand et al. (2021).
+Suppose the training data are (x1,y1),...,(xn,yn) ∈Rd ×R, we define the classical objective function L as
+follows:
+1n
+b(W) = 2∑Sf (W,Xi)-yJ2.
+2 i=1
+The gradient with respect to loss function L is
+∂Lb	1
+n
+(f (W,xi) -yi)
+arxi1wr>xi≥0.
+i=1
+We consider the effect of dropout on network training. For each r∈ [m], we introduce the mask by defining
+random variable σr as follows:
+0,	with probability 1-q;
+1/q, with probability q.
+It is easy to see that E[σ" = 0∙ (1-q) + (1∕q)∙q =1 and E[σ2] =02 ∙ (1-q) + (1∕q)2 ∙q =1/q. We assume
+σi and σ7- are independent for any i=j, then E[σiσ7-] = E[σ∕E[σj] = 1. Let σ = (σι,∙∙∙,σm), we define our
+dropout neural net as
+1m	1m
+F(W,x,σ) := —= y^arσrφ(w>x) = —= S^JarQrw>x1w>χ≥0.	(3)
+r=1	r=1
+Dropout explicitly change the target function, since we need to minimize the `2 distance between F (W,x,σ)
+and y, instead of f(W,x) and y. Formally, we define the dropout loss as
+L(W ):=1 E
+n
+X(F(W,xi,σ) -yi)2 .
+i=1
+(4)
+We first give an explicit formulation of L which also shows the difference between L and L.
+Lemma G.1. The dropout loss defined in Eq. (4) can be expressed as the sum of classical loss L and a
+regularization term as
+nm
+L(W )=L(W )+2mq XXφ(w>xi)2
+(5)
+Proof. Since E[σr] = 1, we have
+1 m	1m
+E [F (W,Xi,σ)]= √m E [χΟrσrφ(w> x)] = √= χαrφ(w> Xi) = f (W,Xi)	⑹
+26
+Published as a conference paper at ICLR 2022
+IllC	■ _ Γ T TL ɪ	1	.1 t∙ Γ-Γ-	1	τ	1 jt
+holds for any i∈ [n]. Next, we show the difference between L and L:
+2(L(W)-Lb(W))
+n
+i=1
+n
+(F (W,xi,σ)-yi)2 -	(f(W,xi) -yi)
+i=1
+X E (F (W,xi,σ)-yi)2 -(f (W,xi)-yi)2
+i=1 σ
+n
+X Eσ F(W,xi,σ)2-f(W,xi)2
+i=1 σ
+X I m X	E[an a『2σn Qr φ(w>Xi)φ(w>Xi)]~ ； X	an a^ φ(w>Xi)φ(w›Xi)
+i=1	r1,r2 ∈[m]	r1,r2∈[m]
+nm
+-∙ 1-q XXa^(Wrxif
+mq r r
+i=1 r=1
+nm
+—q XX。(W> Xi)2
+mq
+i=1 r=1
+(7)
+where the first step follows from definition, the second step follows from the linearity of expectation, the third
+step follows from Eq. (6), the forth step follows from expansion, the fifth step follows from E[σr1σr2] = 1 for
+ri = r and E[σ2 ] = q, and the last step follows from a2 = 1. Thus We have
+nm
+L(W) = b(W ) + 1-q XXΦ(w> xi)2
+2mq	r
+i=1 r=1
+and finish the proof.
+Before we move on, we introduce some extra notations and definitions. We denote
+W=Vec(W )=
+-Wi "			yi
+W2	∈ Rmd,		y
+. .		and Y =	. .
+. Wm			. yn
+∈ Rn.
+Definition G.2. We define matrix G∞ ∈ Rn×n which can be viewed as a Gram matrix from a kernel
+associated with ReLU function as follows:
+Gij (X) =	E	[xi xj 1w>xi≥0,w>xj ≥0], ∀i,j ∈ [n]×[n]
+and assume λ0=λmin(G∞) >08.
+Definition G.3. We define the masked matrix ΦW (X,σ) ∈ Rn×md as
+φw (Xa) := l——
+m
+"Φ(xι,σ)"
+Φ(x2,σ)
+Φ(xn,σ)
+a1σ11hw1,x1i≥0x1>
+a1σ11hwι,X2i≥0x>
+a2σ21hw2,x1i≥0x1>	...	amσm1hwm,x1i≥0x1>
+a2σ21hw2,X2i≥0x>	...	amσm1hwm,χ2i≥0χ2
+a1σ11hw1,xni≥0xn>
+一	O _____
+a2σ21hw2,xni≥0xn>	... amσm1hwm,xni≥0xn>
+and also define the unmasked matrix ΦW (X) ∈Rn
+×md as
+1
+φ W (X ):= √m
+a11hw1,x1i≥0x1
+a11hw1,x2i≥0x2
+a21hw2,xιi≥0x1 … am1hwm,xιi≥Oxl
+a2 lhw2,x2i≥0x2 … am1hwm,X2i≥0x2
+E
+σ
+n
+2
+□
+a11hw1,xni≥0xn
+a21hw2,xni≥0xn	...	am1hwm,xni≥0xn
+8According to Theorem 3.1 in Du et al. (2019), the assumption holds when xi is not parallel with xj for i=6 j, which
+is reasonable in reality.
+27
+Published as a conference paper at ICLR 2022
+Definition G.4. We define the masked block diagonal matrix ΨW (X,σ) ∈ Rmd×md as
+ψW (X,e = mdiag(ψ1,ψ2,…,ψm,
+where ∀r∈ [m], ψr ∈ Rd×d is defined as
+nn
+ψr := a2σ Exix> ∙12Wr,Xii≥0 = σ Exix> ∙1hWr,Xii≥0.
+i=1	i=1
+We also define the unmasked block diagonal matrix ΨbW(X) ∈ Rmd×md as
+1
+Ψw(X) := 一diag Ψ1,ψ2,…,ψm .
+m
+where ∀r∈ [m], ψbr ∈ Rd×d is defined as
+n
+Ψr := ExixJ ∙1hwr,Xii≥0.
+i=1
+Lemma G.5. It is easy to verify that
+_	,	、	^	___ _	_	,	,	^	__ _ C
+Φw(X,σ) = Φw(X)∙Dσ and Ψw(X,σ) = ΨW(X)∙Dσ
+where
+Dσ =diag(σι,…,σι,…,σm,…,σm) ∈ Rmd×md.
+`V~^}	`V}
+dd
+For convenience, we will simply denote ΦW = ΦW (X,σ) and ΨW = ΨW (X,σ). Then by using the above
+notations, We can express our dropout loss as L(W) = 2Eσ[∣∣ΦwW -Y∣∣2].
+Lemma G.6. Ifwe denote λ = 1--q ≥ 0, then we have
+l(w )=2 ∣Φ w W-Y ∣2+λ W >Ψ w W.
+Proof. As for the first term, We have
+n ι m
+∣ΦwW-Yk2 = X(√mXarIhwr,Xii≥0x> ∙Wr-yi)2
+n 1m
+=£( √mɪ2arφ(w> Xi)-yi)2
+i=1	r=1
+n
+= X(f(W,xi)-yi)2
+i=1
+= 2Lb (W).
+ACJ	一	♦一…♦	1	.
+As for the second term, since ΨW is a block diagonal matrix, We have
+1 m
+W >Ψ W W =—
+m
+n
+(arExix> ∙12wr,χii≥o)∙wr
+i=1
+1mn
+m£ E((W>xiMw>xi)>∙12Wr,Xii≥0)
+r=1 i=1
+nm
+-1 XXΦ(w>xi)2.
+mr
+i=1 r=1
+Thus by using Lemma G.1, We have
+nm
+L(W )=L(W )+2mq χχφ(w>xi)2
+i=1 r=1
+=2kφwW-Yk2+2W ψWW
+and finish the proof.
+□
+28
+Published as a conference paper at ICLR 2022
+Remark G.7. A classical kernel ridge regression problem can be defined as
+mWn1 kΦ(X)>W-Y k2 + λ kW k2
+where φ: Rd →F is afeature map. Note that Lemma G.6 breaks the dropout loss into two parts: thefirst part
+is an error term, and the second part can be seen as a regularization term. Thus the task of minimizing the
+dropout loss L(W) is equivalent to a kernel ridge regression (KRR) problem.
+29
+Published as a conference paper at ICLR 2022
+H Dynamics of Kernel Methods (Continuous Gradient Flow)
+The NTK also allows us to analyze the training convergence of sparse networks. We show that gradient
+descent converges globally when training wide sparse networks. This convergence speed is similar to that of
+dense models (Du et al., 2019; Allen-Zhu et al., 2019b).
+In this section we will discuss the dynamics of kernel method under the mask σ, which adds sparsity in
+the output layer. Our problem will be considered in over-parameterized scheme. First we introduce some
+additional definitions and notations. We define symmetric Gram matrix G(W) as G(W) =ΦW ∙ΦW ∈ Rn×n.
+For all i,j∈ [n]×[n], we have
+1m	1 m
+G(W)ij = m〉1ar1hWr,Xii≥0,hWr,Xji≥0xi Xj = mxi Xj〉l1hwr,Xii≥0,hWr,Xj,i≥0.
+r=1	r=1
+We define block symmetric matrix H(W) as H(W)=ΦW ∙Φw ∈Rmd×md. Then for all i,j ∈ [m] X [m], the
+(i,j)-th block of H(W) is
+1 n	>	d×d
+H(W)ij = —aiajXkXk ∙1hwi,Xki≥0,hwj,Xki≥0 ∈R	∙
+m	k=1
+By using Lemma G.6, we consider the corresponding kernel regression problem:
+minLk(W )=min1∣∣ΦW-Y∣∣2 + λW >Ψ W	(8)
+W	W2	2	2
+where Φ ∈ Rn×md, W ∈Rmd×1, Y ∈ Rn×1 and Ψ ∈Rmd×md. The main difference from neural network is
+that we assume Φ (related to NTK, e.g., see Definition G.3) and Ψ (related to regularization term, e.g., see
+Definition G.4) do not change during the training process.
+The gradient of Lk can be expressed as
+^-r ^- ^-r	^--
+VW Lk(W ) = Φ >ΦW-Φ >Y+λΨ W.	(9)
+We use W? to denote the optimal solution ofEq. (8), and it satisfies
+VW Lk(W )∣W=W? = (Φ >Φ+λΨ)W ?-Φ>Y = 0.	(10)
+~ 仝.	...	.. 、一生—1	....	.
+Since Ψ is a positive diagonal matrix, Φ 2 exists, thus we have
+W ? = (Φ >Φ+λΨ )-1Φ>Y.
+Next, we consider the question from a continuous gradient flow aspect. In time t, we denote W(t)=
+vec(W (t)),Φb (t) =Φb W (t),Ψb (t) =Ψb W(t). We also denote G(t) = G(W (t)) and H(t) =H(W(t)). Following
+the literature of Du et al. (2019), we consider the ordinary differential equation defined by
+dwr(t)	∂Lk(W (t))
+—：—=------二———
+dt	∂wr(t)
+(11)
+2
+Lemma H.1 (Lemma 3.1inDu et al. (2019)). If m = Ω( n2log( n)), we have with probability at least 1 — δ,
+kG(0)-G∞k2≤⅜ andλmin(G(0))≥3λo∙	CI
+Lemma H.2 (Lemma 3.2 in Du et al. (2019)). If wι,…,wm are i.i.d generated from N (0,Id), then with
+probability at least 1 一 δ, the following holds. For any set of weight vectors wι,…，wm ∈ Rd that satisfy
+for any r ∈ [m],k Wr — w『(0) k2 ≤ CnO for some small positive constant C, then matrix G ∈ Rd×d satisfies
+IlG-G(O) k2 < λ40 and λmin(G) > λ0.
+The above lemma shows that for W that is close to W (0), the Gram matrix G also stays close to the initial
+Gram matrix G(0), and its minimal eigenvalue is lower bounded.
+Lemma H.3 (Gradient Flow). Ifwe assume λmin (Ψ) ≥ Λ0 > 0, then with probability at least 1 - δ, for
+W1,…,Wm ∈ Rd that satisfy ∀r ∈ [m],∣Wr —Wr(0)∣∣2 ≤ Cn20, we have
+dkφW 一'W *k2 ≤ —γ∣φ W — φ W? k2
+holds some constant γ > 0.
+Proof. By using Eq. (9) and Eq. (11), we can express dW as
+dW = -VW Lk(W) = —(Φ>ΦW—Φ>Y+λΨ W).
+(12)
+30
+Published as a conference paper at ICLR 2022
+Then we have _	_____
+d∣∣Φ W -Φw? ∣∣2
+dt
+__ d∣ΦW-ΦW?k2 dW
+=------------------
+dW	dt
+=2(Φ W-ΦW ?)>Φ∙(-(Φ>ΦW-Φ>Y+λΨ W))
+^-- ^-----. -T ^ ^-r ^- ^-r	^-.
+=-2(Φ W-ΦW ?)>Φ (Φ >Φ W-Φ >Y+λΨ W)
+,^--- ^---. ~Γ ^ ^-Γ ^-------- ^-Γ ^- ^---------------- ^-.
+=-2(Φ W -ΦW *)>Φ (Φ >Φ W-Φ >Φ W ? -λΨ W ?+λΨ W)
+,■^-- -^--,	-T -^- -^ -Γ ,∙^-- -^--.	,∙^--------------- -^--,	-T -^■ , ■^-- -^--.
+=-2(Φ W-ΦW ?)>Φ Φ >(Φ W-Φ W ?)-2λ(Φ W-ΦW ?)>Φ (Ψ W-Ψ W ?)
+..^- ^--..C	.- ---------------. -T ^-r ^ ^ .------ ----.
+≤ -2λ0∣ΦW-ΦW?k2-2λ(W-W*)>Φ>ΦΨ(W-W?)	(13)
+where the second step follows from Eq. (12), the fourth step follows from Eq. (10), and the last step follows
+>
+from the definition that λ0 = λmin(G) = λmin(ΦΦ>).
+As for the second term in the Eq. (13), we have
+,  ------------------------------,-T -^ -T -^■ -^■,  -.
+2λ(W-W ?)>Φ>ΦΨ (W-W ?)
+,---^ -T -^-	----------^ -T -^■ . -T -^■,- ----.
+=2λ(W Φ >Φ-W *Φ >Φ )>Ψ (W-W ?)
+≥ 2λΛo(W-W?)>Φ>Φ(W-W?)
+..^  ^---..C
+= 2λΛo∣ΦW-Φ W *k2	(14)
+Thus by Eq. (13) and Eq. (14) We have
+dk》W-，W*k2 ≤-(2λo+2λΛo)∣ΦW-ΦW?||2，
+By letting γ = 2λ0 +2λΛ0 we finish the proof.
+□
+Tn	∙	1	ɪ /,X TT7∕,X 一 Fg rɪ,. ...	5	.1	.
+For convenience, we denote u(t) = Φ(t)∙W(t) ∈Rn. Then itis easy to verify that
+1m
+Ui(t) = √mkarφ(w>Xi) = f (W(t),Xi), ∀i ∈ [n],
+r=1
+showing that u (t) is the prediction in time t.
+Lemma H.4 (Convergence rate). Ifwe assume λmin(G(s)) ≥ λ0 holdsfor 0 ≤ S ≤t, then we have
+1.	ku(t)-Yk2 ≤e-(Ao+2A/m)tku(0)-Yk2;
+2.	∀r∈ [m],kwr(t)-wr(0)k2 ≤ √nku0(√mγk2
+Proof. From Eq. (9), we can express the dynamics by using u(t) as
+ddt)= -Φ(Φ>ΦW-Φ >γ+λΨ W)
+..	■—■ ■—  
+=G(t)(Y-u(t))-λΦΨ W.
+Thus we have
+dku(td-Yk2 =2(u(t)-Y )>(G(t)(Y-u(t))-λΦΨ W)
+=-2(u(t)-Y )>G(t)(u(t)-Y )-2λ(u(t)-Y )>ΦΨ W
+≤ -λ0∣u(t)-Y∣2-2λ(u(t)-Y)>ΦΨW.
+As for the second term, we have
+2λ(u⑴-Y)>φλbW = —(u(t) -Y)>φ∙ [ψ1 ∙w1,∙∙∙,ψm ∙wm]>
+m
+2λ	n	n
+=m (u(t)-Y )>Φ ・[£ Xiφ(w>Xi),…,fxiφ(wm Xi)]>
+(15)
+(16)
+i=1
+2λ
+一(u(t)-Y )>∙[Ul(t),…,Un(t)]>
+m
+i=1
+(17)
+31
+Published as a conference paper at ICLR 2022
+where forj ∈ [n], Uj(t) ∈R can be expressed as
+1m	n
+Uj (t)= √mΣ^ar1hWrXj i≥0x>∙ ^xiφ(WJrxi))
+1 mn
+=√----〉[arxj (Xixi )wr ∙ 1(Wr ,χii≥0,hWr ,Xji≥0
+r=1 i=1
+We denote U(t) = [Uι(t),…,Un(t)]> ∈Rn and have
+2λ(u(t)-Y )>ΦΨ W =2λ (u(t)-Y )> ∙U (t)	(18)
+m
+and our dynamics becomes
+dkU(?-Y k2 ≤ -λoku(t) - Y k2 - 2λ (u(t)-Y )> ∙ U (t)
+dt	m
+2λ
+≤ -(λ0 +	)ku(t)-Yk2	(19)
+m
+showing that ddt (e(λ0+2λ∕m)tku(t)-Y ∣∣2) ≤ 0. Thus e(λ0+2λ∕m)tku(t)-Y ∣∣2 is a decreasing function with
+respect to t, and we have
+ku(t)-Yk2 ≤eTλ0+2λ∕m叼u(0)-Y∣2.
+As for bounding ∣wr(t)-wr(0)∣2, we use the same method as in Lemma 3.3 ofDu et al. (2019). Thus we
+complete the proof.	□
+Finally, by combining Lemma H.1, H.2, H.3 and H.4, we have the following convergence result.
+Theorem H.5 (Convergence of gradient flow). Suppose λ0 > 0, m = poly(n, 1∕λ0, 1∕δ) ,then with probability
+at least 1 -δ over the randomness of initialization, we have
+∣u(t)-Y ∣22 ≤e-(λ0+2λ∕m)t∣u(0)-Y ∣22.
+The above theorem shows that in the over-parameterized setting (when m is large enough), the training loss
+of the kernel ridge regression problem define in Eq. (8) converges to 0 in a linear rate. By comparing our
+Theorem H.5 with Theorem 3.2 in Du et al. (2019), we can find that the introducing of regularization term
+makes the convergence speed faster, though the improvement is limited. Further notice that in Section G we
+prove the equivalence between minimizing the dropout loss and the kernel ridge regression problem. So we
+conclude our results as:
+The introducing of sparsity into neural network makes the convergence speed faster, but the improvement is
+limited due to the over-parameterized scheme.
+32
+Published as a conference paper at ICLR 2022
+I	Method Details
+We describe some details of our method.
+I.1	Compute budget allocation
+We describe here a procedure to compute the budget allocation based on our cost model. This procedure is
+more complicated than our simple rule of thumb in Section 3.3, and tend to produce the same allocation. For
+completeness, we include the procedure here for the interested reader.
+Given a parameter budget B, we find the density of each layer type that minimize the models’ total cost of
+matrix multiplication. For example, in Transformers, let da and dm be the density of the attention and the
+MLP layers. Let s be the sequence length and d be the feature size. The attention layer with density da will
+cost da(n2 +nd), and the fully connected layers with density dm will cost 2dmnd. We then set da and dm to
+minimize the total cost while maintaining the parameter budget:
+minimizeδa,δmδa(n2+nd)+2δmnd subject to # of trainable parameters≤B. (20)
+As this is a problem with two variables, we can solve it in closed form.
+I.2	Low-rank in Attention
+In Section 3.3, we describe how to use the sparsity pattern from flat block butterfly and the low-rank term for
+weight matrices. This applies to the linear layer in MLP and the projection steps in the attention.
+We also use the sparse + low-rank structure in the attention step itself. Chen et al. (2021) describes a general
+method to combine sparse and low-rank attention, where one uses the sparse component to discount the
+contribution from the low-rank component to ensure accurate approximation of the attention matrix.
+We follow a simpler procedure, which in practice yields similar performance. We use a restricted version of
+low-rank of the form a “global” sparsity mask (as shown in Fig. 12). Indeed, a sparse matrix whose sparsity
+pattern follows the “global” pattern is a sum of two sparse matrices, one containing the “horizontal” global
+components and one containing the “vertical” components. Let w be the width of each of those components,
+then each of them has rank at most w. Therefore, this sparse matrix has rank at most 2w, and is low-rank (for
+small w).
+We also make the global component block-aligned (i.e., set w to be a multiple of the smallest supported block
+size such as 32) for hardware efficiency.
+I.3	Comparison to Other Sparsity Patterns for Attention
+In the context of sparse attention, other sparsity patterns such as BigBird and Longformer also contain a
+“global” component, analogous to our low-rank component. Their “local” component is contained in the block
+diagonal part of the flat block butterfly sparsity pattern.
+The main difference that we do not use the random components (e.g., BigBird), and the diagonal strides from
+flat block butterfly are not found in BigBird or Longformer. Moreover, we apply the same sparsity pattern (+
+low-rank) to the linear layers in the MLP and the projection step in attention as well, allowing our method to
+target most neural network layers, not just the attention layer.
+I.4	Sparsity Mask for Rectangular Matrices
+We have described the sparsity masks from flat block butterfly for square matrices. For rectangular weight
+matrices, we simply “stretch” the sparsity mask. The low-rank component applies to both square and
+rectangular matrices (as shown in Fig. 10). We have found this to work consistently well across tasks.
+33
+Published as a conference paper at ICLR 2022
+Square Flat Block Butterfly
+Rectangular Flat Block Butterfly
+Figure 10: Sparsity Mask for Rectangular Matrices.
+J	Benchmarking of Butterfly Multiply
+We validate that flat butterfly matrices (sum of factors) can speed up multiplication on GPUs compared to
+butterfly matrices (products of factors).
+Consider the matrix M ∈ Rn× n that can be written as products of butterfly factors of strides of up k (a power
+of 2), with residual connection:
+M =(I+λBkn) )(I+λB,2)…(I+λB2n)).
+The first-order approximation of M has the form of a flat butterfly matrix with maximum stride k (Section 3.2):
+Mfiat = I+λ(B2n) + …+Bk/2+Bkn)).
+Notice that M is a product of log2 k factors, each has 2n nonzeros, so multiplying M by a input vector x costs
+O(nlogk) operations (by sequentially multiplying x by the factors of M). The flat version Mflat is a sparse
+matrix with O(nlogk) nonzeros as well, and the cost of multiplying Mflatx is also O(nlogk). However, in
+practice, multiplying Mflat x is much more efficient on GPUs than multiplying Mx because of the ease of
+parallelization.
+We measure the total time of forward and backward passes of multiplying either Mflatx and compare to that
+of multiplying Mx for different maximum strides, as shown in Fig. 11. We see that “flattening” the products
+brings up to 3 × speedup.
+3 -
+2
+S dnp①①ds
+1 -
+2	4	8	16	32
+Maximum stride
+Figure 11: Speedup of multiplying Mflatx compared to multiplying Mx. Flattening the products yields up
+3 × speedup.
+We use matrix size 1024 × 1024 with block size 32. The input batch size is 2048. We use the block sparse
+matrix multiply library from https://github.com/huggingface/pytorch_block_sparse.
+The speed measurement is done on a V100 GPU.
+34
+Published as a conference paper at ICLR 2022
+Local
+Global (Low-rank)
+Figure 12: Sparsity pattern candidate components: Local corresponds to local interaction of neighboring
+elements; Global (low-rank) involves the interaction between all elements and a small subset of elements;
+Butterfly captures the interaction between elements that are some fixed distance apart; Random is common in
+the pruning literature.
+K Exhausted Searching Sparsity Patterns for Efficient Sparse
+Training
+We describe here our early exploration of searching among different sparsity patterns that has been proposed
+in the literature. We use a metric derived from the NTK, which has emerged as one of the standard metric to
+predict the training and generalization of the model. We consistently found the butterfly + low-rank pattern to
+perform among the best.
+In Appendix K.1, we describe the challenges of selecting sparsity patterns for every model components using
+the a metric derived from the NTK, followed by our approaches. Then in , we describe details of empirical
+NTK computation, which is an important step in our method implementation. Last, in Appendix K.3, we
+highlight important properties of our method - it rediscovers several classical sparsity patterns, and the sparse
+models can inherit the training hyperparamters of the dense models, reducing the need for hyperparameters
+tuning.
+K.1 Challenges and Approaches
+Challenge 1: We seek sparsity patterns for each model components that can closely mimic the training
+dynamics of the dense counterpart. As mentioned in Theorem D.9, it is NP-hard to find the optimal sparse
+matrix approximation. Although NTK provides insights and measurement on the “right” sparse model,
+bruteforcely computing NTK for one-layer models with all sparsity patterns is still infeasible.
+Approach 1: Sparsity Pattern Candidates. To address the above challenge, we design our search space to be
+a limited set of sparsity pattern candidates, each is either a component visualized in Fig. 12 or the combination
+of any two of them. These components encompass the most common types of sparsity pattern used, and can
+express We provide the intuition behind these sparsity components:
+•	Local: this block-diagonal component in the matrix corresponds to local interaction of neighboring elements.
+This has appeared in classical PDE discretization (Collins and Angel, 1971), and has been rediscovered in
+Longformer and BigBird attention patterns.
+•	Global: this component involves interaction between all elements and a small subset of elements (i.e.,
+“global” elements). This global pattern is low-rank, and this sparse + low-rank structure is common in data
+science (Udell and Townsend, 2019), and rediscovered in Longformer and BigBird patterns as well.
+•	Butterfly: this component corresponds to interaction between elements that are some fixed distance apart.
+The many divide-and-conquer algorithms, such as the classical fast Fourier transform (Cooley and Tukey,
+1965), uses this pattern at each step. Butterfly matrices reflects this divide-and-conquer structure, and hence
+this sparsity component. The sparse transformer (Child et al., 2019) also found this pattern helpful for
+attention on image data.
+•	Random: this component is a generalization of sparsity patterns found in one-shot magnitude, gradient,
+or momentum based pruning (Lee et al., 2018). Note that at network initialization, they are equivalent to
+random sparsity.
+Challenge 2: Even with a fixed pool of sparsity patterns for each layer, if the model has many layers, the
+number of possible layer-pattern assignments is exponentially large.
+Approach 2: To further reduce the search space, we constrain each layer type (attention, MLP) to have the
+same sparsity pattern. For example, if there are 10 patterns and 2 layer types, the candidate pool is 102 = 100
+combinations.
+35
+Published as a conference paper at ICLR 2022
+Algorithm 2 Model Sparsification
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+Input: model schema Ω, compute budget B, dataset subset X, sparsity mask candidate set C.
+Kdense — NTK(fθ,X).	. Eq.(22)
+output sparsity mask assignment s°ut, dmin — inf for Mi,...,Miωi∈Ciωi do	. Enumerate all sparsity mask candidate combinations
+Let s be the sparsity mask assignment (ti,ri,mi,ni) →Mi.
+if TotalCompute(s) < B then Let Ms be the flattened sparse masks	. Eq. (21), Check if masks satisfy budget constraint
+Ksparse — NTK(fθ°Ms ,X) ds 4- DISTANCE(Kdense,K^sparse) if dmin >ds then dmin 4 ds, sout 4 s	. Eq. (22)
+end if
+end if
+end for
+return sout	. Return sparsity mask assignment
+Challenge 3: Computing the empirical NTK on the whole dataset is expensive in time and space, as it scales
+quadratically in the dataset size.
+Approach 3: We compute the empirical NTK on a randomly chosen subset of the data (i.e., a principal
+submatrix of the empirical NTK matrix). In our experiments, we verify that increasing the subset size beyond
+1000 does not change the choices picked by the NTK heuristic. The subsampled empirical NTK can be
+computed within seconds or minutes.
+K.2 Algorithm Description
+Our method targets GEMM-based neural networks, which are networks whose computation is dominated
+by general matrix multiplies (GEMM), such as Transformer and MLP-Mixer. As a result, we can view the
+network as a series of matrix multiplies. We first define:
+•	Model schema: a list of layer types t (e.g., attention, linear layers in MLP), number of lay-
+ers r of that type, and dimension of the matrix multiplies m X n. We denote it as Ω =
+{(tι,rι,mι,nι),...,(t∣Ω∣,r∣Ω∣,m∣Ω∣,n∣Ω∣)}.
+•	A mask M of dimension m×n is a binary matrix {0,1}m×n. The compute of a mask is the total number
+of ones in the matrix: compute(M) =Pi,jMij.
+•	A sparsity pattern Pm×n for matrix dimension m×n is a set of masks {M1,...,M|P |}, each of dimension
+m× n.
+•	A sparsity mask assignment is a mapping from a model schema Ω to masks M belonging to some sparsity
+pattern P: s: (t,r,m,n) →M.
+•	Given a set of sparsity patterns P1,...,Pk, the set of sparsity mask candidate C is the union of sparsity masks
+in each of Pi: C=∪Pi
+•	A sparsity pattern assignment s satisfies the compute budget B if:
+TotalCompute(s) :=	compute(s(t,r,m,n)) ≤B.	(21)
+layer type l
+•	Let θ be the flattened vector containing the model parameters, and let Ms be the flattened vector containing
+the sparsity mask by the sparsity mask assignment s. Let fθ(x) be the output of the dense network with
+parameter θ and input x. Then the output of the sparse network is fθ0Ms (x).
+•	The empirical NTK of a network fθ on a data subset X = {χι,…,χ∣χ∣} is a matrix of size |X | × |X|:
+dfθκx) df	/ dfθ(xi) dfθ(xj)\	C八
+NTKf∙θ,χ)ij = ∖ -^∂T,^∂r]∙	(22)
+The formal algorithm to assign the sparsity mask to each layer type is described in Algorithm 2. The main idea
+is that, as the set of sparsity mask candidate is finite, we can enumerate all possible sparsity mask assignment
+satisfying the budget and pick the one with the smallest NTK distance to the dense NTK. In practice, we can
+use strategies to avoid explicitly enumerating all possible sparsity mask, e.g. for each sparsity pattern, we can
+choose the largest sparse mask that fits under the budget.
+K.3 Method Properties: Rediscovering Classical Sparsity Patterns, No Additional
+Hyperparameter Tuning
+When applied to the Transformer architecture, among the sparsity components described in Appendix K.1,
+the NTK-guided heuristic consistently picks the local and global components for both the attention and
+36
+Published as a conference paper at ICLR 2022
+MLP layers. Moreover, the butterfly component is also consistently picked for image data, reflecting the 2D
+inductive bias in this component9. While some of these patterns have been proposed for sparse attention, it is
+surprising that they are also picked for the MLP layers. The most popular type of sparsity pattern in MLP
+layers is top-k (in magnitude or gradient, which at initialization is equivalent to random sparsity). We have
+proved that lower NTK difference results in better generalization bound for the sparse model. As expected, we
+observe that this allows the sparse model to use the same hyperparamters (optimizer, learning rate, scheduler)
+as the dense model (Section 5).
+9Convolution (commonly used in image data) can be written in terms of the fast Fourier transform, which has this
+same sparse pattern at each step of the algorithm
+37
+Published as a conference paper at ICLR 2022
+L	Experiment Details
+L.1 Datasets
+•	Cifar10 (Krizhevsky et al., 2009) consists of 60000 coloured images of resolution 32 × 32. Each
+of them belong to one of 10 classes, including airplanes, cars, birds, cats, deer, dogs, frogs, horses,
+ships, and trucks. Among these, 50000 images are allocated to be the training set and 10000 images
+the testing set.
+•	Cifar100 (Krizhevsky et al., 2009) is similar to Cifar10. It also consists of images of resolution 32
+× 32. In total, there are 60000 images, each of which belongs to one of 100 classes. Each of the
+100 classes has 500 images in training set and 100 images in testing set.
+•	ImageNet1K (Russakovsky et al., 2015) spans 1000 object classes, containing 1,281,167 training
+images, 50,000 validation images and 100,000 test images. Although images are collected in
+different resolutions, in practice they are generally reshaped and cropped into 224 × 224.
+•	WikiText-103 (Merity et al., 2016) contains articles from the wikipedia page. It extracts verified
+articles from Wikipedia, which add up to over 100 million tokens. Compared to other datasets, such
+as Penn Treebank (PTB) (Taylor et al., 2003), WikiText features a larger vocabulary and preserves
+original upper/lower cases, punctuation and numbers.
+L.2 Model Configurations and Hyperparameter
+We summarize the details required to replicate our experiments below.
+Baseline Model: Except for dense model. We choose our baselines for each experiment base on the following.
+RigL aims to sparsify model weights/parameters, so we use it as a baseline in MLP-based models (Mixer).
+BigBird focuses on attention matrices, so we used it as a baseline in Transformer-based models (ViT, GPT-2).
+L.2.1	Image Classification
+Table 1: Configuration of the Cifar10 experiments.
+Model	Optimizer	Weight Decay	Learning Rate	Drop Path	Warmup/Epoch
+ViT-Small	AdamW	0.05	0.0005	0.1	5/300
+Pixelfly-ViT-Small	AdamW	0.05	0.0005	0	5/300
+ViT-Base	AdamW	0.05	0.0005	0.1	5/300
+Pixelfly-ViT-Base	AdamW	0.05	0.0005	0	5/300
+Mixer-Small	AdamW	0.1	0.0005	0.1	5/300
+Pixelfly-Mixer-Small	AdamW	0.1	0.0005	0	5/300
+Mixer-Base	AdamW	0.1	0.0005	0.1	5/300
+Pixelfly-Mixer-Base	AdamW	0.1	0.0005	0	5/300
+Model	Optimizer	Weight Decay	Learning Rate	Drop Path	Warmup/Epoch
+ViT-Small	AdamW	0.05	0.0005	0.1	5/300
+Pixelfly-ViT-Small	AdamW	0.05	0.0005	0	5/300
+ViT-Base	AdamW	0.05	0.0005	0.1	5/300
+Pixelfly-ViT-Base	AdamW	0.05	0.0005	0	5/300
+Mixer-Small	AdamW	0.1	0.0005	0.1	5/300
+Pixelfly-Mixer-Small	AdamW	0.1	0.0005	0	5/300
+Mixer-Base	AdamW	0.1	0.0005	0.1	5/300
+Pixelfly-Mixer-Base	AdamW	0.1	0.0005	0	5/300
+Table 2: Configuration of the Cifar100 experiments
+We report more details on the models, including number of parameters and FLOPs, in Table 4.
+We follow the naming convention in the Vision Transformer paper and MLP-Mixer paper. In particular, ViT-S
+and ViT-B refers to the small and base ViT models respectively, and 16 refers to the patch size of 16x16. The
+MLP-Mixer models follows the same convention.
+L.2.2 Language Modeling
+We report more details on the models, including number of parameters and FLOPs, in Table 5 and Table 6.
+38
+Published as a conference paper at ICLR 2022
+Model	Optimizer	Weight Decay	Learning Rate	Drop Path	Warmup/Epoch
+ViT-Small	AdamW	0.05	0.001	0.1	5/300
+Pixelfly-ViT-Small	AdamW	0.05	0.001	0	5/300
+ViT-Base	AdamW	0.05	0.001	0.1	5/300
+Pixelfly-ViT-Base	AdamW	0.05	0.001	0	5/300
+Mixer-Small	AdamW	0.1	0.001	0.1	5/300
+Pixelfly-Mixer-Small	AdamW	0.1	0.001	0	5/300
+Mixer-Base	AdamW	0.1	0.001	0.1	5/300
+Pixelfly-Mixer-Base	AdamW	0.1	0.001	0	5/300
+Table 3: Configuration of the ImageNet experiment
+Table 4: The performance of Pixelfly and ViT or MLP-Mixer on the ImageNet benchmarks, including the
+number of parameters and FLOPs. We measure the accuracy and the training time speedup (on ImageNet)
+compared to the dense model.
+Model	ImageNet top-1 acc.	Speedup	Params	FLOPs
+Mixer-S/16	72.4	-	18.5M	3.8G
+Pixelfly-Mixer-S/16	72.6	1.7×	5.9M	1.3G
+Mixer-B/16	75.6	-	59.9M	12.6G
+Pixelfly-Mixer-B/16	76.3	2.3×	17.4M	4.3G
+ViT-S/16	77.7	-	48.8M	9.9G
+Pixelfly-ViT-S/16	77.5	1.9×	16.9M	3.6G
+ViT-B/16	78.5	-	86.6M	17.6G
+Pixelfly-ViT-B/16	78.6	2.0×	28.2M	6.1G
+Table 5: The performance of Pixelfly, BigBird and GPT-2-Small on WikiText-103, including the number of
+parameters and FLOPs. We measure the perplexity and the training speed up.
+Model	WikiTeXt-103(ppl)	Speedup	Params	FLOPS
+-GPT-2-Small	222	-	-117M	48.4G
+BigBird	23.3	-0.96×-	-117M	40.2G
+Pixelfly	225	-2!×-	-68M-	-185G-
+GPT-2-Medium	209	-	345M	168G
+BigBird	21.5	-∏×-	345M	-134G
+Pixelfly	21.0	-2.5×-	-203M-	-27G-
+Table 6: Configuration of the WikiText103 experiments
+Model	Optimizer Weight Decay Learning Rate Dropout Warmup/Epoch
+GPT-2-Small	Adam	0.1	0.0001	0.1	5/100
+Pixelfly	Adam	0.1	0.0001	0.1	5/100
+L.3 Measuring Empirical NTK
+The Empirical NTK is a rough estimation of the real NTK, in which the width of the neural net goes to infinity.
+As the width grows, the kernel gets closer to its infinite-width limit. Fortunately, both our models of interest,
+MLP-Mixer and Vision Transformer, are wide and overly parameterized. Therefore they are only one step
+away from the real NTK domain. This allows us to use the Empirical NTK to approximately predict their
+training behaviors.
+As described in equation 22, we first compute the gradient of each data sample, then we compute pair-wise
+product to construct the Empirical NTK. Although we use a relatively small dataset, it’s still expensive to build
+a kernel for large models, such as ViTs and MLP-Mixers. In practice, we find that it’s sufficient to compute
+kernels for a subsampled dataset.
+39
+Published as a conference paper at ICLR 2022
+MLP-Mixer and Vision Transformer each represent one type of module of interest for our sparsification. In
+MLP-Mixer, we study the sparse behavior of the Linear module, whereas, in Vision Transformer, we mainly
+focus on sparsifying attention. All models are first sparsified to around 10% of the original dense compute.
+Then we compare their NTK kernels with their original dense kernel. We run three random seeds to eliminate
+noise, i.e., three different initializations for each pair of configurations. We report the mean relative difference
+between the kernels with respect to the norm of the dense kernel.
+L.4 Transfer Learning Experiments
+We conduct extended experiments to test the generalization of our pretrained sparse models on downstream
+tasks. Specifically, we finetune Pixelfly pretrained model (ImageNet) on CIFAR-10 and show that it get
+99.03% accuracy compared to 98.77% on our pretrained dense ViT-B/16 model. In addition, we see more
+than 2× speed up on downstream task fine-tuning process as well.
+L.5 Microbenchmarking
+In this section, we perform microbenchmarking on a 4K× 4K sparse matrix multiplication. We aim to show
+that Pixelfly patterns are far more hardware friendly than random patterns. For a 4K×4K matrix, expected
+density is the number of non-zero entries∕(4K×4K); actual density is the number of accessed entries∕(4K×4K),
+e.g. even if there is only one non-zero, 32×32 entries would be accessed because the hardware block size is
+32×32.
+When random patterns are generated with small block size, (e.g 1×1, 2× 2), the resources, such as memory
+access and computes(denoted by Actual Density), required to compute a random sparse matrix of density
+1.25% are equivalent to computing a dense matrix multiplication. This is further reflected in the latency: As
+pattern block size shrinks, deviating from the hardware block size of 32 ×32, the random patterns’ latency
+worsens, whereas the Pixelfly remains efficient. Vanilla Butterfly is 5× slower than Pixelfly as expected,
+because (1) it does not take advantage of the hardware property - not structured sparsity(2) it is a series of
+products.
+Pattern	Block size	Expected Density	Actual Density	Latency(ms)
+	1×1	1.25%	100%	9.4
+	2×2	2.5%	99.84%	9.3
+	4×4	5%	96.24%	9.04
+Random	6×6	10%	93.66%	8.8
+	8×8	20%	81.89%	7.7
+	16×16	40%	34.52%	3.3
+	32×32	80%	10.15%	1.0
+Butterfly	1×1	10%	62.50%	5.2
+	1×1	125%	4.62%	0.48
+	2×2	2.5%	5.38%	0.56
+	4×4	5%	6.13%	0.63
+Pixelfly	6×6	10%	9.64%	0.96
+	8×8	10%	10.58%	1.05
+	16×16	10%	11.30%	1.12
+	32×32	10%	10.58%	1.04
+Table 7: Microbenchmarking of different patterns. Given GPU processes the matrix block by block of size 32
+× 32, random block pattern’s latency increases as the block size shrinks, while Pixelfly remains efficient. We
+measure the latency by averaging 100 runs of batch size 4096 for each configuration.
+L.6 Efficient Implementation of Pixelfly
+We run all of our experiments on V100 GPUs. We rely on efficient implementation of block sparse
+matrix multiply and block sparse attention from the libraries Triton (https://github.com/openai/
+triton) and https://github.com/huggingface/pytorch_block_sparse. For the low-
+rank part, we rely on efficient (dense) matrix multiplies from cuBLAS. In particular, to multiply the input x
+by the low-rank matrix UV >, we multiply U(V >x).
+We keep the same number of training epochs as that of the dense models (e.g., on ImageNet, the dense model
+and the Pixelfly model are trained for 300 epochs). The training speedup of the Pixelfly models is due to
+faster time per epoch.
+40
+Published as a conference paper at ICLR 2022
+We do not use 2:4 sparsity (available on Ampere GPUs such as A100). Such fine-grained sparsity is orthogonal
+to our approach, and we expect that future work incorporating both 2:4 sparsity and block sparsity to yield
+further speedup.
+L.7 Ablation: Speed-Accuracy Tradeoff of Pixelfly
+We conduct an ablation experiment to examine the speed-accuracy trade of Pixelfly: on the ImageNet dataset
+and the Mixer-B/16 model, we replace the dense matrices with flat block butterfly + low-rank matrices, while
+varying the compute / parameter budget. We plot the speed-accuracy tradeoff in Fig. 13.
+Training speedup compared to dense model
+Figure 13: Speed-accuracy tradeoff of Pixelfly on ImageNet classification, with Mixer-B/16 as the dense
+model. Pixelfly maintains or exceeds the accuracy of the dense model, up to around 2.3× speedup (or around
+30% of the number of parameters). Performance degrades when the Pixelfly model has fewer than 30% of the
+number of parameters.
+L.8 Comparison Against Original Butterfly
+We compare Pixelfly against original Butterfly matrices (Dao et al., 2020) on the ImageNet dataset and
+Mixer-B/16 dense model. We present the results in Table 8. We notice another benefit of Pixelfly compared to
+Butterfly: it trains more stably and requires less careful initialization. Since Butterfly is a product of many
+factors, it requires careful initialization, otherwise the activation and gradient will be very large or very small.
+Table 8: The performance of Pixelfly and original Butterfly on MLP-Mixer on the ImageNet benchmarks.
+Model	ImageNet top-1 acc.	Speedup	Params	FLOPs
+Mixer-B/16	75.6	-	59.9M	12.6G
+Butterfly-Mixer-B/16	76.1	0.8×	17.4M	4.3G
+Pixelfly-Mixer-B/16	76.3	2.3×	17.4M	4.3G
+41
+Published as a conference paper at ICLR 2022
+M Extended Related Work
+In this section, we extend the related works referenced in the main paper and discuss them in detail.
+M.1 Neural Pruning
+Our work is loosely related to neural network pruning. By iteratively eliminating neurons and connections,
+pruning has seen great success in compressing complex models.Han et al. (2015a;b) put forth two naive
+but effective algorithms to compress models up to 49x and maintain comparable accuracy. Li et al. (2016)
+employ filter pruning to reduce the cost of running convolution models up to 38 %, Lin et al. (2017) prunes
+the network at runtime, hence retaining the flexibility of the full model. Dong et al. (2017) prunes the network
+locally in a layer by layer manner. Sanh et al. (2020) prunes with deterministic first-order information, which
+is more adaptive to pretrained model weights. Lagunas et al. (2021) prunes transformers models with block
+sparsity pattern during fine-tuning, which leads to real hardware speed up while maintaining the accuracy.
+Zhu and Gupta (2017) finds large pruned sparse network consistently outperform the small dense networks
+with the same compute and memory footprints. Although both our and all the pruning methods are aiming to
+produce sparse models, we differ in our emphasis on the overall efficiency, whereas pruning mostly focuses
+on inference efficiency and disregards the cost in finding the smaller model.
+M.2 Lottery Ticket Hypothesis
+Models proposed in our work can be roughly seen as a class of manually constructed lottery tickets. Lottery
+tickets Frankle and Carbin (2018) are a set of small sub-networks derived from a larger dense network, which
+outperforms their parent networks in convergence speed and potentially in generalization. A huge number
+of studies are carried out to analyze these tickets both empirically and theoretically: Morcos et al. (2019)
+proposed to use one generalized lottery tickets for all vision benchmarks and got comparable results with the
+specialized lottery tickets; Frankle et al. (2019) improves the stability of the lottery tickets by iterative pruning;
+Frankle et al. (2020) found that subnetworks reach full accuracy only if they are stable against SGD noise
+during training; Orseau et al. (2020) provides a logarithmic upper bound for the number of parameters it
+takes for the optimal sub-networks to exist; Pensia et al. (2020) suggests a way to construct the lottery ticket
+by solving the subset sum problem and it’s a proof by construction for the strong lottery ticket hypothesis.
+Furthermore, follow-up works (Liu and Zenke, 2020; Wang et al., 2020; Tanaka et al., 2020) show that we
+can find tickets without any training labels.
+M.3 Neural Tangent Kernel
+Our work rely heavily on neural tangent kernel in theoretical analysis. Neural Tangent Kernel Jacot et al.
+(2018) is first proposed to analyse the training dynamic of infinitely wide and deep networks. The kernel is
+deterministic with respect to the initialization as the width and depth go to infinity, which provide an unique
+mathematical to analyze deep overparameterized networks. Couples of theoretical works are built based upon
+this: Lee et al. (2019) extend on the previous idea and prove that finite learning rate is enough for the model to
+follow NTK dynamic. Arora et al. (2019b) points out that there is still a gap between NTK and the real finite
+NNs. Cao and Gu (2020) sheds light on the good generalization behavior of overparameterized deep neural
+networks. Arora et al. (2019a) is the first one to show generalization bound independent of the network size.
+Later, some works reveal the training dynamic of models of finite width, pointing out the importance of width
+in training: Hayou et al. (2019) analyzes stochastic gradient from the stochastic differential equations’ point of
+view; Based on these results, we formulate and derive our theorems on sparse network training.
+M.4 Overparameterized Models
+Our work mainly targets overparameterized models. In Nakkiran et al. (2019), the double descendent
+phenomenon was observed. Not long after that, d’Ascoli et al. (2020) discover the triple descendent
+phenomenon. It’s conjectured in both works that the generalization error improves as the parameter count
+grows. On top of that, Arora et al. (2018) speculates that overparameterization helps model optimization, and
+without "enough" width, training can be stuck at local optimum. Given these intuitions, it’s not surprising
+that the practitioning community is racing to break the record of the largest parameter counts: The two large
+language models, GPT-2 and GPT-3 (Radford et al., 2019; Brown et al., 2020), are pushing the boundary on
+text generation and understanding; Their amazing zero-shot ability earn them the title of foundation models
+(Bommasani et al., 2021). On the computer vision side, Dosovitskiy et al. (2020); Tolstikhin et al. (2021);
+Zhai et al. (2021) push the top-1 accuracy on various vision benchmarks to new highs after scaling up to 50
+times the parameters; Naumov et al. (2019) shows impressive results on recommendation with a 21 billion
+42
+Published as a conference paper at ICLR 2022
+large embedding; Jumper et al. (2021) from DeepMind solve a 50 year old grand challenge in protein research
+with a 46-layer Evoformer. In our work, we show that there is a more efficient way to scale up model training
+through sparsification and double descent only implies the behavior of the dense networks.
+43
