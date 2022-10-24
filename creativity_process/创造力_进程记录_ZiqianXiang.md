@@ -2,7 +2,7 @@
 
 ### 本周工作记录
 
-* **论文阅读：**The construction of novelty in computer science papers 
+* **论文阅读：** The construction of novelty in computer science papers 
 ![微信图片_20221020155005.png](https://s2.loli.net/2022/10/24/OnXFNvW6c45Q8GS.png)
 
 
