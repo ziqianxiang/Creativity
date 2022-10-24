@@ -19,7 +19,7 @@
 ### 下周计划
 
 * **分析相关：** 参考文献相似度（欧氏距离）与technical_novelty_score_mean/empirical_novelty_score_mean/recommendation_score_mean
-* 考虑更多的** 相似度计算指标：**余弦相似度等
+* 考虑更多的**相似度计算指标：** 余弦相似度等
 * 句子的相似性计算方式（查阅，更好的表征方式
 * 计算novelty分数，将confidence_score_mean作为权重，计算加权平均数
 * 调研：**nvivo**
